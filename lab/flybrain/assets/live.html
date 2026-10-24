@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мозг мухи — пульт</title>
+<style>
+  :root{
+    --bg:#07090d; --panel:#0e1219; --line:#1e2633; --fg:#e6edf6;
+    --dim:#8b97a8; --accent:#ffb259; --good:#6ee7a8; --warn:#fc8181;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font:14px/1.5 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    overflow:hidden}
+  /* minmax(0,1fr) и min-height:0 ниже — чтобы строки грида могли стать
+     меньше содержимого: у канваса есть собственный размер, и без этого
+     панель арены уезжает за нижний край окна */
+  #app{display:grid;grid-template-columns:340px minmax(0,1fr) 320px;
+    grid-template-rows:minmax(0,1fr);height:100vh;
+    gap:1px;background:var(--line)}
+
+  aside{background:var(--panel);overflow-y:auto;padding:14px}
+  h2{font-size:11.5px;text-transform:uppercase;letter-spacing:.8px;
+    color:var(--dim);margin:16px 0 8px;font-weight:600}
+  h2:first-child{margin-top:0}
+  label{display:block;font-size:11.5px;color:var(--dim);margin:8px 0 3px}
+  input[type=text],input[type=number],select{width:100%;background:#0b1017;
+    color:var(--fg);border:1px solid var(--line);border-radius:6px;
+    padding:6px 8px;font:inherit;font-size:12.5px}
+  input:focus,select:focus{outline:none;border-color:var(--accent)}
+  .row{display:flex;gap:8px}
+  .row>*{flex:1}
+  button{background:#172030;color:var(--fg);border:1px solid var(--line);
+    border-radius:6px;padding:7px 12px;font:inherit;font-size:12.5px;
+    cursor:pointer}
+  button:hover{background:#1e2a3c}
+  button:disabled{opacity:.4;cursor:default}
+  button.primary{background:var(--accent);color:#1a1205;border-color:var(--accent);
+    font-weight:600}
+  button.primary:hover{filter:brightness(1.08)}
+  button.on{background:var(--accent);color:#1a1205;border-color:var(--accent)}
+  .tabs{display:flex;gap:6px;margin-bottom:10px}
+  .tabs button{flex:1}
+  .hint{font-size:11px;color:var(--dim);margin:4px 0 0;min-height:15px}
+  .hint b{color:var(--fg)}
+  .hint.bad{color:var(--warn)}
+  .chk{display:flex;align-items:center;gap:7px;margin:7px 0;font-size:12.5px;
+    color:var(--fg);cursor:pointer}
+  .chk input{width:auto;accent-color:var(--accent)}
+
+  #stage{position:relative;background:#05070a;display:grid;min-height:0;
+    grid-template-rows:minmax(0,1fr)}
+  #stage.arena{grid-template-rows:minmax(0,1fr) 290px}
+  /* min-height:0 обязателен: строка 1fr в гриде не ужимается меньше
+     содержимого, а у канваса есть собственный размер, и панель арены
+     уезжает за нижний край окна */
+  #brain{position:relative;overflow:hidden;min-height:0}
+  canvas{display:block;width:100%;height:100%}
+  #arenaBox{position:relative;border-top:1px solid var(--line);background:#06080c;
+    display:none;min-height:0}
+  #stage.arena #arenaBox{display:block}
+  #labels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+  .rlab{position:absolute;transform:translate(-50%,-50%);font-size:10.5px;
+    font-weight:600;letter-spacing:.3px;white-space:nowrap;
+    text-shadow:0 0 6px #000,0 0 2px #000;opacity:.85;pointer-events:none}
+  #hud{position:absolute;left:12px;top:12px;background:rgba(8,11,16,.72);
+    border:1px solid var(--line);border-radius:8px;padding:10px 12px;
+    font-size:12px;min-width:200px;backdrop-filter:blur(6px)}
+  #hud .big{font-size:20px;font-weight:700;color:var(--accent);
+    font-variant-numeric:tabular-nums}
+  #hud .r{display:flex;justify-content:space-between;gap:12px;color:var(--dim)}
+  #hud .r b{color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
+  .scaleBar{height:9px;border-radius:3px;margin:5px 0 2px;
+    background:linear-gradient(90deg,#10121a,#3b0f70,#8c2981,#dd4968,#fb8861,#fcfdbf)}
+  #viewbtns{position:absolute;left:12px;bottom:12px;display:flex;gap:6px;
+    flex-wrap:wrap}
+  #tip{position:absolute;pointer-events:none;background:rgba(10,14,20,.95);
+    border:1px solid var(--line);border-radius:6px;padding:6px 9px;
+    font-size:12px;display:none;z-index:5;max-width:240px}
+  #conn{position:absolute;right:12px;top:12px;font-size:11.5px;color:var(--dim);
+    background:rgba(8,11,16,.72);border:1px solid var(--line);
+    border-radius:6px;padding:4px 9px}
+  #conn.live{color:var(--good);border-color:#1d4a35}
+
+  .bar{display:grid;grid-template-columns:52px 1fr 42px;gap:7px;
+    align-items:center;margin:3px 0;font-size:12px}
+  .bar .nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;cursor:pointer}
+  .bar .tr{background:#121925;border-radius:3px;height:11px;overflow:hidden}
+  .bar .fl{height:100%;border-radius:3px;transition:width .12s linear}
+  .bar .vl{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th{text-align:left;color:var(--dim);font-weight:600;padding:3px 4px;
+    border-bottom:1px solid var(--line)}
+  td{padding:3px 4px;border-bottom:1px solid #141a24}
+  td.n{text-align:right;font-variant-numeric:tabular-nums;color:var(--accent)}
+  .chip{display:inline-block;width:8px;height:8px;border-radius:2px;
+    margin-right:5px;vertical-align:middle}
+  .cmt{border-left:2px solid #223049;padding:4px 0 4px 9px;margin:0 0 6px;
+    font-size:12px;color:#9fadbf}
+  .cmt .ts{color:#5c6878;font-variant-numeric:tabular-nums;margin-right:6px}
+  .note{color:var(--dim);font-size:11px;line-height:1.45;margin:6px 0 0}
+  .preset{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+  .preset button{flex:none;padding:3px 8px;font-size:11.5px}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <aside id="left">
+    <div class="tabs">
+      <button id="tab-stim" class="on">Стимуляция</button>
+      <button id="tab-arena">Арена</button>
+    </div>
+
+    <div id="panel-stim">
+      <h2>Кого зажечь</h2>
+      <input type="text" id="q-act" value="class:gustatory+side:left">
+      <p class="hint" id="hint-act">&nbsp;</p>
+      <div class="preset" id="presets"></div>
+
+      <label>Частота, Гц</label>
+      <input type="number" id="rate" value="200" min="1" max="500" step="10">
+
+      <div class="row">
+        <div><label>Импульс с, мс</label>
+          <input type="number" id="on" value="100" min="0" step="50"></div>
+        <div><label>по, мс (пусто — до конца)</label>
+          <input type="number" id="off" value="400" min="0" step="50"></div>
+      </div>
+
+      <h2>Кого выключить</h2>
+      <input type="text" id="q-sil" placeholder="например type:KC">
+      <p class="hint" id="hint-sil">&nbsp;</p>
+
+      <div class="row">
+        <div><label>Длительность, с</label>
+          <input type="number" id="t-stim" value="0.6" min="0.1" max="10" step="0.1"></div>
+        <div><label>Шаг записи, мс</label>
+          <input type="number" id="bin" value="10" min="5" max="50" step="5"></div>
+      </div>
+    </div>
+
+    <div id="panel-arena" style="display:none">
+      <h2>Выход на рулёжку</h2>
+      <select id="readout"></select>
+      <p class="note">Какая популяция управляет поворотом. `fly lateral`
+        показывает, кто вообще кодирует сторону запаха.</p>
+
+      <div class="row">
+        <div><label>Интегрирование, с</label>
+          <input type="number" id="dn-tau" value="0.5" min="0.02" max="2" step="0.02"></div>
+        <div><label>Шаг управления, мс</label>
+          <input type="number" id="control-ms" value="20" min="10" max="50" step="5"></div>
+      </div>
+      <div class="row">
+        <div><label>Длительность, с</label>
+          <input type="number" id="t-arena" value="5" min="1" max="30" step="1"></div>
+        <div><label>Сид</label>
+          <input type="number" id="seed" value="0" min="0" step="1"></div>
+      </div>
+
+      <label class="chk"><input type="checkbox" id="swap">
+        контроль: переставить антенны</label>
+      <label class="chk"><input type="checkbox" id="comment">
+        комментарий локальной модели</label>
+    </div>
+
+    <h2>Запуск</h2>
+    <div class="row">
+      <button class="primary" id="go">Пуск</button>
+      <button id="stop" disabled>Стоп</button>
+    </div>
+    <div class="row" style="margin-top:7px">
+      <button id="save" disabled>Сохранить прогон</button>
+    </div>
+    <p class="hint" id="hint-run">&nbsp;</p>
+  </aside>
+
+  <div id="stage">
+    <div id="brain">
+      <canvas id="gl"></canvas>
+      <div id="labels"></div>
+      <div id="conn">нет связи</div>
+      <div id="hud">
+        <div class="big"><span id="hud-t">0</span> мс</div>
+        <div class="r"><span>активно сейчас</span><b id="hud-act">0</b></div>
+        <div class="r"><span>максимум, Гц</span><b id="hud-peak">0</b></div>
+        <div class="r"><span>топ-область</span><b id="hud-reg">—</b></div>
+        <div class="scaleBar"></div>
+        <div class="r"><span>0</span><span id="hud-scale">—</span></div>
+      </div>
+      <div id="viewbtns">
+        <button id="mode-act" class="on">активность</button>
+        <button id="mode-reg">области</button>
+        <button id="only">только активные</button>
+        <button id="lab" class="on">подписи</button>
+        <button id="view">вид: фронт</button>
+      </div>
+      <div id="tip"></div>
+    </div>
+    <div id="arenaBox"><canvas id="arena"></canvas></div>
+  </div>
+
+  <aside id="right">
+    <h2>Области сейчас</h2>
+    <div id="regbars"></div>
+
+    <h2>Самые активные</h2>
+    <table><thead><tr><th>тип</th><th>область</th><th class="n">Гц</th></tr></thead>
+      <tbody id="toptab"></tbody></table>
+
+    <div id="cmtbox" style="display:none">
+      <h2>Комментарий модели</h2>
+      <div id="comments"></div>
+    </div>
+
+    <h2>Итог прогона</h2>
+    <div id="summary"><p class="note">Запустите прогон.</p></div>
+  </aside>
+</div>
+
+<script src="viewer.js"></script>
+<script src="live.js"></script>
+</body>
+</html>
