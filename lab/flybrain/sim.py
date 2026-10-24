@@ -214,8 +214,25 @@ class Engine:
         self.refrac = self.refrac_steps.unsqueeze(0).repeat(batch, 1).clone()
 
     def step(self, rates):
-        """Advance one 0.1 ms tick.  ``rates`` is [batch, n] in Hz."""
-        # Poisson drive straight into the membrane voltage
+        """Advance one 0.1 ms tick.  ``rates`` is [batch, n] in Hz.
+
+        Состояние обновляется НА МЕСТЕ: `v`, `conductance`, `spikes` и
+        `refrac` всю жизнь движка лежат в одной и той же памяти. Это не
+        украшение и не экономия аллокаций — без этого шаг нельзя записать
+        в CUDA-граф: при пересвязывании `self.v = self.v + …` граф на
+        повторе читал бы тензор, оставшийся от записи, и состояние не
+        двигалось бы вовсе.
+
+        Арифметика и её порядок не изменились ни на операцию. Там, где
+        `torch.where` заменён умножением, равенство точное: `spikes` —
+        это ровно 0.0 или 1.0, поэтому `(refrac + 1) * (1 - spikes)` даёт
+        либо `refrac + 1` без изменения бита, либо ноль. Сверяется это не
+        рассуждением, а `probe/lif_equal.py`: отпечатки состояния до и
+        после правки совпали побайтово.
+        """
+        # Poisson drive straight into the membrane voltage.  Два умножения
+        # оставлены двумя: `(x * gain) * scale` и `x * (gain * scale)` в
+        # общем случае дают разные последние биты.
         poisson = torch.bernoulli(
             rates * self.prob_scale, generator=self.gen) * self.poisson_gain
         voltage_stim = self.w_scale * poisson
@@ -225,8 +242,7 @@ class Engine:
             self.w_csr, self.spikes.t().contiguous()).t()
 
         # refractory counter: reset on spike, otherwise count up
-        self.refrac = torch.where(
-            self.spikes > 0, torch.zeros_like(self.refrac), self.refrac + 1.0)
+        self.refrac.add_(1.0).mul_(1.0 - self.spikes)
         gate = (self.refrac >= self.refrac_steps.unsqueeze(0)).float()
 
         # synaptic conductance with axonal delay.  The upstream code rolls a
@@ -241,12 +257,13 @@ class Engine:
         # what upstream's AlphaLIF.forward does -- it passes the old tensor to
         # the neuron and only afterwards swaps in the new one.  Keeping that
         # ordering is what makes `cli verify` match.
-        self.v = self.v + voltage_stim
-        self.v = self.v + self.tau_mem_f * (
-            self.conductance - (self.v - self.v_rest))
-        self.spikes = (self.v > self.v_th).float()
-        self.v = self.v - (self.v - self.v_reset) * self.spikes
-        self.conductance = conductance_new - conductance_new * self.spikes
+        self.v.add_(voltage_stim)
+        self.v.add_(self.tau_mem_f * (
+            self.conductance - (self.v - self.v_rest)))
+        self.spikes.copy_(self.v > self.v_th)
+        self.v.sub_((self.v - self.v_reset) * self.spikes)
+        self.conductance.copy_(conductance_new
+                               - conductance_new * self.spikes)
         return self.spikes
 
 
@@ -318,7 +335,10 @@ def run(
     rates = torch.zeros(B, n, device=device)
     counts = torch.zeros(n, dtype=torch.int64, device=device)
     binned = torch.zeros(n_bins, n, dtype=torch.int16, device=device)
-    bin_acc = torch.zeros(n, dtype=torch.int16, device=device)
+    # Накопитель бина держится во float32 — в том же типе, что и спайки:
+    # так сложение идёт без приведения на каждом шаге, а в int16 он
+    # приводится один раз на бин, когда уходит в растр.
+    bin_acc = torch.zeros(n, dtype=torch.float32, device=device)
 
     ev = 0
     bar = None
@@ -339,15 +359,20 @@ def run(
 
         spikes = engine.step(rates)
 
-        s_sum = spikes.sum(0).to(torch.int16)
-        bin_acc += s_sum
-        counts += s_sum.to(torch.int64)
+        # Накопление идёт в том же типе, в каком приходят спайки, и общий
+        # счётчик складывается раз в бин, а не на каждом шаге. Сумма та же:
+        # счётчик — это сумма бинов, а бин — сумма шагов. Зато приведение в
+        # int64 и сложение в int64 случаются сто раз реже; замер показал,
+        # что на каждом шаге они стоили 0,12 мс из 0,93.
+        bin_acc += spikes.sum(0)
         if (step + 1) % bin_steps == 0 or step == steps - 1:
             b = min(step // bin_steps, n_bins - 1)
-            binned[b] = bin_acc
+            whole = bin_acc.to(torch.int16)
+            binned[b] = whole
+            counts += bin_acc.to(torch.int64)
             if on_bin is not None:
-                on_bin(b, (step + 1) * DT, bin_acc.cpu().numpy())
-            bin_acc = torch.zeros_like(bin_acc)
+                on_bin(b, (step + 1) * DT, whole.cpu().numpy())
+            bin_acc.zero_()
             if should_stop is not None and should_stop():
                 steps = step + 1
                 break
