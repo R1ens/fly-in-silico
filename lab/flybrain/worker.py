@@ -125,6 +125,7 @@ class Worker:
         self._links_ms = 0.0
 
         self._pending = []          # команды, пришедшие посреди задачи
+        self._control = []          # управление идущим расчётом
         self._cancelled = set()
         self._stop = False
         self._job = None
@@ -241,8 +242,20 @@ class Worker:
                 # заставлять окно ждать конца прогона ради подсчёта нейронов
                 # в селекторе — это неотзывчивое поле ввода.
                 self._query(cmd)
+            elif isinstance(cmd, ipc.Control):
+                # Управление идущим расчётом складывается отдельно: его
+                # разбирает сама задача, на границе шага управления.
+                # Разбирать здесь нельзя — середина шага физики не то
+                # место, где можно менять состояние модели.
+                self._control.append(cmd)
             else:
                 self._pending.append(cmd)
+
+    def _drain_control(self):
+        """Отдать задаче то, что пришло с прошлого раза. Не блокирует."""
+        self._pump()
+        got, self._control = self._control, []
+        return got
 
     def _should_stop(self, job_id):
         def check():
@@ -415,6 +428,7 @@ class Worker:
         name = raw.get("save") or raw.get("out")
         out_dir = self._free_dir(str(name)) if name else None
         ctx = _WorkerCtx(self, job_id, out_dir=out_dir)
+        ctx._base._drain = self._drain_control
         try:
             res = jobs.run(S.from_dict(raw), ctx)
             if res.summary.get("error"):

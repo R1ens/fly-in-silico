@@ -148,6 +148,36 @@ def _build_body(cfg: BodyConfig, sources, video_path=None):
     return sim, cams
 
 
+def _odour_channels(fly):
+    """Какие столбцы `odor_intensity` — антенны, а какие щупики.
+
+    Порядок задаётся словарём `config["olfaction"]["sensor_positions"]`
+    и равен `LMaxillaryPalp, RMaxillaryPalp, LAntenna, RAntenna`. Раньше
+    здесь стояли жёсткие индексы 0 и 1 — то есть читались **максиллярные
+    щупики**, хотя в подписи значились антенны. Лево и право при этом
+    были верны, но разнос щупиков 0,60 мм против 0,17 мм у антенн, и
+    билатеральная разница выходила в 3,4 раза больше настоящей.
+
+    Ищем по имени: порядок в словаре — не обещание FlyGym, и молча
+    разъехаться он не должен второй раз.
+    """
+    names = list(fly.config["olfaction"]["sensor_positions"])
+    left = right = None
+    for i, name in enumerate(names):
+        low = name.lower()
+        if "antenna" not in low:
+            continue
+        if low.startswith("l") and left is None:
+            left = i
+        elif low.startswith("r") and right is None:
+            right = i
+    if left is None or right is None:
+        raise ValueError(
+            "в olfaction.sensor_positions не нашлось пары антенн: "
+            + ", ".join(names))
+    return left, right
+
+
 def _pose(obs):
     """Положение в мм и курс в радианах из наблюдения FlyGym."""
     pos = np.asarray(obs["fly"])[0]
@@ -229,10 +259,15 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         print("  открыто окно MuJoCo: мышь вращает камеру, "
               "закрытие окна останавливает эпизод")
 
+    ant_l, ant_r = _odour_channels(body.fly)
+
     def read_odour(obs):
-        """Антенны: [0] левая, [1] правая (проверено сменой стороны источника)."""
+        """Интенсивность на левой и правой АНТЕННЕ.
+
+        Столбцы найдены по имени (`_odour_channels`), а не заданы числом.
+        """
         oi = np.asarray(obs["odor_intensity"])[0]
-        return float(oi[0]), float(oi[1])
+        return float(oi[ant_l]), float(oi[ant_r])
 
     def drive_brain(left_i, right_i, taste_hz, ref):
         """Придуманная часть: интенсивность -> частота рецепторов."""

@@ -47,7 +47,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("было")
     ap.add_argument("стало")
+    ap.add_argument("--ожидаемо", nargs="*", default=[], metavar="СЦЕНАРИЙ",
+                    help="сценарии, где расхождение — не поломка, а "
+                         "сознательная правка модели. Их расхождение "
+                         "печатается целиком, но не считается провалом")
     args = ap.parse_args()
+    expected = set(getattr(args, "ожидаемо") or [])
 
     a = json.loads((OUT / ("bench_v2_%s.json" % getattr(args, "было"))
                     ).read_text(encoding="utf-8"))
@@ -100,6 +105,9 @@ def main():
         elif drift and max(d[3] for d in drift) <= TOL:
             level = "уровень 2: в пределах %.0e" % TOL
             worst = max(worst, 2)
+        elif name in expected:
+            level = "расхождение ОЖИДАЕМО: правка модели"
+            worst = max(worst, 2)
         else:
             level = "РАСХОЖДЕНИЕ"
             worst = 3
@@ -119,7 +127,14 @@ def main():
     if worst == 0:
         print("ВСЁ СОВПАЛО ПОБАЙТОВО — уровень 1 по всем сценариям")
     elif worst == 2:
-        print("числа сошлись в пределах порога — уровень 2, нужна пометка")
+        if expected:
+            print("расхождения только там, где их ждали: %s"
+                  % ", ".join(sorted(expected)))
+            print("это правка модели, а не оптимизация — результат "
+                  "изменился сознательно и помечен")
+        else:
+            print("числа сошлись в пределах порога — уровень 2, "
+                  "нужна пометка")
     else:
         print("ЕСТЬ РАСХОЖДЕНИЯ — в научные прогоны так нельзя")
     return 0 if worst <= 1 else (0 if worst == 2 else 1)

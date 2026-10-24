@@ -63,6 +63,14 @@ class Session:
         self.summary = None
         self.artifacts = []
 
+        # Управление идущим расчётом. `sent` — что окно послало,
+        # `applied` — что работник подтвердил применённым. Два списка, а
+        # не один, именно потому, что это разные события: между ними
+        # лежит шаг управления.
+        self.sent = []
+        self.applied = []
+        self._born = time.perf_counter()
+
         self.body_seq = 0
         self.body_frame = None
         self._body_from = 0
@@ -158,6 +166,31 @@ class Session:
         if self.job_id is not None:
             self.cmd.put(ipc.Cancel(self.job_id))
 
+    def control(self, action, payload=None, at_t_ms=None):
+        """Изменить идущий расчёт. Возвращает номер команды.
+
+        Команда уходит в ту же очередь, что и задачи, но разбирается
+        задачей на границе шага управления: прерывать шаг физики посреди
+        вычисления нельзя. Поэтому отправка — ещё не применение, и
+        подтверждение придёт отдельным сообщением с модельным временем,
+        в которое команду действительно применили.
+
+        `at_t_ms` просит применить не раньше заданного модельного
+        времени; `None` значит «на ближайшей границе».
+        """
+        cmd_id = uuid.uuid4().hex[:8]
+        self.cmd.put(ipc.Control(cmd_id, str(action), payload, at_t_ms))
+        self.sent.append({"команда": cmd_id, "действие": action,
+                          "подана, с": time.perf_counter() - self._born,
+                          "целевое модельное, мс": at_t_ms})
+        del self.sent[:-200]
+        return cmd_id
+
+    def take_applied(self):
+        """Забрать подтверждения, пришедшие с прошлого раза."""
+        got, self.applied = self.applied, []
+        return got
+
     def ask(self, what, arg=None):
         """Спросить работника. Ответ придёт в `answers`, не блокируя окно."""
         req = uuid.uuid4().hex[:8]
@@ -231,6 +264,12 @@ class Session:
                 self.state = "error"
                 self.error = msg.message
             self.log.append("ошибка: " + msg.message)
+        elif isinstance(msg, ipc.Applied):
+            # Подтверждение ФАКТИЧЕСКОГО применения. Окно показывает
+            # именно его: между нажатием и применением лежит шаг
+            # управления, и выдавать отправку за применение нельзя.
+            self.applied.append(msg)
+            del self.applied[:-200]
         elif isinstance(msg, ipc.Answer):
             self._answers[msg.req_id] = msg.payload
             self._pending.pop(msg.req_id, None)

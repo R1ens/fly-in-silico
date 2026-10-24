@@ -65,6 +65,15 @@ class Ctx:
         # одним и тем же именем: каждый следующий эпизод затирал
         # предыдущий.
         self.out_dir = Path(out_dir) if out_dir else None
+        # Разбор команд на ходу. Ставится работником; без него задача
+        # ведёт себя как прежде и ни на какой паузе не стоит.
+        self._drain = None
+        self.paused = False
+        self.stepping = 0
+        self.applied = []
+        self._later = []          # просятся на будущее модельное время
+        self._asked_stop = False
+        self._t0 = time.perf_counter()
 
     # -- данные ---------------------------------------------------------
 
@@ -112,7 +121,94 @@ class Ctx:
         self.emit(ipc.Artifact(self.job_id, kind, str(path)))
 
     def should_stop(self):
+        if self._asked_stop:
+            return True
         return bool(self._stop()) if self._stop is not None else False
+
+    # -- команды на ходу ------------------------------------------------
+
+    def control_point(self, t_ms, state=None):
+        """Безопасная граница шага: разобрать очередь и, если надо, встать.
+
+        Зовётся задачей один раз на шаг управления — там, где состояние
+        модели целостно. Шаг физики посреди вычисления прерывать нельзя,
+        поэтому всё, что пришло за время шага, применяется здесь.
+
+        Правило порядка детерминировано и простое: команды применяются в
+        том порядке, в каком пришли в очередь, и если несколько меняют
+        одно свойство, побеждает последняя. Переставлять их нельзя и
+        терять нельзя — каждая получает подтверждение со своим исходом.
+
+        На паузе очередь продолжает разбираться, но модель стоит: новые
+        события копятся и применяются там же, на границе, когда придёт
+        `resume` или `step`.
+        """
+        if self._drain is None:
+            return False
+        self._take(t_ms, state)
+        while self.paused and not self.should_stop():
+            if self.stepping > 0:
+                self.stepping -= 1
+                return True
+            time.sleep(0.005)
+            self._take(t_ms, state)
+        return not self.paused
+
+    def _take(self, t_ms, state):
+        """Разобрать то, что успело прийти. Ничего не ждёт.
+
+        Сначала созревшие отложенные — они пришли раньше, — потом новые.
+        Порядок внутри каждой группы тот же, в каком команды легли в
+        очередь.
+        """
+        from . import ipc
+
+        ready = [c for c in self._later
+                 if c.at_t_ms is None or t_ms + 1e-9 >= float(c.at_t_ms)]
+        if ready:
+            self._later = [c for c in self._later if c not in ready]
+        for cmd in ready + list(self._drain()):
+            outcome, values, why = "applied", None, ""
+            if cmd.at_t_ms is not None and t_ms + 1e-9 < float(cmd.at_t_ms):
+                # Рано: команда просится на будущее модельное время.
+                # Возвращаем её в собственную очередь ожидания.
+                self._later.append(cmd)
+                continue
+            if cmd.action == "pause":
+                self.paused = True
+            elif cmd.action == "resume":
+                self.paused = False
+                self.stepping = 0
+            elif cmd.action == "step":
+                self.paused = True
+                self.stepping += int((cmd.payload or {}).get("n", 1))
+            elif cmd.action == "stop":
+                self.paused = False
+                self._asked_stop = True
+            elif cmd.action == "set":
+                values, why = self._apply_set(cmd.payload, state)
+                outcome = "applied" if not why else "rejected"
+            else:
+                outcome, why = "rejected", "неизвестное действие %r" % cmd.action
+            rec = ipc.Applied(cmd.cmd_id, cmd.action, float(t_ms),
+                              round(time.perf_counter() - self._t0, 4),
+                              outcome, values, why)
+            self.applied.append(rec)
+            self.emit(rec)
+
+    def _apply_set(self, payload, state):
+        """Изменить параметр идущего расчёта. Пока — только то, что есть.
+
+        Проверка значений делается здесь, в работнике: из окна приходит
+        словарь, и верить ему нельзя. Чего `state` не умеет менять, то
+        отклоняется с причиной, а не применяется наполовину.
+        """
+        if state is None:
+            return None, "этот вид прогона менять на ходу не умеет"
+        try:
+            return state.apply(dict(payload or {})), ""
+        except (ValueError, TypeError, KeyError) as exc:
+            return None, str(exc)[:160]
 
     # -- крючки для работника -------------------------------------------
 
@@ -208,6 +304,9 @@ def _job_stim(spec, ctx):
         seen["bins"] = i + 1
         ctx.frame(t_ms, counts)
         ctx.status("running", "счёт", (i + 1) / n_bins)
+        # У стимуляции безопасная граница — конец бина: внутри бина
+        # движок крутится блоком, и состояние трогать нельзя.
+        ctx.control_point(t_ms)
 
     ctx.status("running", "счёт", 0.0)
     res = sim.run(stimuli, silenced=silenced, config=cfg, neurons=neurons,
@@ -252,6 +351,7 @@ def _job_arena(spec, ctx):
                                  if k in rec})
         ctx.step(rec)
         ctx.status("running", "эпизод", (step + 1) / n_steps)
+        ctx.control_point(rec["t_ms"])
 
     ctx.status("warmup", "разогрев", 0.0)
     ep = _call(loop.run_episode, config=cfg, body_params=body, neurons=neurons,
@@ -288,6 +388,9 @@ def _job_body(spec, ctx):
                                  if k in rec})
         ctx.step(rec)
         ctx.status("running", "эпизод", (step + 1) / n_steps)
+        # Граница шага управления: здесь состояние целостно, и здесь
+        # разбираются команды, пришедшие за время шага.
+        ctx.control_point(rec["t_ms"])
 
     ctx.status("setup", "сборка тела", 0.0)
     video = None
