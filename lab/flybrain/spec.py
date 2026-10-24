@@ -59,6 +59,11 @@ class ArenaSpec:
     dn_tau_s: float = None
     turn_target_rad_s: float = None
     probes: bool = False
+    # Окно записи активности, с. 0 — писать всю сессию, как у обычного
+    # эпизода. Положительное включает кольцо: `bins` держит последние
+    # `keep_s` секунд, счётчики — всю сессию. Нужно длинной сессии, где
+    # полная запись это гигабайты (см. `loop.EpisodeConfig.keep_s`).
+    keep_s: float = 0.0
 
 
 @dataclass
@@ -251,6 +256,7 @@ class RunSpec:
             comment=self.comment,
             comment_every_ms=self.comment_every_ms,
             model=self.model,
+            keep_s=(self.arena.keep_s if self.arena else 0.0) or 0.0,
         )
 
     def to_body_config(self, device=None):

@@ -170,12 +170,16 @@ def load(run, key):
             return None
         bins = z["bins"]
         bin_ms = float(z["bin_ms"])
+        # Запись не обязана начинаться с нуля: у длинной сессии это
+        # последнее окно, и ось, начатая с нуля, показала бы чужое время.
+        t0_ms = float(z["t0_ms"]) if "t0_ms" in z.files else 0.0
         y = bins.sum(axis=1).astype("float64")
-        x = (np.arange(len(y), dtype="float64") + 0.5) * bin_ms
+        x = t0_ms + (np.arange(len(y), dtype="float64") + 0.5) * bin_ms
+        note = "бин %g мс, записанных нейронов %d" % (bin_ms, bins.shape[1])
+        if t0_ms > 0:
+            note += "; запись — окно с %.0f мс, не вся сессия" % t0_ms
         base.update(kind="line", x=x, xlabel="время, мс",
-                    series=[("спайков в бине", y)],
-                    note="бин %g мс, записанных нейронов %d"
-                         % (bin_ms, bins.shape[1]))
+                    series=[("спайков в бине", y)], note=note)
         return base
 
     if key in ("regions", "spread"):

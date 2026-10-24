@@ -541,11 +541,15 @@ def save(result: Result, out_dir: Path, min_rate=0.5):
     )
     result.rate_table(min_rate).to_parquet(out_dir / "rates.parquet")
     keep = result.active(min_rate)
+    # `t0_ms` — модельное время первой строки записи. У обычного прогона
+    # это ноль, у длинной сессии с кольцом — начало последнего окна.
+    # Поле новое, поэтому у прежних файлов его нет: читающий берёт ноль.
     np.savez_compressed(
         out_dir / "bins.npz",
         neuron_idx=keep.astype(np.int32),
         bins=result.bins[:, keep].astype(np.int16),
         bin_ms=np.float32(result.config.bin_ms),
+        t0_ms=np.float32((result.timing or {}).get("запись с, мс", 0.0)),
     )
     return out_dir
 

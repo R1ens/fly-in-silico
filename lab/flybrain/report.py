@@ -331,6 +331,9 @@ TEMPLATE = r"""<!doctype html>
     border:1px solid var(--line);border-radius:6px;padding:6px 9px;font-size:12px;
     display:none;z-index:5;max-width:240px}
   .note{color:var(--dim);font-size:11.5px;line-height:1.45;margin:6px 0 0}
+  ul.cav{margin:6px 0 0;padding-left:16px;list-style:square}
+  ul.cav li{color:var(--accent);font-size:11.5px;line-height:1.5;
+    margin-bottom:5px}
   .narr{white-space:pre-wrap;font-size:12.5px;line-height:1.55;
     background:#0b1017;border:1px solid var(--line);border-radius:6px;padding:10px}
   .cmt{border-left:2px solid #223049;padding:4px 0 4px 9px;margin:0 0 6px;
@@ -413,6 +416,11 @@ TEMPLATE = r"""<!doctype html>
     <h2>Самые активные нейроны</h2>
     <table><thead><tr><th>тип</th><th>область</th><th class="n">Гц</th></tr></thead>
       <tbody id="toptab"></tbody></table>
+
+    <div id="cavbox" style="display:none">
+      <h2>Чем этот прогон отличается от эталонного</h2>
+      <ul class="cav" id="cav"></ul>
+    </div>
 
     <h2>Параметры прогона</h2>
     <div id="metatab"></div>
@@ -1185,6 +1193,19 @@ function metaTable(){
     ['устройство', m.timing.device],
     ['счёт', m.timing.sim_s + ' с'],
   ];
+  // Оговорки приходят из `timing.оговорки` — их писал тот, кто считал.
+  // Вставляются через textContent, а не innerHTML: это текст из файла
+  // прогона, и знак `<` в нём не должен становиться разметкой.
+  const cav = (m.timing && m.timing['оговорки']) || [];
+  if(cav.length){
+    document.getElementById('cavbox').style.display = '';
+    const ul = document.getElementById('cav');
+    for(const c of cav){
+      const li = document.createElement('li');
+      li.textContent = String(c);
+      ul.appendChild(li);
+    }
+  }
   document.getElementById('metatab').innerHTML =
     '<table>' + rows.map(r=>`<tr><td style="color:var(--dim)">${r[0]}</td>
       <td class="n">${r[1]}</td></tr>`).join('') + '</table>';

@@ -1346,6 +1346,20 @@ def _tab_science(app, ctx, r, run):
                 run.state_why, role="small",
                 color=STATE_COLOR.get(run.state, C.faint), wrapped=True)
     s.take(h, sc.px(S.sm))
+    if run.caveats:
+        # Оговорки самого прогона: чем он отличается от эталонного.
+        # Стоят первыми и жёлтым — раньше оговорок про отдельные
+        # графики, потому что они про весь результат, а не про картинку.
+        W.label(ctx, s.take(f.small.gh + sc.px(2)),
+                "Чем этот прогон отличается от эталонного", role="small",
+                color=C.dim)
+        for line in run.caveats:
+            if not s.fits(f.micro.gh * 2):
+                break
+            h = W.label(ctx, L.Rect(content.x, s.area.y, content.w,
+                                    s.area.h), "— " + line, role="micro",
+                        color=C.warn, wrapped=True)
+            s.take(h, sc.px(S.xs))
     _broken(app, ctx, s, content, run)
     for p in PL.available(run):
         if not p.caveat or not s.fits(f.micro.gh * 2):

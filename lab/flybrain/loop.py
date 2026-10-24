@@ -33,6 +33,17 @@ class EpisodeConfig:
     control_ms: float = 20.0
     seed: int = 0
     device: str | None = None
+    # Сколько секунд модельного времени держать в записи. 0 — держать всё
+    # (так считались и считаются научные эпизоды). Положительное число
+    # включает кольцо: `bins` хранит последние `keep_s` секунд, а
+    # счётчики остаются за всю сессию.
+    #
+    # Нужно это длинной интерактивной сессии. Плотный `bins` стоит
+    # 138 639 × 2 байта = 277 КБ на бин: при шаге 20 мс это 13,9 МБ на
+    # секунду модельного времени, десять минут — 8,3 ГБ. Держать такое
+    # нельзя, а молча обрезать запись и не сказать об этом — нельзя тем
+    # более, поэтому окно записи попадает в `timing` и в `bins.npz`.
+    keep_s: float = 0.0
     comment_every_ms: float = 1000.0
     comment: bool = True
     model: str | None = None
@@ -218,9 +229,15 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
     n_steps = int(round(config.duration_s / dt_s))
     requested_steps = n_steps
 
+    # Кольцо записи. `keep_steps == n_steps` — это и есть прежнее
+    # поведение: писать всё, по строке на шаг, и никакого кольца.
+    keep_steps = n_steps
+    if config.keep_s and config.keep_s > 0:
+        keep_steps = max(1, min(n_steps, int(round(config.keep_s / dt_s))))
+
     rates = torch.zeros(1, n, device=device)
     counts = torch.zeros(n, dtype=torch.int64, device=device)
-    bins = torch.zeros(n_steps, n, dtype=torch.int16, device=device)
+    bins = torch.zeros(keep_steps, n, dtype=torch.int16, device=device)
 
     fly = start or FlyState(arena.width * 0.5, arena.height * 0.12,
                             math.radians(80.0))
@@ -295,7 +312,10 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
         for _ in range(block_steps):
             acc += engine.step(rates)[0]
 
-        bins[step] = acc.to(torch.int16)
+        # Счётчики копятся за всю сессию, запись — только за окно: иначе
+        # частоты (`counts / t_run_s`) считались бы по обрезанной записи
+        # и врали бы ровно во столько раз, во сколько окно короче сессии.
+        bins[step % keep_steps] = acc.to(torch.int16)
         counts += acc.to(torch.int64)
 
         block_s = block_steps * sim.DT / 1000.0
@@ -346,11 +366,14 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
             next_comment = t_ms + config.comment_every_ms
 
         if on_step is not None:
-            on_step(step, rec, bins[step].cpu().numpy(), commentator)
+            on_step(step, rec, bins[step % keep_steps].cpu().numpy(),
+                    commentator)
         if should_stop is not None and should_stop():
             n_steps = step + 1
             records = records[:n_steps]
-            bins = bins[:n_steps]
+            # `bins` здесь не режется: при провернувшемся кольце строки
+            # лежат не по порядку, и расставить их можно только зная
+            # окончательное число шагов. Делается это один раз ниже.
             break
 
         if bar is not None:
@@ -370,6 +393,18 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
     # оборвали: n_steps * dt_s не обязано совпадать с заказанной длительностью
     # при неделимом control_ms, и подменять её без причины нельзя.
     dur_s = n_steps * dt_s if n_steps < requested_steps else config.duration_s
+
+    # Кольцо — по времени. До этого места строка шага `i` лежит в слоте
+    # `i % keep_steps`, то есть при провернувшемся кольце самая старая
+    # строка стоит не первой. Поворот ставит их по порядку, и только
+    # после него запись можно подписывать временем.
+    kept = min(n_steps, keep_steps)
+    if n_steps > keep_steps:
+        bins = torch.roll(bins, -(n_steps % keep_steps), dims=0)
+    else:
+        bins = bins[:kept]
+    bins_t0_ms = (n_steps - kept) * config.control_ms
+
     timing = {
         "setup_s": round(t_setup, 3),
         "sim_s": round(t_sim, 3),
@@ -379,6 +414,18 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
     }
     if n_steps < requested_steps:
         timing["duration_s"] = round(dur_s, 6)
+    if kept < n_steps:
+        # Запись короче сессии. Молчать об этом нельзя: по `bins` считают
+        # растр и ход активности, и без подписи они выглядели бы как
+        # целый прогон, начинающийся с нуля.
+        timing["duration_s"] = round(dur_s, 6)
+        timing["окно записи, с"] = round(kept * dt_s, 6)
+        timing["запись с, мс"] = round(bins_t0_ms, 3)
+        timing.setdefault("оговорки", []).append(
+            "запись активности — последнее окно %.3g с из %.3g с сессии "
+            "(с %.0f мс). Счётчики и частоты посчитаны по всей сессии, "
+            "растр и ход активности — только по окну."
+            % (kept * dt_s, dur_s, bins_t0_ms))
     metrics = _metrics(records)
     return Episode(arena, body.p, records, counts.cpu().numpy(),
                    bins.cpu().numpy(), neurons, config, comments, timing,

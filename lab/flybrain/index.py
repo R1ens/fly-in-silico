@@ -393,6 +393,31 @@ def _card_agent(e):
     return _card(e, "агент", _esc(goal), facts, extra)
 
 
+def _caveats_html(e):
+    """Оговорки прогона: чем он отличается от эталонного.
+
+    Собираются из `timing.оговорки` любого блока записи — ключ один и тот
+    же у всех видов, разбирать по видам нечего. Пишет их тот, кто считал
+    (быстрая физика тела, окно записи длинной сессии, правки условий на
+    ходу), а указатель обязан их показать: оговорка, которую никто не
+    видит, оговоркой не является.
+    """
+    seen, lines = set(), []
+    for v in e.values():
+        if not isinstance(v, dict):
+            continue
+        for line in ((v.get("timing") or {}).get("оговорки") or []):
+            line = str(line)
+            if line not in seen:
+                seen.add(line)
+                lines.append(line)
+    if not lines:
+        return ""
+    items = "".join("<li>%s</li>" % _esc(x) for x in lines)
+    return ("<div class='cav'><span>чем отличается от эталонного</span>"
+            "<ul>%s</ul></div>" % items)
+
+
 def _card(e, kind, subtitle, facts, extra="", narrative=None, no_report=False):
     fact_html = "".join(
         f"<div class='f'><span>{_esc(k)}</span><b>{v}</b></div>" for k, v in facts)
@@ -408,6 +433,7 @@ def _card(e, kind, subtitle, facts, extra="", narrative=None, no_report=False):
     <code>{_esc(e['name'])}</code></header>
   <p class="sub">{subtitle}</p>
   <div class="facts">{fact_html}</div>
+  {_caveats_html(e)}
   {extra}{narr}
   {link}
 </article>"""
@@ -526,6 +552,11 @@ TEMPLATE = r"""<!doctype html>
     border-bottom:1px solid var(--line)}
   .tbl td{padding:3px 5px;border-bottom:1px solid #141a24}
   .tbl .n{text-align:right;font-variant-numeric:tabular-nums}
+  .cav{margin:8px 0 0;border-left:2px solid var(--warn);padding:2px 0 2px 9px}
+  .cav>span{display:block;color:var(--warn);font-size:10.5px;
+    font-weight:600;margin-bottom:3px}
+  .cav ul{margin:0;padding-left:14px;list-style:square}
+  .cav li{color:var(--dim);font-size:11px;line-height:1.45;margin-bottom:3px}
   .quote{background:#0b1017;border:1px solid var(--line);border-radius:6px;
     padding:9px 11px;font-size:12px;color:#aab6c6;white-space:pre-wrap;
     max-height:180px;overflow:auto}

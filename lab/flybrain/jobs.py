@@ -328,7 +328,7 @@ def _job_stim(spec, ctx):
 
 
 def _job_arena(spec, ctx):
-    from . import loop
+    from . import live, loop, world
 
     neurons = ctx.neurons
     weights = ctx.weights()
@@ -339,6 +339,13 @@ def _job_arena(spec, ctx):
                        body_params=body)
 
     cfg = spec.to_episode_config()
+    # Арена собирается здесь, а не внутри `run_episode`, ровно по той же
+    # команде и с тем же семенем. Нужна она снаружи для одного: живые
+    # условия должны менять ТОТ объект, который модель читает на каждом
+    # шаге, а не его копию. То же и с `body` — `world.Body` держит
+    # `BodyParams` ссылкой и перечитывает его в `sense` каждый шаг.
+    arena = world.default_arena(cfg.seed)
+    state = live.ArenaLive(arena, body)
     n_steps = max(1, int(round(cfg.duration_s * 1000.0 / cfg.control_ms)))
     seen = {"n": 0}
 
@@ -351,16 +358,36 @@ def _job_arena(spec, ctx):
                                  if k in rec})
         ctx.step(rec)
         ctx.status("running", "эпизод", (step + 1) / n_steps)
-        ctx.control_point(rec["t_ms"])
+        ctx.control_point(rec["t_ms"], state=state)
 
     ctx.status("warmup", "разогрев", 0.0)
-    ep = _call(loop.run_episode, config=cfg, body_params=body, neurons=neurons,
-               weights=weights, progress=False, probes=spec.arena.probes
-               if spec.arena else False,
+    ep = _call(loop.run_episode, arena=arena, config=cfg, body_params=body,
+               neurons=neurons, weights=weights, progress=False,
+               probes=spec.arena.probes if spec.arena else False,
                on_step=on_step, should_stop=ctx.should_stop)
+    _record_edits(ep.timing, state)
     summary = {"kind": "arena", "metrics": ep.metrics, "timing": ep.timing,
                "cancelled": seen["n"] < n_steps}
     return JobResult("arena", ep, summary, cancelled=summary["cancelled"])
+
+
+def _record_edits(timing, state):
+    """Живые правки — часть результата, а не история нажатий.
+
+    Без этого эпизод, у которого посреди счёта поменяли усиление
+    рецепторов или поменяли антенны местами, на диске выглядел бы как
+    чистый. Журнал уезжает в `timing`, оттуда в `episode.json`, в отчёт и
+    в каталог; помеченные правки отдельно собираются в оговорку.
+    """
+    if not getattr(state, "log", None):
+        return
+    timing["живые правки"] = list(state.log)
+    marked = sorted({m for r in state.log for m in r.get("помечено", [])})
+    if marked:
+        timing.setdefault("оговорки", []).append(
+            "условия менялись на ходу, и среди правок есть меняющие смысл "
+            "прогона: %s. С эталонными прогонами этот результат не "
+            "сравнивается." % ", ".join(marked))
 
 
 def _job_body(spec, ctx):

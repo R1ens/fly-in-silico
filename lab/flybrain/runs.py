@@ -103,6 +103,10 @@ class Run:
     has_report: bool = False
     source: str = ""             # "desk" | "cli" | ""
     errors: dict = field(default_factory=dict)   # имя файла -> что с ним
+    # Оговорки прогона: чем он отличается от эталонного. Пишет их тот,
+    # кто считал (`timing.оговорки`), а каталог обязан их показать —
+    # оговорка, которую никто не видит, оговоркой не является.
+    caveats: tuple = ()
 
     @property
     def kind_title(self):
@@ -334,6 +338,19 @@ def _fill_times(r):
             r.errors[name] = err
         elif v is not None:
             small[name] = v
+    # Оговорки собираются со всех видов сразу, одним местом: их пишет
+    # тот, кто считал (`timing.оговорки` — быстрая физика в теле, окно
+    # записи у длинной сессии, правки условий на ходу), а каталог обязан
+    # их показать. Разбирать по видам нечего: ключ один и тот же.
+    seen, caveats = set(), []
+    for v in small.values():
+        for line in ((v.get("timing") or {}).get("оговорки") or []):
+            line = str(line)
+            if line not in seen:
+                seen.add(line)
+                caveats.append(line)
+    r.caveats = tuple(caveats)
+
     main = MAIN_FILE.get(r.kind)
     if main and main in r.errors:
         # Запись остаётся видимой: папка найдена, остальные файлы целы.
