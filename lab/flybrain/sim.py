@@ -70,6 +70,11 @@ class Stimulus:
         return d
 
 
+# Имена режимов скорости. Держатся здесь, а не строками по месту.
+FAST = "быстрый"
+REFERENCE = "эталонный"
+
+
 @dataclass
 class RunConfig:
     t_run_s: float = 1.0
@@ -78,6 +83,12 @@ class RunConfig:
     seed: int = 0
     device: str | None = None
     params: dict = field(default_factory=lambda: dict(MODEL_PARAMS))
+    # Режим скорости. "быстрый" — с CUDA-графами; "эталонный" — без них.
+    # Это не два разных движка: графы дают побайтово тот же результат, и
+    # это проверяется `probe/lif_equal.py` и `probe/bench_cmp.py`.
+    # Эталонный режим оставлен, чтобы было с чем сравнивать и куда
+    # отступить, если граф когда-нибудь поведёт себя иначе.
+    speed: str = FAST
 
 
 class Result:
@@ -213,6 +224,88 @@ class Engine:
         self.spikes = torch.zeros(batch, n, device=device)
         self.refrac = self.refrac_steps.unsqueeze(0).repeat(batch, 1).clone()
 
+        # CUDA-графы: по одному на каждое положение кольца задержек.
+        # Пусто, пока не позвали `use_graphs()`.
+        self._graphs = None
+        self._vstim = None
+        self._pool = None
+
+    def advance_ptr(self):
+        self.ptr = (self.ptr + 1) % self.buf_len
+
+    def use_graphs(self, enable=True):
+        """Записать детерминированную часть шага в CUDA-графы.
+
+        Зачем. Шаг упирается не в работу, а в число обращений к драйверу:
+        73 ядра на один тик 0,1 мс, и при партии в шестнадцать раз большей
+        время растёт всего в 1,74 раза (`probe/profile_lif.py`). Граф
+        отправляет весь этот список одним вызовом.
+
+        Почему графов девятнадцать, а не один. Слот кольца задержек
+        выбирается питоновской переменной `ptr`, а она при записи
+        застывает: один граф всю жизнь читал бы и писал один и тот же
+        слот, и задержка перестала бы существовать. Поэтому пишется по
+        графу на каждое из `buf_len` положений, а на прогоне берётся тот,
+        что отвечает текущему `ptr`.
+
+        Что НЕ попадает в граф: пуассоновский вход. Генератор при захвате
+        получает собственный поток случайных чисел, и результат разошёлся
+        бы с эталоном. Он считается как прежде, а в граф входит готовое
+        `voltage_stim` через постоянный буфер.
+
+        Арифметика не меняется ни на операцию — это те же ядра в том же
+        порядке. Равенство проверяется `probe/lif_equal.py`.
+        """
+        if not enable:
+            self._graphs = None
+            self._vstim = None
+            self._pool = None
+            return False
+        if self.device != "cuda" or not torch.cuda.is_available():
+            return False
+        if self._graphs is not None:
+            return True
+
+        self._vstim = torch.zeros(self.batch, self.n, device=self.device)
+
+        # Прогрев перед захватом — это настоящие шаги: без него захват
+        # ловит ленивую инициализацию библиотек. Но шаги меняют состояние,
+        # и даже на нулевом входе счётчик рефрактерности уходит вперёд на
+        # три. Поэтому состояние снимается до прогрева и возвращается
+        # после — на место, в те же тензоры, на которые ссылаются графы.
+        start_ptr = self.ptr
+        saved = {name: getattr(self, name).clone()
+                 for name in ("v", "conductance", "spikes", "refrac",
+                              "delay_buffer")}
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                self._core(self._vstim)
+        torch.cuda.current_stream().wait_stream(side)
+        self.ptr = start_ptr
+
+        graphs = []
+        for slot in range(self.buf_len):
+            self.ptr = slot
+            g = torch.cuda.CUDAGraph()
+            # Один пул на все графы: иначе временные тензоры шага
+            # размножатся на девятнадцать.
+            if self._pool is None:
+                with torch.cuda.graph(g):
+                    self._core(self._vstim)
+                self._pool = g.pool()
+            else:
+                with torch.cuda.graph(g, pool=self._pool):
+                    self._core(self._vstim)
+            graphs.append(g)
+        self.ptr = start_ptr
+        for name, value in saved.items():
+            getattr(self, name).copy_(value)
+        self._vstim.zero_()
+        self._graphs = graphs
+        return True
+
     def step(self, rates):
         """Advance one 0.1 ms tick.  ``rates`` is [batch, n] in Hz.
 
@@ -230,13 +323,33 @@ class Engine:
         рассуждением, а `probe/lif_equal.py`: отпечатки состояния до и
         после правки совпали побайтово.
         """
-        # Poisson drive straight into the membrane voltage.  Два умножения
-        # оставлены двумя: `(x * gain) * scale` и `x * (gain * scale)` в
-        # общем случае дают разные последние биты.
+        if self._graphs is not None:
+            # Вход считаем как обычно и кладём в постоянный буфер, из
+            # которого его читает граф.
+            self._vstim.copy_(self._poisson(rates))
+            self._graphs[self.ptr].replay()
+            self.advance_ptr()
+            return self.spikes
+        voltage_stim = self._poisson(rates)
+        return self._core(voltage_stim)
+
+    def _poisson(self, rates):
+        """Пуассоновский вход в мембрану. Единственное место со случайностью.
+
+        Вынесен из тела шага нарочно: всё остальное детерминировано и
+        потому записывается в CUDA-граф, а генератор случайных чисел при
+        захвате получил бы собственный поток — числа пошли бы другие, и
+        сравнивать результат с эталоном стало бы не с чем.
+
+        Два умножения оставлены двумя: `(x * gain) * scale` и
+        `x * (gain * scale)` в общем случае дают разные последние биты.
+        """
         poisson = torch.bernoulli(
             rates * self.prob_scale, generator=self.gen) * self.poisson_gain
-        voltage_stim = self.w_scale * poisson
+        return self.w_scale * poisson
 
+    def _core(self, voltage_stim):
+        """Детерминированная часть шага. Её и пишем в граф."""
         # recurrent input: W[post, pre] @ spikes[pre]
         recurrent = self.w_scale * torch.sparse.mm(
             self.w_csr, self.spikes.t().contiguous()).t()
@@ -251,7 +364,7 @@ class Engine:
         delayed = self.delay_buffer[:, self.ptr, :]
         conductance_new = self.conductance * (1.0 - self.tau_syn_f) + delayed * gate
         self.delay_buffer[:, self.ptr, :] = recurrent
-        self.ptr = (self.ptr + 1) % self.buf_len
+        self.advance_ptr()
 
         # Membrane update uses the conductance from the PREVIOUS step, which is
         # what upstream's AlphaLIF.forward does -- it passes the old tensor to
@@ -268,8 +381,15 @@ class Engine:
 
 
 def build_engine(weights=None, neurons=None, silenced=None, params=None,
-                 device=None, batch=1, seed=0, no_refractory=None):
-    """Load what is needed and return a ready :class:`Engine`."""
+                 device=None, batch=1, seed=0, no_refractory=None,
+                 graphs=True):
+    """Load what is needed and return a ready :class:`Engine`.
+
+    `graphs` просит записать шаг в CUDA-графы. По умолчанию да: выигрыш
+    замерен втрое, а результат побайтово тот же. На процессоре и при
+    отказе захвата движок молча остаётся обычным — `use_graphs` вернёт
+    False, и шаг пойдёт прежним путём.
+    """
     if neurons is None:
         neurons = D.load_neurons()
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -280,8 +400,11 @@ def build_engine(weights=None, neurons=None, silenced=None, params=None,
         weights = weights.to(device)
     weights = _silence(weights, np.asarray(silenced if silenced is not None
                                            else [], dtype=np.int64), n)
-    return Engine(weights, n, params=params, device=device, batch=batch,
-                  seed=seed, no_refractory=no_refractory)
+    eng = Engine(weights, n, params=params, device=device, batch=batch,
+                 seed=seed, no_refractory=no_refractory)
+    if graphs:
+        eng.use_graphs()
+    return eng
 
 
 def run(
@@ -329,7 +452,8 @@ def run(
 
     engine = build_engine(weights=weights, neurons=neurons, silenced=silenced,
                           params=p, device=device, batch=B, seed=config.seed,
-                          no_refractory=stim_all)
+                          no_refractory=stim_all,
+                          graphs=(getattr(config, "speed", FAST) != REFERENCE))
     t_setup = time.perf_counter() - t0
 
     rates = torch.zeros(B, n, device=device)
@@ -391,6 +515,10 @@ def run(
         "steps": steps,
         "device": device,
         "realtime_ratio": round(config.t_run_s / t_sim, 4) if t_sim else None,
+        # Режим пишется в каждый прогон: по сохранённому файлу должно быть
+        # видно, чем он посчитан.
+        "speed": getattr(config, "speed", FAST),
+        "graphs": engine._graphs is not None,
     }
     return Result(
         counts.cpu().numpy(),
