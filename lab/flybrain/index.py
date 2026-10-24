@@ -271,8 +271,12 @@ def _card_embodied(e):
         ("совпадение с градиентом",
          f"<b class='{'good' if (align or 0) > 0.05 else ''}'>{align:+.3f}</b>"
          if align is not None else "—"),
+        # Если ни на одном шаге не было включённого источника, метрик
+        # расстояния в файле нет вовсе (body._metrics), и «? → ? мм» было
+        # бы обещанием миллиметров, которых не измеряли.
         ("до источника",
-         f"{met.get('dist_start_mm', '?')} → {met.get('dist_end_mm', '?')} мм"),
+         f"{met.get('dist_start_mm', '?')} → {met.get('dist_end_mm', '?')} мм"
+         if met.get("dist_start_mm") is not None else "нет включённых"),
         ("прошла", f"{met.get('path_mm', '—')} мм"),
         ("скорость", f"{met.get('speed_mm_s', '—')} мм/с"),
         ("длительность", f"{cfg.get('duration_s', '—')} с"),

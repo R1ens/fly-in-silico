@@ -280,3 +280,472 @@ class ArenaLive:
                 "эталонным" % ", ".join(marked))
         self.log.append(rec)
         return now
+
+
+# ------------------------------------------------- живые условия в теле
+
+# Предел прямой стимуляции. Не из вкуса: `sim.Engine._poisson` считает
+# `torch.bernoulli(rates * DT/1000)`, и при DT = 0,1 мс вероятность
+# доходит до единицы на 10 000 Гц. Выше — не стимул, а постоянная
+# единица на каждом тике, то есть не пуассоновский вход вовсе. Тысяча
+# герц оставляет до этого предела десятикратный запас.
+MAX_STIM_HZ = 1000.0
+
+# Сколько прямых стимулов держать одновременно. Каждый — это выборка по
+# DSL и запись в тензор на каждом шаге; предел нужен, чтобы шаг
+# управления не съела сама подача.
+MAX_STIMS = 6
+
+
+BODY_KNOBS = {k.name: k for k in (
+    # --- источники запаха: настоящие mocap-тела модели MuJoCo ---
+    Knob("sources", "arena", "body_sources", None, None, "",
+         "слоты источника запаха: x, y, сила, включён"),
+    # --- вход рецепторов ---
+    Knob("orn_max_hz", "params", "float", 0.0, MAX_STIM_HZ, "Гц",
+         "частота обонятельных рецепторов при насыщении"),
+    Knob("grn_hz", "params", "float", 0.0, MAX_STIM_HZ, "Гц",
+         "частота вкусовых рецепторов на источнике"),
+    Knob("food_radius_mm", "params", "float", 0.0, 60.0, "мм",
+         "с какого расстояния источник считается достигнутым"),
+    Knob("odour_ref", "params", "float", 1e-9, 100.0, "",
+         "яркость, которая считается насыщением рецепторов",
+         marked=True),
+    # --- как выход мозга становится шагом ---
+    Knob("amp_base", "params", "float", 0.0, 2.0, "",
+         "амплитуда шага при нулевой асимметрии"),
+    Knob("amp_span", "params", "float", 0.0, 2.0, "",
+         "на сколько её меняет одна сигма асимметрии"),
+    Knob("amp_min", "params", "float", 0.0, 2.0, "",
+         "нижний предел амплитуды"),
+    Knob("amp_max", "params", "float", 0.0, 2.0, "",
+         "верхний предел амплитуды"),
+    Knob("dn_tau_s", "params", "float", 0.0, 5.0, "с",
+         "сглаживание выхода популяции"),
+    # --- вмешательства, меняющие смысл сеанса ---
+    Knob("swap_antennae", "params", "bool", None, None, "",
+         "поменять антенны местами: контроль на двусторонний путь",
+         marked=True),
+    Knob("cross", "params", "bool", None, None, "",
+         "перекрёстная связь полушарий с ногами", marked=True),
+    # --- прямая стимуляция по DSL ---
+    Knob("stim", "params", "stims", None, None, "",
+         "прямые нейронные стимулы: запрос DSL и частота"),
+)}
+
+
+def _body_source(tag, d):
+    extra = set(d) - {"x", "y", "strength", "on"}
+    if extra:
+        raise ValueError("%s: лишние поля %s" % (tag, ", ".join(sorted(extra))))
+    on = d.get("on", True)
+    if not isinstance(on, bool):
+        raise ValueError("%s.on: нужно да или нет, пришло %r" % (tag, on))
+    return {
+        # Пределы — половина арены OdorArena (300×300 мм): за краем пола
+        # источник висел бы в воздухе, и сцена показывала бы ерунду.
+        "x": _num(tag + ".x", d.get("x", 0.0), -150.0, 150.0, "мм"),
+        "y": _num(tag + ".y", d.get("y", 0.0), -150.0, 150.0, "мм"),
+        "strength": _num(tag + ".strength", d.get("strength", 1.0),
+                         0.0, 100.0, ""),
+        "on": on,
+    }
+
+
+def _stims(name, value):
+    """Разобрать список прямых стимулов. Запросы DSL здесь не проверяются.
+
+    Разбор запроса требует таблицы нейронов, а она есть только у
+    привязанного состояния, поэтому запрос проверяется в
+    :meth:`BodyLive._resolve_stims` — там же, где становится известно,
+    сколько нейронов он нашёл.
+    """
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("%s: нужен список, пришло %r"
+                         % (name, type(value).__name__))
+    if len(value) > MAX_STIMS:
+        raise ValueError("%s: не больше %d стимулов, пришло %d"
+                         % (name, MAX_STIMS, len(value)))
+    out = []
+    for i, item in enumerate(value):
+        tag = "%s[%d]" % (name, i)
+        if not isinstance(item, dict):
+            raise ValueError("%s: нужен словарь, пришло %r"
+                             % (tag, type(item).__name__))
+        extra = set(item) - {"query", "rate_hz"}
+        if extra:
+            raise ValueError("%s: лишние поля %s"
+                             % (tag, ", ".join(sorted(extra))))
+        q = str(item.get("query", "")).strip()
+        if not q:
+            raise ValueError("%s.query: пустой запрос" % tag)
+        out.append({"query": q,
+                    "rate_hz": _num(tag + ".rate_hz",
+                                    item.get("rate_hz", 0.0),
+                                    0.0, MAX_STIM_HZ, "Гц")})
+    return out
+
+
+class BodyLive:
+    """Живые условия сеанса в теле: настоящая модель MuJoCo.
+
+    Отличие от :class:`ArenaLive` принципиальное. Там средой была наша
+    же плоская арена, и менять в ней можно было что угодно. Здесь среда —
+    ``OdorArena`` из FlyGym внутри MuJoCo, и у неё два следствия.
+
+    **Слоты источников создаются при сборке модели.** Маркер источника —
+    это ``mocap``-тело MJCF (``odor_source_marker_<i>``), и добавить тело
+    в собранную модель нельзя, не пересобрав её. Поэтому «добавить
+    источник» — это включить свободный слот, а не создать объект. Сколько
+    слотов, столько и задаётся при запуске сеанса.
+
+    **Яркость считается по кэшам, а не по массиву положений.**
+    ``OdorArena.get_olfaction`` читает ``_odor_source_repeated`` и
+    ``_peak_intensity_repeated``, собранные в конструкторе. Записать
+    новое положение в ``odor_source`` и успокоиться нельзя: кэш надо
+    пересобрать, иначе муха будет чуять источник там, где его уже нет.
+
+    Что меняется на каждое перемещение слота, и всё это — состояние
+    модели, а не картинка:
+
+    * ``arena.odor_source[i]`` и кэш ``_odor_source_repeated`` — то, что
+      считают сенсоры антенн;
+    * ``physics.data.mocap_pos[i]`` — то, где маркер стоит в сцене;
+    * ``sources[i]`` — массив, по которому эпизод считает расстояние до
+      источника, вкус и совпадение курса с направлением на него;
+    * прозрачность маркера (``model.geom_rgba``) — выключенный слот не
+      должен выглядеть работающим.
+
+    Первые три обязаны совпадать, иначе окно показывает одно, а модель
+    чует другое. Это и проверяет ``probe/sandbox_link.py``.
+    """
+
+    # Прозрачность маркера выключенного слота. Совсем прятать его нельзя:
+    # слот остаётся в модели, и видеть, где он, пользователю надо.
+    OFF_ALPHA = 0.18
+
+    def __init__(self, initial=None):
+        self.initial = dict(initial or {})
+        self.body = None
+        self.sources = None
+        self.params = None
+        self.neurons = None
+        self.device = "cpu"
+        self.log = []
+        self.start = {}
+        self._stims = []          # [{"query","rate_hz","n","idx"}]
+        self._drive = None        # тензор (1, n) с прямыми стимулами
+        self._idx_cache = {}
+        self._kept = {}           # заказанная сила слота, как её просили
+        # Включённость хранится отдельно от силы. Выводить её из
+        # `strength > 0` нельзя: слот, включённый с нулевой силой, читался
+        # бы как выключенный, тумблер в окне стоял бы «включён», а панель
+        # показывала бы «выключен» — и ни одного признака расхождения.
+        self._on = {}
+        self._mocap = {}
+        self._geom = {}
+
+    # -- привязка к собранной модели ------------------------------------
+
+    def attach(self, body, sources, cfg, neurons, device):
+        self.body = body
+        self.sources = sources
+        self.params = cfg
+        self.neurons = neurons
+        self.device = device
+        self._marker_rows()
+        if self.initial:
+            # Это исходные условия сеанса, а не правка на ходу: зовётся
+            # до разогрева и в журнале стоит отдельной записью.
+            self.start = dict(self.apply(self.initial, initial=True))
+        self.start.setdefault("sources", self._read_sources())
+        self.start.setdefault("odour_ref", getattr(cfg, "odour_ref", None))
+
+    def _marker_rows(self):
+        """Строки `mocap_pos` и геометрия маркеров — по имени, не по счёту.
+
+        Отказ здесь громкий и сразу. Если сборка FlyGym переименует
+        маркеры, молчаливый пропуск дал бы правку наполовину: яркость и
+        массив эпизода переехали бы, а маркер в сцене остался бы на
+        прежнем месте — окно показывало бы одно, а муха чуяла другое.
+        Проверяется и `mocapid`: у немокапного тела он −1, и запись в
+        `mocap_pos[-1]` молча сдвинула бы чужое тело.
+        """
+        m = self.body.physics.model
+        self._mocap, self._geom = {}, {}
+        for i in range(int(m.nbody)):
+            try:
+                name = m.body(i).name
+            except Exception:                         # noqa: BLE001
+                name = ""
+            if not name or "odor_source_marker" not in str(name):
+                continue
+            try:
+                slot = int(str(name).rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            row = int(m.body_mocapid[i])
+            if row < 0:
+                raise RuntimeError(
+                    "маркер источника %r не мокапное тело (mocapid %d): "
+                    "положение источника задать нечем" % (str(name), row))
+            self._mocap[slot] = row
+            adr, num = int(m.body_geomadr[i]), int(m.body_geomnum[i])
+            if num > 0:
+                self._geom[slot] = adr
+        want = int(self.body.arena.odor_source.shape[0])
+        missing = [i for i in range(want) if i not in self._mocap]
+        if missing:
+            raise RuntimeError(
+                "в модели %d источников, а маркеров нашлось %d: нет слотов "
+                "%s. Их имена задаёт `OdorArena` (`odor_source_marker_<i>`); "
+                "без них перенос источника не дойдёт до сцены"
+                % (want, len(self._mocap), missing))
+
+    # -- что модель считает прямо сейчас --------------------------------
+
+    def slots(self):
+        if self.body is None:
+            return 0
+        return int(self.body.arena.odor_source.shape[0])
+
+    def _read_sources(self):
+        if self.body is None:
+            return []
+        ar = self.body.arena
+        out = []
+        for i in range(self.slots()):
+            # Сила показывается заказанная, а не та, что сейчас в модели:
+            # у выключенного слота в модели ноль, и иначе включение
+            # выглядело бы как появление силы из ниоткуда.
+            out.append({"x": round(float(ar.odor_source[i, 0]), 4),
+                        "y": round(float(ar.odor_source[i, 1]), 4),
+                        "strength": round(float(self._kept.get(
+                            i, float(ar.peak_odor_intensity[i, 0]))), 6),
+                        "on": bool(self._on.get(i, True))})
+        return out
+
+    def active_sources(self):
+        """Маска включённых слотов — для расстояния, вкуса и курса.
+
+        Выключенный слот остаётся в модели, но едой не является:
+        выбирать его как ближайший источник значит кормить муху тем,
+        чего нет. Поэтому эпизод спрашивает маску, а не считает по всем.
+        """
+        if self.body is None:
+            return None
+        if not self._on:
+            # Ничего ещё не задавали: ни исходных условий, ни правок.
+            # `None` значит «маски нет», и эпизод считает по всем
+            # источникам — то есть ровно так, как считался без живых
+            # условий вообще. Возвращать список из одних `True` было
+            # хуже: равенство с прежним расчётом держалось бы на
+            # арифметическом совпадении `np.where`, а не на том, что
+            # этот код не исполняется.
+            return None
+        # Включённый слот с нулевой силой — всё ещё включённый: его не
+        # чует ни одна антенна, но едой он считается, и расстояние до
+        # него осмысленно. Поэтому маска берётся из признака, а не из
+        # силы.
+        return [bool(self._on.get(i, True)) for i in range(self.slots())]
+
+    def snapshot(self):
+        out = {}
+        for k in BODY_KNOBS.values():
+            if k.name == "sources":
+                out["sources"] = self._read_sources()
+            elif k.name == "stim":
+                out["stim"] = [{"query": s["query"], "rate_hz": s["rate_hz"],
+                                "нейронов": s["n"]} for s in self._stims]
+            else:
+                out[k.name] = getattr(self.params, k.name, None)
+        return out
+
+    def schema(self):
+        cur = self.snapshot()
+        return [{"имя": k.name, "тип": k.kind, "от": k.lo, "до": k.hi,
+                 "единица": k.unit, "что": k.what, "помечено": k.marked,
+                 "сейчас": cur.get(k.name)}
+                for k in BODY_KNOBS.values()]
+
+    # -- прямые стимулы -------------------------------------------------
+
+    def add_drive(self, rates):
+        """Поднять частоты шага до заданных прямыми стимулами.
+
+        Про это надо знать одно, и это не очевидно: сенсорные каналы
+        собраны в `no_refractory` при сборке движка, а нейроны, выбранные
+        стимулом на ходу, — нет. Значит у них остаётся рефрактерный
+        период, и та же частота даст меньше спайков, чем на антеннах.
+        Менять `no_refractory` на ходу нельзя: это пересборка движка.
+        """
+        import torch
+
+        if self._drive is not None:
+            # Не сложение, а максимум. Сложение нарушало объявленный
+            # предел: стимул на 1000 Гц, наведённый на те же нейроны, что
+            # сенсорный канал, давал бы 1000 + 150 Гц — выше того, что
+            # названо пределом, и нигде это не было бы видно. Максимум
+            # держит предел и читается однозначно: стимул задаёт нижнюю
+            # границу частоты, а не добавку к ней.
+            torch.maximum(rates, self._drive, out=rates)
+
+    def _resolve_stims(self, want):
+        """Разобрать запросы DSL. Только проверка, ничего не меняет.
+
+        Делается это на этапе проверки, а не записи, и именно поэтому.
+        Разбор запроса — единственное в правке, что может отказать уже
+        после того, как слоты источника переписаны в модель: тогда
+        подтверждение сказало бы «отклонено», а модель была бы изменена
+        наполовину, и воспроизвести такой сеанс по журналу стало бы
+        нельзя. Теперь отказать может только проверка.
+        """
+        from . import data as D
+
+        ready = []
+        for i, s in enumerate(want):
+            idx = self._idx_cache.get(s["query"])
+            if idx is None:
+                try:
+                    idx = D.select(self.neurons, s["query"])
+                except ValueError as exc:
+                    raise ValueError("стимул %d: запрос %r не разбирается: %s"
+                                     % (i + 1, s["query"], exc))
+                self._idx_cache[s["query"]] = idx
+            if not len(idx):
+                raise ValueError("стимул %d: запрос %r не нашёл ни одного "
+                                 "нейрона" % (i + 1, s["query"]))
+            ready.append(dict(s, n=int(len(idx)), idx=idx))
+        return ready
+
+    def _install_stims(self, ready):
+        """Записать разобранные стимулы. Отказать здесь уже нечему."""
+        import torch
+
+        if not ready:
+            self._stims, self._drive = [], None
+            return []
+        n = len(self.neurons)
+        drive = torch.zeros(1, n, device=self.device)
+        for s in ready:
+            t = torch.as_tensor(s["idx"], device=self.device)
+            # Два стимула на одни нейроны не складываются, а побеждает
+            # последний: сложение тихо вышло бы за предел Пуассона.
+            drive[0, t] = float(s["rate_hz"])
+        self._stims, self._drive = ready, drive
+        return [{"query": s["query"], "rate_hz": s["rate_hz"],
+                 "нейронов": s["n"]} for s in ready]
+
+    # -- применение -----------------------------------------------------
+
+    def apply(self, payload, initial=False):
+        """Проверить всё, потом записать. Возвращает применённое.
+
+        Порядок именно такой: при отказе модель остаётся в том
+        состоянии, в каком была, и подтверждение несёт причину.
+        """
+        if self.body is None:
+            raise ValueError("сеанс ещё не собран: менять нечего")
+        if not isinstance(payload, dict):
+            raise TypeError("правка должна быть словарём, пришло %r"
+                            % type(payload).__name__)
+        if not payload:
+            raise ValueError("пустая правка: нечего менять")
+        unknown = [k for k in payload if k not in BODY_KNOBS]
+        if unknown:
+            raise KeyError("менять нельзя: %s; можно: %s"
+                           % (", ".join(sorted(unknown)),
+                              ", ".join(sorted(BODY_KNOBS))))
+
+        slots = self.slots()
+        ready = {}
+        for name, value in payload.items():
+            k = BODY_KNOBS[name]
+            if k.kind == "float":
+                ready[name] = _num(name, value, k.lo, k.hi, k.unit)
+            elif k.kind == "bool":
+                ready[name] = _bool(name, value)
+            elif k.kind == "body_sources":
+                if not isinstance(value, (list, tuple)):
+                    raise ValueError("sources: нужен список из %d слотов"
+                                     % slots)
+                if len(value) != slots:
+                    raise ValueError(
+                        "sources: слотов в модели %d, а пришло %d. Слот — "
+                        "это тело MJCF, их число задаётся при сборке модели "
+                        "и на ходу не меняется: «добавить источник» — это "
+                        "включить свободный слот" % (slots, len(value)))
+                ready[name] = [
+                    _body_source("sources[%d]" % i,
+                                 d if isinstance(d, dict) else {})
+                    for i, d in enumerate(value)]
+            elif k.kind == "stims":
+                # Разбор запросов — здесь же, в проверке: иначе отказ
+                # пришёлся бы на этап записи, когда слоты уже переписаны.
+                ready[name] = self._resolve_stims(_stims(name, value))
+            else:                                     # pragma: no cover
+                raise ValueError("%s: неизвестный тип %r" % (name, k.kind))
+
+        was, now = {}, {}
+        snap = self.snapshot()
+        for name, value in ready.items():
+            was[name] = snap.get(name)
+            if name == "sources":
+                self._write_sources(value)
+                now[name] = self._read_sources()
+            elif name == "stim":
+                now[name] = self._install_stims(value)
+            else:
+                setattr(self.params, name, value)
+                now[name] = getattr(self.params, name)
+
+        marked = sorted(n for n in ready if BODY_KNOBS[n].marked)
+        rec = {"что": "исходные условия" if initial else "правка",
+               # Время правки ставит `jobs.Ctx._apply_set`: только он
+               # знает модельное время границы шага. У исходных условий
+               # оно нулевое по смыслу — они применяются до разогрева.
+               "модельное, мс": 0.0 if initial else None,
+               "было": was, "стало": now}
+        if marked and not initial:
+            rec["помечено"] = marked
+            rec["оговорка"] = (
+                "изменено на ходу: %s — сеанс перестал быть сравнимым с "
+                "эталонным" % ", ".join(marked))
+        self.log.append(rec)
+        return now
+
+    def _write_sources(self, want):
+        """Положение и сила слотов — в модель, в кэш, в сцену и в массив."""
+        import numpy as np
+
+        ar = self.body.arena
+        for i, d in enumerate(want):
+            ar.odor_source[i, 0] = d["x"]
+            ar.odor_source[i, 1] = d["y"]
+            # Сила выключенного слота — ноль: так его не чует ни одна
+            # антенна, где бы он ни стоял. Заказанную силу помним, чтобы
+            # включение вернуло её, а не единицу по умолчанию.
+            self._kept[i] = d["strength"]
+            self._on[i] = bool(d["on"])
+            ar.peak_odor_intensity[i, 0] = d["strength"] if d["on"] else 0.0
+            if self.sources is not None and i < len(self.sources):
+                self.sources[i, 0] = d["x"]
+                self.sources[i, 1] = d["y"]
+            row = self._mocap.get(i)
+            if row is not None:
+                # Маркер — mocap-тело: его положение задаётся данными, а
+                # не моделью, и следующий шаг физики поставит его туда.
+                self.body.physics.data.mocap_pos[row, 0] = d["x"]
+                self.body.physics.data.mocap_pos[row, 1] = d["y"]
+            g = self._geom.get(i)
+            if g is not None:
+                self.body.physics.model.geom_rgba[g, 3] = (
+                    1.0 if d["on"] else self.OFF_ALPHA)
+
+        # Кэши `OdorArena` собраны в её конструкторе: без пересборки муха
+        # будет чуять источник там, где его уже нет.
+        rep = ar.odor_source[:, np.newaxis, np.newaxis, :]
+        rep = np.repeat(rep, ar.odor_dimensions, axis=1)
+        ar._odor_source_repeated = np.repeat(rep, ar.num_sensors, axis=2)
+        pk = ar.peak_odor_intensity[:, :, np.newaxis]
+        ar._peak_intensity_repeated = np.repeat(pk, ar.num_sensors, axis=2)

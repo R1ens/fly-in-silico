@@ -37,7 +37,8 @@ __all__ = ["PHASES", "WorkerState", "RunState", "SelectionState",
 PHASES = ("idle", "prep", "run", "cancel", "done", "fail")
 
 WORKSPACES = (("experiment", "Эксперимент"), ("brain", "Мозг"),
-              ("body", "Тело"), ("analysis", "Анализ"))
+              ("body", "Тело"), ("sandbox", "Песочница"),
+              ("analysis", "Анализ"))
 
 # Виды камеры тела: ключ, подпись, имя камеры FlyGym (не используется —
 # без объекта камеры их в модели нет, см. probe/cams.py) и настройка:
@@ -173,6 +174,13 @@ class SelectionState:
     matched_note: str = ""
 
 
+# Потолок отдаления по вьюпортам. У песочницы он больше: источники
+# запаха стоят в 14 мм от мухи, а охват камеры слежения считается по её
+# габариту (около 5 мм), и при множителе четыре источник оказывается у
+# самого края кадра — взять его мышью нельзя.
+CAMERA_DIST_MAX = {"sandbox": 12.0}
+
+
 @dataclass
 class CameraState:
     """Вид одного вьюпорта.
@@ -189,6 +197,12 @@ class CameraState:
     free: bool = False           # ушли от именованной камеры вручную
     fit: bool = True             # пересчитать охват на ближайшем кадре
     layers: tuple = ()           # включённые отладочные слои
+    # Потолок отдаления — у каждого вьюпорта свой. Общий был ошибкой:
+    # подняв его ради песочницы (источники стоят в 14 мм, а охват
+    # считается по габариту мухи в 5 мм), я поднял его и в «Теле», где
+    # он достигается кнопкой «отдалить» и колесом, а не только
+    # ползунком с его собственными пределами.
+    dist_max: float = 4.0
 
     def reset(self):
         self.yaw = self.pitch = 0.0
@@ -202,7 +216,7 @@ class CameraState:
         self.free = True
 
     def zoom(self, k):
-        self.dist = max(0.3, min(4.0, self.dist * float(k)))
+        self.dist = max(0.3, min(self.dist_max, self.dist * float(k)))
         self.free = True
 
 
@@ -333,6 +347,138 @@ class WorkspaceState:
         return False
 
 
+# ------------------------------------------------------------- песочница
+
+# Слоты источника запаха по умолчанию. Ближе, чем в научных эпизодах
+# (там 25 и 38 мм): камера слежения считает охват по габариту мухи, пять
+# миллиметров, и источник в тридцати миллиметрах в кадр не попадает
+# вовсе. Здесь он должен быть виден вместе с мухой, иначе его нельзя
+# взять в сцене.
+SANDBOX_SLOTS = ((12.0, 8.0), (12.0, -8.0), (-12.0, 8.0), (-12.0, -8.0))
+
+# Яркость насыщения рецепторов для сеанса. Задаётся числом, а не мерится
+# на разогреве: сеанс начинается с выключенными источниками, и
+# измеренная по началу яркость была бы нулевой — первый же включённый
+# источник насытил бы рецепторы до потолка.
+#
+# Число взято из замера: источник силой 1 на расстоянии 14 мм даёт
+# яркость около 0,005 (обратный квадрат расстояния, `OdorArena`).
+SANDBOX_ODOUR_REF = 0.005
+
+# Высота слоя, по которому ведётся перетаскивание: маркеры источников
+# стоят на 1,5 мм над полом.
+SANDBOX_Z = 1.5
+
+
+@dataclass
+class SandboxSlot:
+    """Слот источника запаха — так, как его видит окно.
+
+    Это намерение пользователя, а не состояние модели. Состояние модели
+    приходит подтверждением от работника, и до него слот показывается
+    как «ожидает применения».
+    """
+
+    x: float = 0.0
+    y: float = 0.0
+    strength: float = 1.0
+    on: bool = False
+
+    def as_payload(self):
+        return {"x": round(float(self.x), 4), "y": round(float(self.y), 4),
+                "strength": round(float(self.strength), 4),
+                "on": bool(self.on)}
+
+
+@dataclass
+class SandboxState:
+    """Состояние рабочего пространства «Песочница».
+
+    Три вещи, которые здесь держатся отдельно и путать их нельзя:
+
+    * `slots` — чего хочет пользователь;
+    * `applied` — что работник подтвердил как состояние модели;
+    * `pending` — команды, ушедшие и ещё не подтверждённые.
+
+    Пока они различаются, окно показывает именно это различие: иначе
+    подпись «источник перемещён» означала бы «кнопка нажата».
+    """
+
+    slots: list = field(default_factory=lambda: [
+        SandboxSlot(x=x, y=y) for x, y in SANDBOX_SLOTS])
+    picked: int = -1              # выбранный слот, -1 — ни один
+    drag: int = -1                # слот, который тянут мышью
+    drag_from: tuple = ()         # откуда начали тянуть, для отмены
+
+    # --- сеанс ---
+    t_run: float = 0.0            # 0 — без заранее заданного конца
+    keep_s: float = 20.0          # окно записи активности, с
+    odour_ref: float = SANDBOX_ODOUR_REF
+    # Частота рецепторов при насыщении — та же, что у `BodyConfig`.
+    # Держится здесь, чтобы показания могли сказать, когда оба канала
+    # упёрлись в потолок и двусторонней разницы не стало.
+    orn_max_hz: float = 150.0
+    seed: int = 0
+    readout: str = "ALPN"
+
+    # --- прямой стимул ---
+    query: str = "region:AL+side:left"
+    stim_hz: float = 100.0
+    stim_on: bool = False
+    stim_note: str = ""
+    stim_bad: bool = False
+
+    # --- что подтвердил работник ---
+    applied_slots: list = field(default_factory=list)
+    applied_stim: list = field(default_factory=list)
+    pending: dict = field(default_factory=dict)   # cmd_id -> запись
+    events: list = field(default_factory=list)
+    events_max: int = 400
+
+    # --- измеренная скорость ---
+    speed_ms: float = 0.0         # модельного времени на последней выборке
+    speed_wall: float = 0.0
+    ratio: float = 0.0            # модельное к настенному, измеренное
+    paused: bool = False
+    cam: dict = None              # поза камеры того кадра, что на экране
+    cam_seq: int = -1             # номер кадра, которому поза принадлежит
+    # Держать правку до следующего шага вместо применения на ближайшей
+    # границе. Нужно это паузе: так правку можно подготовить, а
+    # применится она ровно тем шагом, который сделает «Один шаг».
+    on_next: bool = False
+    control_ms: float = 20.0      # шаг управления сеанса
+
+    def payload(self):
+        return [s.as_payload() for s in self.slots]
+
+    def new_session(self):
+        """Забыть всё, что относилось к прошлому сеансу.
+
+        Без этого второй сеанс в том же окне начинался с чужими
+        числами: модельное время идёт заново, значит разность для
+        скорости отрицательна, а «применённые раздражители» и «ждут
+        применения» первые секунды описывают прошлый прогон.
+        """
+        self.applied_slots = []
+        self.applied_stim = []
+        self.pending = {}
+        self.cam = None
+        self.cam_seq = -1
+        self.speed_ms = 0.0
+        self.speed_wall = 0.0
+        self.ratio = 0.0
+        self.paused = False
+        self.drag = -1
+
+    def note(self, what, t_ms=None, detail="", level="info"):
+        """Запись в журнал событий — с модельным временем, если оно есть."""
+        self.events.append({"что": what, "модельное, мс": t_ms,
+                            "по стене": time.time(), "подробно": detail,
+                            "уровень": level})
+        if len(self.events) > self.events_max:
+            del self.events[:len(self.events) - self.events_max]
+
+
 @dataclass
 class AppState:
     """Всё состояние окна в одном месте, но не в одной куче."""
@@ -342,6 +488,7 @@ class AppState:
     sel: SelectionState = field(default_factory=SelectionState)
     brain: BrainState = field(default_factory=BrainState)
     ws: WorkspaceState = field(default_factory=WorkspaceState)
+    sb: SandboxState = field(default_factory=SandboxState)
     cams: dict = field(default_factory=dict)
 
     # параметры сборки прогона: ровно те, что уходят в RunSpec
@@ -371,9 +518,16 @@ class AppState:
     log_max: int = 400
 
     def camera(self, key):
+        """Вид одного вьюпорта. У каждого ключа — своё состояние.
+
+        Песочница берёт свой ключ, а не чужой: камера «Тела» — тот же
+        объект, который читает `send_camera`, и широкое отдаление
+        песочницы уезжало прямо в «Тело». Своё состояние и свой потолок.
+        """
         st = self.cams.get(key)
         if st is None:
-            st = self.cams[key] = CameraState()
+            st = self.cams[key] = CameraState(
+                dist_max=CAMERA_DIST_MAX.get(key, 4.0))
         return st
 
     def note(self, text, level="info"):

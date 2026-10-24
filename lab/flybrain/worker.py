@@ -569,6 +569,7 @@ class _WorkerCtx:
         self.span = 5.0
         self._warm = False
         self.pictures = 0
+        self.last_cam = None
         self.render_ms = 0.0
         self._mark = time.perf_counter()
 
@@ -601,6 +602,27 @@ class _WorkerCtx:
         self.w.ring.write(self.ren.render())
         self.pictures += 1
         self.render_ms += (time.perf_counter() - t) * 1000.0
+        # Поза камеры, которой снят ИМЕННО этот кадр. Нужна она окну для
+        # одного: чтобы щелчок по сцене можно было перевести в
+        # координаты модели, а не угадать. Берётся не из настроек, а из
+        # разрешённой сцены — там учтены и слежение за мухой, и охват,
+        # посчитанный по её габариту, чего окно не знает.
+        gc = self.ren.scene.camera[0]
+        self.last_cam = {
+            "pos": [float(v) for v in gc.pos],
+            "forward": [float(v) for v in gc.forward],
+            "up": [float(v) for v in gc.up],
+            "near": float(gc.frustum_near), "far": float(gc.frustum_far),
+            "bottom": float(gc.frustum_bottom), "top": float(gc.frustum_top),
+            "centre": float(gc.frustum_center),
+            "ortho": bool(gc.orthographic),
+            # `RING_SHAPE` — это (высота, ширина): так его принимает
+            # `mujoco.Renderer`. Перепутать здесь местами значит дать
+            # окну неверную проекцию, и на кадре 960×720 промах выходит
+            # под двести пикселей (поймано `probe/scene_pick.py`).
+            "w": int(RING_SHAPE[1]), "h": int(RING_SHAPE[0]),
+            "pic": int(self.pictures),
+        }
 
     def extras(self):
         if not self.pictures:

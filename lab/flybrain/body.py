@@ -69,7 +69,32 @@ class BodyConfig:
     # Пропуск лишнего пересчёта прямой динамики. Выключено по умолчанию,
     # пока равенство не доказано на этой модели: см. `_fly_class`.
     fast_physics: bool = False
+
+    # --- сеанс песочницы ---
+    #
+    # `duration_s <= 0` — сеанс без заранее заданного конца: его
+    # заканчивает только остановка. Такой сеанс ОБЯЗАН держать кольцо
+    # записи (`keep_s > 0`), иначе плотный `bins` растёт без предела:
+    # 138 639 × 2 байта = 277 КБ на шаг управления, при шаге 20 мс это
+    # 13,9 МБ на секунду модельного времени.
+    keep_s: float = 0.0
+
+    # Яркость, которая считается насыщением рецепторов. `None` — мерить
+    # на разогреве по тому, что муха чует в начале (так считались все
+    # прежние эпизоды). Песочнице нужно число: если сеанс начинается с
+    # выключенными источниками, измеренная яркость будет нулевой, и
+    # первый же включённый источник насытит рецепторы до потолка.
+    odour_ref: float | None = None
+
     view_every: int = 1  # обновлять окно раз в столько шагов управления
+
+
+# Предел шагов у сеанса «без конца». Это не длительность, а то, на чём
+# арифметика ещё не теряет смысл: 10 млн шагов управления по 20 мс — это
+# 55 часов модельного времени, то есть при измеренной скорости около
+# 0,08 от настенной порядка месяца счёта. До него не дойдёт ни один
+# сеанс, а `range` и оценки времени остаются конечными.
+ENDLESS_STEPS = 10_000_000
 
 
 DEFAULT_SOURCES = np.array([
@@ -249,16 +274,37 @@ def _pose(obs):
 
 def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                 sources=None, progress=True, on_step=None, should_stop=None,
-                video_path=None, on_body=None):
+                video_path=None, on_body=None, live=None):
     """Эпизод в теле. ``on_body(body)`` зовётся один раз, когда тело собрано
     и сброшено: живому окну нужен доступ к физической модели, чтобы снимать
     кадры своим ``mujoco.Renderer`` — камера FlyGym отмеряет кадры по
     модельному времени и для живого вида не годится.
+
+    ``live`` — состояние живых условий (:class:`flybrain.live.BodyLive`) или
+    ``None``. Контракт ровно из двух вызовов, и оба на виду:
+
+    * ``live.attach(body, sources, cfg, neurons, device)`` — один раз,
+      когда тело собрано: состояние получает ссылки на настоящую модель
+      MuJoCo, на массив положений источников и на настройку, и дальше
+      меняет их на месте;
+    * ``live.add_drive(rates)`` — на каждом шаге, после того как в
+      ``rates`` записаны сенсорные каналы: так в расчёт попадают прямые
+      нейронные стимулы;
+    * ``live.active_sources()`` — на каждом шаге: какие слоты источника
+      включены. Выключенный слот остаётся в модели, но едой не является.
+
+    Без ``live`` ни один из вызовов не делается, и эпизод считается в
+    точности как раньше.
     """
     import torch
 
     cfg = cfg or BodyConfig()
-    sources = DEFAULT_SOURCES if sources is None else np.asarray(sources, float)
+    # Копия обязательна в обеих ветках. `BodyLive` пишет в этот массив
+    # на месте, когда пользователь переносит слот, и без копии правка
+    # уехала бы в сам `DEFAULT_SOURCES` — то есть в КАЖДЫЙ следующий
+    # эпизод этого процесса работника, молча и невидимо по файлам.
+    sources = (DEFAULT_SOURCES.copy() if sources is None
+               else np.array(sources, dtype=float))
     if neurons is None:
         neurons = D.load_neurons()
     device = cfg.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -292,7 +338,22 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     brain_steps = max(1, int(round(cfg.control_ms / sim.DT)))
     body_steps = max(1, int(round(dt_s / cfg.physics_dt)))
     block_s = brain_steps * sim.DT / 1000.0
-    n_steps = int(round(cfg.duration_s / dt_s))
+    endless = cfg.duration_s is not None and cfg.duration_s <= 0
+    keep_steps = 0
+    if cfg.keep_s and cfg.keep_s > 0:
+        keep_steps = max(1, int(round(cfg.keep_s / dt_s)))
+    if endless:
+        if not keep_steps:
+            raise ValueError(
+                "сеанс без заданного конца требует кольца записи: укажите "
+                "keep_s, иначе `bins` растёт без предела (277 КБ на шаг "
+                "управления, 13,9 МБ на секунду модельного времени)")
+        # Предела у сеанса нет, но у счёта шагов он должен быть: иначе
+        # `range` не построить, а бесконечность в арифметике времени
+        # превращает каждую оценку в nan.
+        n_steps = ENDLESS_STEPS
+    else:
+        n_steps = int(round(cfg.duration_s / dt_s))
     requested_steps = n_steps
 
     print("собираю тело...")
@@ -306,6 +367,16 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     body, cams = _build_body(cfg, sources, video_path if cfg.video else None)
     obs, _ = body.reset(seed=cfg.seed)
     t_setup = time.perf_counter() - t0
+    if live is not None:
+        # До разогрева: то, что состояние применит здесь, — исходные
+        # условия сеанса, а не правка на ходу.
+        live.attach(body, sources, cfg, neurons, device)
+        # Наблюдение надо перечитать. `reset` снял его ДО применения
+        # условий, и дальше по нему считается и калибровка разогрева, и
+        # нулевой шаг: при выключенных источниках муха «чуяла» бы
+        # 0,005 и получала 150 Гц в рецепторы вместо нуля, а опора,
+        # перекос и шум мерились бы на возбуждённом мозге.
+        obs = body.fly.get_observation(body)
     if on_body is not None:
         on_body(body)
 
@@ -342,6 +413,10 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         rates[0, t_sens["odour_right"]] = rr
         if taste_hz > 0:
             rates[0, t_sens["taste"]] = taste_hz
+        if live is not None:
+            # Прямые нейронные стимулы — после сенсорных каналов и после
+            # `rates.zero_()`: иначе их стирало бы каждым шагом.
+            live.add_drive(rates)
         return rl, rr
 
     def step_brain():
@@ -354,7 +429,14 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
 
     # --- разогрев: симметричный вход, меряем опору, перекос и шум ---
     li, ri = read_odour(obs)
-    odour_ref = max((li + ri) / 2.0 * cfg.odour_ref_factor, 1e-9)
+    if cfg.odour_ref is not None:
+        # Песочница задаёт яркость насыщения числом: сеанс может
+        # начинаться с выключенными источниками, и измеренная по началу
+        # яркость была бы нулевой — первый же включённый источник
+        # насытил бы рецепторы до потолка и градиент стал бы не виден.
+        odour_ref = max(float(cfg.odour_ref), 1e-9)
+    else:
+        odour_ref = max((li + ri) / 2.0 * cfg.odour_ref_factor, 1e-9)
     warm = max(5, int(round(3000.0 * cfg.dn_tau_s / cfg.control_ms)))
     k = math.exp(-dt_s / max(cfg.dn_tau_s, 1e-6))
     mean_i = (li + ri) / 2.0
@@ -392,7 +474,10 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         # ни итог, и вызывающему пришлось бы разбирать особый случай.
         n_steps = min(n_steps, 1)
     counts = torch.zeros(n, dtype=torch.int64, device=device)
-    bins = torch.zeros(n_steps, n, dtype=torch.int16, device=device)
+    if not keep_steps:
+        keep_steps = n_steps
+    keep_steps = min(keep_steps, n_steps)
+    bins = torch.zeros(keep_steps, n, dtype=torch.int16, device=device)
     records = []
     el = er = None
 
@@ -409,13 +494,39 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     for step in range(n_steps):
         x, y, theta = _pose(obs)
         d = np.linalg.norm(sources[:, :2] - np.array([x, y]), axis=1)
-        nearest = int(np.argmin(d))
+        # Выключенный слот источника остаётся в модели, но едой не
+        # является: выбрать его ближайшим значило бы кормить муху тем,
+        # чего нет. Маску даёт состояние живых условий; без него, как и
+        # раньше, считаются все источники.
+        act = live.active_sources() if live is not None else None
+        if act is not None and len(act) == len(d):
+            if not any(act):
+                nearest, d_near = -1, None
+            else:
+                dd = np.where(np.asarray(act, bool), d, np.inf)
+                nearest = int(np.argmin(dd))
+                d_near = float(dd[nearest])
+        else:
+            nearest = int(np.argmin(d))
+            d_near = float(d[nearest])
         li, ri = read_odour(obs)
-        taste = cfg.grn_hz if d[nearest] < cfg.food_radius_mm else 0.0
-        rl, rr = drive_brain(li, ri, taste, odour_ref)
+        taste = (cfg.grn_hz if (d_near is not None
+                                and d_near < cfg.food_radius_mm) else 0.0)
+        # Обе величины перечитываются из настройки на каждом шаге, а не
+        # берутся один раз до цикла: иначе живая правка `odour_ref` или
+        # `dn_tau_s` подтверждалась бы как применённая и попадала в
+        # журнал прогона, ничего при этом не меняя. При неизменной
+        # настройке значения те же, что и прежде.
+        ref_now = (max(float(cfg.odour_ref), 1e-9)
+                   if cfg.odour_ref is not None else odour_ref)
+        k = math.exp(-dt_s / max(cfg.dn_tau_s, 1e-6))
+        rl, rr = drive_brain(li, ri, taste, ref_now)
 
         acc, dl, dr = step_brain()
-        bins[step] = acc.to(torch.int16)
+        # Счётчики копятся за весь сеанс, запись — только за окно:
+        # иначе частоты (`counts / t_run_s`) считались бы по обрезанной
+        # записи и врали бы во столько раз, во сколько окно короче.
+        bins[step % keep_steps] = acc.to(torch.int16)
         counts += acc.to(torch.int64)
 
         el = dl if el is None else k * el + (1 - k) * dl
@@ -437,19 +548,32 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                 body.render()
             if term or trunc:
                 break
+        closed = False
         if viewer is not None and step % cfg.view_every == 0:
             if not viewer.is_running():
                 print("  окно закрыто, останавливаюсь")
-                n_steps = step + 1
-                bins = bins[:n_steps]
-                break
-            viewer.sync()
+                # Выйти здесь нельзя: строка `bins` этого шага уже
+                # записана, а запись шага ещё нет — вышло бы на одну
+                # строку записи меньше, чем шагов, и `metrics["steps"]`
+                # разошёлся бы с `timing["steps_done"]`. Поэтому шаг
+                # доводится до конца, а выход — после записи.
+                closed = True
+            else:
+                viewer.sync()
 
         nx, ny, _ = _pose(obs)
-        to_src = sources[nearest, :2] - np.array([nx, ny])
-        norm = float(np.linalg.norm(to_src))
-        grad_cos = float((to_src @ np.array([math.cos(theta), math.sin(theta)])) / norm) \
-            if norm > 1e-6 else 0.0
+        if nearest < 0:
+            # Ни одного включённого источника: курс сравнивать не с чем,
+            # и расстояние до «ближайшего» было бы выдумкой. Минус
+            # единица в записи значит именно это, а не ноль миллиметров.
+            grad_cos, dist_mm = 0.0, -1.0
+        else:
+            to_src = sources[nearest, :2] - np.array([nx, ny])
+            norm = float(np.linalg.norm(to_src))
+            grad_cos = float((to_src @ np.array([math.cos(theta),
+                                                 math.sin(theta)])) / norm) \
+                if norm > 1e-6 else 0.0
+            dist_mm = float(np.linalg.norm(sources[nearest, :2] - [nx, ny]))
 
         rec = {
             "t_ms": step * cfg.control_ms,
@@ -460,16 +584,19 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             "dn_l": round(dl, 3), "dn_r": round(dr, 3),
             "asym": round(asym, 5), "z": round(z, 3),
             "amp_l": round(float(action[0]), 3), "amp_r": round(float(action[1]), 3),
-            "dist": round(float(np.linalg.norm(sources[nearest, :2] - [nx, ny])), 2),
+            "dist": round(dist_mm, 2),
             "grad_cos": round(grad_cos, 4),
+            "source": int(nearest),
             "spikes": int(acc.sum()),
         }
         records.append(rec)
         if on_step is not None:
-            on_step(step, rec, bins[step].cpu().numpy())
+            on_step(step, rec, bins[step % keep_steps].cpu().numpy())
+        if closed:
+            n_steps = step + 1
+            break
         if should_stop is not None and should_stop():
             n_steps = step + 1
-            bins = bins[:n_steps]
             break
         if bar is not None:
             bar.update(1)
@@ -490,7 +617,18 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     # эпизод оборвали: n_steps * dt_s не обязано совпадать с заказанной
     # длительностью при неделимом control_ms, и подменять её зря нельзя.
     cut = n_steps < requested_steps
-    dur_s = n_steps * dt_s if cut else cfg.duration_s
+    dur_s = n_steps * dt_s if (cut or endless) else cfg.duration_s
+
+    # Кольцо — по времени. До этого места строка шага `i` лежит в слоте
+    # `i % keep_steps`: при провернувшемся кольце самая старая строка
+    # стоит не первой, и расставить их можно только зная окончательное
+    # число шагов.
+    kept = min(n_steps, keep_steps)
+    if n_steps > keep_steps:
+        bins = torch.roll(bins, -(n_steps % keep_steps), dims=0)
+    else:
+        bins = bins[:kept]
+    bins_t0_ms = (n_steps - kept) * cfg.control_ms
     timing = {
         "setup_s": round(t_setup, 2),
         "sim_s": round(t_sim, 2),
@@ -504,18 +642,34 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         "steps_requested": int(requested_steps),
         "duration_s": round(dur_s, 6),
     }
+    if endless:
+        timing["steps_requested"] = None   # предела не было
+        timing.setdefault("оговорки", []).append(
+            "сеанс без заранее заданного конца: его закончила остановка, "
+            "а не исчерпание заказанного времени. «Отменён» в карточке "
+            "для такого сеанса — норма, а не обрыв расчёта.")
+    if kept < n_steps:
+        # Запись короче сеанса. Молчать нельзя: по `bins` считают растр
+        # и ход активности, и без подписи они выглядели бы как целый
+        # прогон, начинающийся с нуля.
+        timing["окно записи, с"] = round(kept * dt_s, 6)
+        timing["запись с, мс"] = round(bins_t0_ms, 3)
+        timing.setdefault("оговорки", []).append(
+            "запись активности — последнее окно %.3g с из %.3g с сеанса "
+            "(с %.0f мс). Счётчики и частоты посчитаны по всему сеансу, "
+            "растр и ход активности — только по окну."
+            % (kept * dt_s, dur_s, bins_t0_ms))
     if getattr(cfg, "fast_physics", False):
         # Прогон в быстрой физике сравнивать с эталонным нельзя, и
         # молчать об этом тоже: оговорка едет вместе с результатом в
         # `meta.json`, а оттуда в отчёт и в сверку.
-        timing["оговорки"] = [
+        timing.setdefault("оговорки", []).append(
             "включена быстрая физика (`fast_physics`): пропущен повторный "
             "расчёт прямой динамики после записи управляющих сигналов. "
             "Замер `probe/body_equal.py`: ускорение 1,73 раза, но "
             "траектория другая — расхождение начинается на втором шаге "
             "управления и накапливается. С эталонными прогонами такой "
-            "эпизод не сравнивается.",
-        ]
+            "эпизод не сравнивается.")
     metrics = _metrics(records, dt_s)
     return EmbodiedRun(records, counts.cpu().numpy(), bins.cpu().numpy(),
                        neurons, cfg, sources, timing, metrics, calib, sensor_idx)
@@ -527,16 +681,30 @@ def _metrics(records, dt_s):
     # При одном шаге (отмена на разогреве) вторая половина выходила
     # пустой, и `np.mean` отдавал nan с предупреждением. Тогда обе
     # половины — это сам единственный шаг.
-    half = len(records) // 2
-    d = [r["dist"] for r in records]
+    # Шаги, на которых не было ни одного включённого источника, пишут
+    # `dist = -1` и `grad_cos = 0` — это «не с чем сравнивать», а не
+    # «ноль миллиметров». Считать их наравне значило бы подмешать в
+    # среднее расстояние минус единицу, а в выравнивание — нули, и обе
+    # величины поехали бы тем сильнее, чем дольше источники были выключены.
+    aimed = [r for r in records if r.get("dist", 0.0) >= 0.0]
+    skipped = len(records) - len(aimed)
+    if not aimed:
+        return {"steps": len(records), "шагов без источника": skipped,
+                "примечание": "ни на одном шаге не было включённого "
+                              "источника: расстояние и выравнивание по "
+                              "градиенту не определены"}
+    half = len(aimed) // 2
+    d = [r["dist"] for r in aimed]
     d_first = d[:half] if half else d
     d_second = d[half:] if half < len(d) else d
     path = sum(math.dist((records[i]["x"], records[i]["y"]),
                          (records[i - 1]["x"], records[i - 1]["y"]))
                for i in range(1, len(records)))
-    return {
+    out = {} if not skipped else {"шагов без источника": skipped}
+    out.update({
         "steps": len(records),
-        "grad_alignment": round(float(np.mean([r["grad_cos"] for r in records])), 4),
+        "grad_alignment": round(float(np.mean([r["grad_cos"]
+                                               for r in aimed])), 4),
         "dist_first_half_mm": round(float(np.mean(d_first)), 2),
         "dist_second_half_mm": round(float(np.mean(d_second)), 2),
         "dist_start_mm": round(d[0], 2),
@@ -546,7 +714,8 @@ def _metrics(records, dt_s):
         "food_steps": int(sum(1 for r in records if r["taste"] > 0)),
         "mean_dn_hz": round(float(np.mean([(r["dn_l"] + r["dn_r"]) / 2
                                            for r in records])), 3),
-    }
+    })
+    return out
 
 
 def bench(n_runs=6, duration_s=3.0, neurons=None, weights=None, device=None,
@@ -598,6 +767,17 @@ def bench(n_runs=6, duration_s=3.0, neurons=None, weights=None, device=None,
                             progress=False, should_stop=should_stop,
                             video_path=video)
             m = r.metrics
+            if "grad_alignment" not in m:
+                # Эпизод, прошедший целиком без включённых источников:
+                # ни выравнивания по градиенту, ни расстояния у него нет
+                # (см. `_metrics`). Включить его в серию наравне с
+                # остальными значило бы подмешать выдуманные нули;
+                # молча пропустить — тоже нельзя, поэтому отказ громкий.
+                raise ValueError(
+                    "эпизод %d условия %r прошёл без единого включённого "
+                    "источника: выравнивания по градиенту и расстояния у "
+                    "него нет, и в серию он не идёт. Серии нужны условия, "
+                    "в которых источник включён." % (i + 1, label))
             vals.append(m["grad_alignment"])
             dists.append(m["dist_end_mm"] - m["dist_start_mm"])
             visits.append(m["food_steps"])

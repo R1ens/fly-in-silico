@@ -254,7 +254,12 @@ def _meters(app, ctx, r):
             txt = "—" if v is None else (
                 ("{:,.0f}".format(v).replace(",", " ")) if nd == 0
                 else ("{:.%df}" % nd).format(float(v)).replace(".", ","))
-            W.kv(ctx, s.take(sc.px(S.row)), name, txt, unit)
+            # `dist = -1` значит «ни одного включённого источника», а не
+            # ноль миллиметров (body.py), так что числа здесь быть не
+            # должно. Так же сделано в песочнице, в «Где муха».
+            off = key == "dist" and v is not None and float(v) < 0
+            W.kv(ctx, s.take(sc.px(S.row)), name,
+                 "нет включённых" if off else txt, "" if off else unit)
     if s.fits(sc.px(S.row) * 2):
         W.section(ctx, s, "Поток")
         # «Активных нейронов» здесь нет нарочно: счётчик сеанса считает

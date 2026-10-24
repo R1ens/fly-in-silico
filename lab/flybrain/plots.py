@@ -270,12 +270,35 @@ def load(run, key):
                  if k == key), None)
     if cols is None:
         return None
-    df = series_table(run, columns=["t_ms"] + list(cols))
+    # Шаги, на которых в теле не было ни одного включённого источника,
+    # пишут `dist = -1` и `grad_cos = 0` — это «не с чем сравнивать», а не
+    # «ноль миллиметров» и не «курс поперёк градиента» (см. body.py, место
+    # «Ни одного включённого источника»). На графике они соврали бы дважды:
+    # линия расстояния падала бы на -1 мм и тянула ось в минус, а совпадение
+    # с градиентом показывало бы выдуманный ноль. Поэтому такие шаги с обоих
+    # графиков убираются, а сколько их убрано — сказано в примечании.
+    aimed = run.kind == "body" and key in ("dist", "grad")
+    need = ["t_ms"] + list(cols)
+    if aimed and "dist" not in need:
+        need.append("dist")
+    df = series_table(run, columns=need)
     if df is None or not len(df):
         return None
+    note = "шагов %d" % len(df)
+    if aimed and "dist" in df.columns:
+        keep = df["dist"].to_numpy("float64") >= 0.0
+        skipped = int(len(df) - int(keep.sum()))
+        if skipped:
+            df = df[keep]
+            if not len(df):
+                # Все шаги без источника: рисовать нечего, и график
+                # не предлагается вовсе — как для любых пустых данных.
+                return None
+            note = ("шагов %d; отброшено шагов без включённых источников: %d"
+                    % (len(df), skipped))
     base.update(kind="line", x=df["t_ms"].to_numpy("float64"),
                 xlabel="время, мс",
                 series=[(c, df[c].to_numpy("float64")) for c in cols
                         if c in df.columns],
-                note="шагов %d" % len(df))
+                note=note)
     return base

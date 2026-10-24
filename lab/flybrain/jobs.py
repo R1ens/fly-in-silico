@@ -186,7 +186,7 @@ class Ctx:
                 self.paused = False
                 self._asked_stop = True
             elif cmd.action == "set":
-                values, why = self._apply_set(cmd.payload, state)
+                values, why = self._apply_set(cmd.payload, state, t_ms)
                 outcome = "applied" if not why else "rejected"
             else:
                 outcome, why = "rejected", "неизвестное действие %r" % cmd.action
@@ -196,19 +196,29 @@ class Ctx:
             self.applied.append(rec)
             self.emit(rec)
 
-    def _apply_set(self, payload, state):
+    def _apply_set(self, payload, state, t_ms=None):
         """Изменить параметр идущего расчёта. Пока — только то, что есть.
 
         Проверка значений делается здесь, в работнике: из окна приходит
         словарь, и верить ему нельзя. Чего `state` не умеет менять, то
         отклоняется с причиной, а не применяется наполовину.
+
+        Применённая правка получает модельное время. Без него по
+        сохранённому прогону нельзя сказать, на какой миллисекунде она
+        сработала: время жило только в подтверждении, которое уходит в
+        окно и на диск не попадает, — а бриф требует фиксировать именно
+        время применения.
         """
         if state is None:
             return None, "этот вид прогона менять на ходу не умеет"
         try:
-            return state.apply(dict(payload or {})), ""
+            values = state.apply(dict(payload or {}))
         except (ValueError, TypeError, KeyError) as exc:
             return None, str(exc)[:160]
+        log = getattr(state, "log", None)
+        if log and t_ms is not None:
+            log[-1]["модельное, мс"] = round(float(t_ms), 3)
+        return values, ""
 
     # -- крючки для работника -------------------------------------------
 
@@ -391,7 +401,7 @@ def _record_edits(timing, state):
 
 
 def _job_body(spec, ctx):
-    from . import body as B
+    from . import body as B, live
 
     neurons = ctx.neurons
     weights = ctx.weights()
@@ -403,21 +413,46 @@ def _job_body(spec, ctx):
         return _series(spec, ctx, B.bench, neurons, weights, base=cfg,
                        out_dir=ctx.out_dir)
 
-    n_steps = max(1, int(round(cfg.duration_s * 1000.0 / cfg.control_ms)))
+    endless = cfg.duration_s is not None and cfg.duration_s <= 0
+    n_steps = (0 if endless
+               else max(1, int(round(cfg.duration_s * 1000.0
+                                     / cfg.control_ms))))
     seen = {"n": 0}
+    # Живые условия сеанса. Состояние создаётся заранее, а ссылки на
+    # настоящую модель MuJoCo получает внутри `run_episode`, когда тело
+    # собрано и сброшено. Исходные условия (`live_initial`) применяются
+    # там же — до разогрева, поэтому они и есть условия, а не правка.
+    state = live.BodyLive(initial=(spec.body.live_initial
+                                   if spec.body else None))
 
     def on_step(step, rec, bins_row):
         seen["n"] = step + 1
-        ctx.frame(rec["t_ms"], bins_row, extra=rec)
+        # Кадр снимается ДО отправки состояния: тогда поза камеры,
+        # которую работник кладёт в `last_cam`, относится к тому самому
+        # кадру, что уехал в общую память, и окно может перевести щелчок
+        # по сцене в координаты модели. Иначе поза отставала бы на шаг.
+        ctx.step(rec)
+        cam = getattr(ctx, "last_cam", None)
+        # Поза едет отдельной копией, а не в самой записи шага: записи
+        # уходят в `track.parquet`, и словарь в столбце там не нужен.
+        ctx.frame(rec["t_ms"], bins_row,
+                  extra=(dict(rec, cam=cam) if cam else rec))
         ctx.series(rec["t_ms"], {k: rec[k] for k in
                                  ("dn_l", "dn_r", "odour_l", "odour_r",
                                   "amp_l", "amp_r", "dist", "grad_cos")
                                  if k in rec})
-        ctx.step(rec)
-        ctx.status("running", "эпизод", (step + 1) / n_steps)
+        if endless:
+            # Доли у сеанса без конца нет, и показывать её нечестно:
+            # вместо неё окно получает прожитое модельное время.
+            ctx.status("running", "сеанс", 0.0,
+                       text="" if step % 50 else
+                       "сеанс идёт: %.1f с модельного времени"
+                       % (rec["t_ms"] / 1000.0))
+        else:
+            ctx.status("running", "эпизод", (step + 1) / n_steps)
         # Граница шага управления: здесь состояние целостно, и здесь
         # разбираются команды, пришедшие за время шага.
-        ctx.control_point(rec["t_ms"])
+        ctx.control_point(rec["t_ms"], state=state)
 
     ctx.status("setup", "сборка тела", 0.0)
     video = None
@@ -429,11 +464,22 @@ def _job_body(spec, ctx):
         ctx.out_dir.mkdir(parents=True, exist_ok=True)
         video = ctx.out_dir / "walk.mp4"
     run = _call(B.run_episode, cfg=cfg, neurons=neurons, weights=weights,
+                sources=(spec.body.sources if spec.body else None),
                 progress=False, on_step=on_step, should_stop=ctx.should_stop,
-                on_body=ctx.on_body, video_path=video)
+                on_body=ctx.on_body, video_path=video, live=state)
+    _record_edits(run.timing, state)
+    if state.log:
+        # Исходные условия — часть результата: без них по журналу правок
+        # не восстановить, от чего сеанс отталкивался. Но писать их в
+        # КАЖДЫЙ эпизод тела нельзя: у обычного прогона никаких исходных
+        # условий не задавалось, и новый блок в научном результате
+        # появлялся бы без причины. Признак — непустой журнал: он
+        # непуст ровно тогда, когда что-то применяли.
+        run.timing["исходные условия"] = state.start
+    cancelled = (ctx.should_stop() if endless else seen["n"] < n_steps)
     summary = {"kind": "body", "metrics": run.metrics, "timing": run.timing,
-               "calibration": run.calib, "cancelled": seen["n"] < n_steps}
-    return JobResult("body", run, summary, cancelled=summary["cancelled"])
+               "calibration": run.calib, "cancelled": cancelled}
+    return JobResult("body", run, summary, cancelled=cancelled)
 
 
 def _series(spec, ctx, bench_fn, neurons, weights, **kw):

@@ -24,7 +24,8 @@ import numpy as np
 
 from . import layout as L
 from . import widgets as W
-from .state import (BODY_VIEWS, PHASES, VISION, WORKSPACES, AppState)
+from .state import (BODY_VIEWS, PHASES, SANDBOX_Z, VISION, WORKSPACES,
+                    AppState)
 from .tokens import C, R, S, T
 
 __all__ = ["App", "run"]
@@ -249,7 +250,11 @@ class App:
         """Отправить работнику настройки камеры, если они изменились."""
         if self.ses is None:
             return
-        cam = self.st.camera("body")
+        # Камера берётся того вьюпорта, который на экране. Брать всегда
+        # «Тело» было ошибкой: песочница писала своё отдаление в его
+        # камеру, и, вернувшись в «Тело», владелец находил чужой вид.
+        cam = self.st.camera("sandbox" if self.st.ws.current == "sandbox"
+                             else "body")
         base = next((v for v in BODY_VIEWS if v[0] == cam.view), BODY_VIEWS[0])
         az, el, k = base[3]
         # Расстояние всегда считается от габарита мухи, а приближение
@@ -423,10 +428,41 @@ class App:
     # в «Мозге» запуск тела было бы просто неверно.
     RUN_OF = {"body": ("body", "эпизод в теле"),
               "brain": ("stim", "стимуляция"),
+              "sandbox": ("sandbox", "сеанс песочницы"),
               "experiment": ("spec", "собранный опыт")}
 
     def run_kind(self):
         return self.RUN_OF.get(self.st.ws.current, (None, ""))
+
+    def sandbox_spec(self):
+        """Спека сеанса песочницы: тот же вид «тело», но живой.
+
+        Отличий от обычного эпизода три, и все заданы здесь, а не внутри
+        задачи: длительность может быть нулевой (сеанс без заранее
+        заданного конца), запись идёт в кольцо, а яркость насыщения
+        рецепторов задана числом — сеанс начинается с выключенными
+        источниками, и измеренная по началу яркость была бы нулевой.
+
+        Исходные условия слотов уходят отдельным полем: они применяются
+        до разогрева и в сохранённом прогоне стоят отдельно от правок,
+        сделанных на ходу.
+        """
+        sb = self.st.sb
+        return {
+            "kind": "body",
+            "t": float(sb.t_run),
+            "seed": int(sb.seed),
+            "bin_ms": 10.0,
+            "open_report": False,
+            "body": {
+                "readout": str(sb.readout or "ALPN"),
+                "control_ms": 20.0,
+                "keep_s": float(sb.keep_s),
+                "odour_ref": float(sb.odour_ref),
+                "sources": [[s.x, s.y, SANDBOX_Z] for s in sb.slots],
+                "live_initial": {"sources": sb.payload()},
+            },
+        }
 
     def run_ready(self):
         """Можно ли пускать здесь и сейчас, и если нет — почему."""
@@ -445,6 +481,16 @@ class App:
             if bad:
                 return False, bad[0]
             return True, K.KINDS[X._state(self)["kind"]].title
+        if kind == "sandbox":
+            # Сеанс песочницы проверяется тем же справочником, что и
+            # обычный эпизод в теле: это он и есть, только без заранее
+            # заданного конца и с кольцом записи.
+            from .. import catalog as K
+
+            bad = K.validate(self.sandbox_spec())
+            if bad:
+                return False, bad[0]
+            return True, title
         return True, title
 
     def _stim_query(self):
@@ -621,8 +667,15 @@ class App:
             elif run.progress > 0:
                 frac = run.progress
             if frac is None and busy:
-                W.progress(ctx, bst.take(sc.px(34)), 0.0,
-                           "этап: " + stage, indeterminate=True)
+                # У сеанса без заранее заданного конца доли нет и быть
+                # не может: его заканчивает остановка. Вместо выдуманных
+                # процентов — прожитое модельное время.
+                note = ("этап: " + stage)
+                if run.t_target <= 0 and run.t_sim > 0:
+                    note += ("  ·  %s с модельного, конец не задан"
+                             % _fmt(run.t_sim, 2))
+                W.progress(ctx, bst.take(sc.px(34)), 0.0, note,
+                           indeterminate=True)
             else:
                 W.progress(ctx, bst.take(sc.px(34)), frac or 0.0,
                            "этап: " + stage + "  ·  %s из %s с модельного"
@@ -679,6 +732,8 @@ class App:
 
                 spec = X.build_spec(self)
                 title = X.KINDS_TITLE(spec["kind"])
+            elif kind == "sandbox":
+                spec = self.sandbox_spec()
             elif kind == "body":
                 body = {}
                 if st.readout:
@@ -699,6 +754,10 @@ class App:
         job = self.ses.submit(spec)
         if job:
             st.track.clear()
+            # Песочница забывает прошлый сеанс: модельное время пойдёт
+            # заново, и её скорость, подтверждения и ожидания от прошлого
+            # прогона описывали бы не этот.
+            st.sb.new_session()
             rep = int(spec.get("repeat") or 0)
             # Серия заводится только там, где она есть. Иначе запись от
             # прошлой серии оставалась на экране и наполнялась числами
@@ -807,11 +866,13 @@ from . import ws_analysis                                    # noqa: E402
 from . import ws_body                                        # noqa: E402
 from . import ws_brain                                       # noqa: E402
 from . import ws_experiment                                  # noqa: E402
+from . import ws_sandbox                                     # noqa: E402
 
 SPACES = {
     "body": ws_body.SPACE,
     "brain": ws_brain.SPACE,
     "experiment": ws_experiment.SPACE,
+    "sandbox": ws_sandbox.SPACE,
     "analysis": ws_analysis.SPACE,
 }
 
