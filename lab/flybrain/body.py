@@ -65,6 +65,10 @@ class BodyConfig:
 
     # --- живое окно MuJoCo ---
     view: bool = False
+
+    # Пропуск лишнего пересчёта прямой динамики. Выключено по умолчанию,
+    # пока равенство не доказано на этой модели: см. `_fly_class`.
+    fast_physics: bool = False
     view_every: int = 1  # обновлять окно раз в столько шагов управления
 
 
@@ -113,11 +117,69 @@ class EmbodiedRun:
         }
 
 
+def _fly_class(fast):
+    """Муха FlyGym, при `fast` — без лишнего пересчёта прямой динамики.
+
+    Откуда берётся лишний пересчёт. `Fly.pre_step` пишет управляющие
+    сигналы через `physics.bind(...).ctrl`, а dm_control считает `ctrl`
+    полем, которое «пачкает» состояние (`MJDATA_TRIGGERS_DIRTY`). Первое
+    же чтение наблюдений после этого видит флаг и зовёт полный
+    `physics.forward()`. Замер: 2000 вызовов `mj_forward` на 2000 шагов
+    физики, ровно по одному на шаг, 1,03 с из 5,70 с профиля — пятая
+    часть шага управления уходит на повторный расчёт того же состояния.
+
+    Почему это вообще может быть безопасно: `ctrl` — вход следующего
+    шага, а не производная величина. Почему это НЕ очевидно безопасно: в
+    модели 179 сенсоров, и если хоть один зависит от `ctrl`, пропуск
+    пересчёта даст устаревшее наблюдение и изменит траекторию.
+
+    Поэтому здесь ничего не доказывается рассуждением. Режим включается
+    отдельно, а равенство проверяется `probe/body_equal.py`: траектория,
+    моторные команды и активность сравниваются побайтово с прежними.
+
+    **Проверено, равенства нет.** `probe/body_equal.py` на двух эпизодах
+    по 2 с с одним семенем: тело ускоряется в 1,73 раза (56,0 с против
+    32,4 с), но результат другой. Первое расхождение — на втором шаге
+    управления и крошечное (x: 0,561 против 0,560), то есть устаревшим
+    оказывается не всё наблюдение, а малая его часть; дальше ходьба
+    раскачивает его сама — к сотому шагу x разошёлся на 4,6 мм, курс на
+    4,7 рад, суммарные спайки на 1529, а выравнивание по градиенту упало
+    с 0,301 до 0,094. Значит хотя бы один из 179 сенсоров всё-таки
+    зависит от `ctrl`, и пропуск пересчёта даёт другую траекторию.
+
+    Поэтому это не ускорение, а правка модели, и по правилу брифа
+    («первой целью должны быть ускорения, не меняющие математические
+    шаги») в научные прогоны она не идёт: `fast_physics` остаётся
+    выключенным, а включённый помечает прогон оговоркой в `timing`, чтобы
+    такой эпизод нельзя было сравнить с эталонным молча.
+    """
+    from flygym_gymnasium import Fly
+
+    if not fast:
+        return Fly
+
+    class _FlyNoReforward(Fly):
+        """То же, но без пересчёта ради снятия флага."""
+
+        def pre_step(self, action, sim):
+            was = sim.physics.is_dirty
+            super().pre_step(action, sim)
+            if not was:
+                # Мы написали только `ctrl`. Ничего производного от него
+                # до следующего `mj_step` не читается, а `mj_step` всё
+                # пересчитает сам.
+                sim.physics._dirty = False
+
+    return _FlyNoReforward
+
+
 def _build_body(cfg: BodyConfig, sources, video_path=None):
-    from flygym_gymnasium import Fly, YawOnlyCamera
+    from flygym_gymnasium import YawOnlyCamera
     from flygym_gymnasium.arena import OdorArena
     from flygym_gymnasium.preprogrammed import default_leg_sensor_placements
     from flygym_gymnasium.examples.locomotion import HybridTurningController
+
+    Fly = _fly_class(getattr(cfg, "fast_physics", False))
 
     arena = OdorArena(
         odor_source=sources,
@@ -442,6 +504,18 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         "steps_requested": int(requested_steps),
         "duration_s": round(dur_s, 6),
     }
+    if getattr(cfg, "fast_physics", False):
+        # Прогон в быстрой физике сравнивать с эталонным нельзя, и
+        # молчать об этом тоже: оговорка едет вместе с результатом в
+        # `meta.json`, а оттуда в отчёт и в сверку.
+        timing["оговорки"] = [
+            "включена быстрая физика (`fast_physics`): пропущен повторный "
+            "расчёт прямой динамики после записи управляющих сигналов. "
+            "Замер `probe/body_equal.py`: ускорение 1,73 раза, но "
+            "траектория другая — расхождение начинается на втором шаге "
+            "управления и накапливается. С эталонными прогонами такой "
+            "эпизод не сравнивается.",
+        ]
     metrics = _metrics(records, dt_s)
     return EmbodiedRun(records, counts.cpu().numpy(), bins.cpu().numpy(),
                        neurons, cfg, sources, timing, metrics, calib, sensor_idx)

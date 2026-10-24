@@ -20,6 +20,7 @@ import contextlib
 import json
 import os
 import warnings
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -279,7 +280,8 @@ def select(df: pd.DataFrame, query: str) -> np.ndarray:
     A bare word is treated as ``type:<word>``.  Terms can be chained with ``+``
     to intersect, e.g. ``type:LC10+side:left``.
     """
-    out: set[int] = set()
+    idx = _codes(df)["idx"]
+    parts = []
     for part in str(query).split(","):
         # Quotes survive some shells and pasted commands; a selector wrapped in
         # them should still work rather than look like an unknown key.
@@ -289,11 +291,95 @@ def select(df: pd.DataFrame, query: str) -> np.ndarray:
         mask = np.ones(len(df), dtype=bool)
         for term in part.split("+"):
             mask &= _term_mask(df, term.strip())
-        out.update(df.loc[mask, "idx"].tolist())
-    return np.array(sorted(out), dtype=np.int64)
+        parts.append(idx[mask])
+    if not parts:
+        return np.array([], dtype=np.int64)
+    # Было `sorted(set(...))` через список питоновских целых: на 138 тысячах
+    # строк это заметно дороже самой выборки. `np.unique` даёт тот же
+    # отсортированный уникальный результат.
+    return np.unique(np.concatenate(parts)).astype(np.int64)
+
+
+_SEL_CACHE: dict[int, dict] = {}
+
+
+def _cache(df: pd.DataFrame) -> dict:
+    """Кэш выборок, живущий рядом с таблицей, но не на ней.
+
+    Зачем. Один селектор вида ``region:AL+side:left`` раньше сканировал
+    138 639 строк регулярным выражением на каждое слагаемое, а список
+    популяций (:func:`world.probe_candidates`) гоняет около 250 таких
+    запросов, из которых ``side:left`` встречается в половине. Замер:
+    13,7 с на построение списка, 19,0 с на 247 селекторов, и 48 млн
+    вызовов ``re.search`` в профиле эпизода в теле — больше, чем вся
+    физика MuJoCo.
+
+    Первая попытка держала кэш в ``df.attrs``, и это оказалось ловушкой:
+    pandas переносит ``attrs`` на производные таблицы, а
+    ``DataFrame.to_parquet`` сериализует их в JSON. Массив numpy в кэше
+    ронял сохранение **всех** прогонов — поймано регрессией
+    (`probe/cli_check.py`), а не рассуждением.
+
+    Поэтому кэш лежит в словаре модуля по ``id`` таблицы, а
+    ``weakref.finalize`` убирает запись, когда таблицу собирает сборщик
+    мусора: ни утечки памяти, ни повторного использования ``id`` под
+    чужую таблицу. Отпечаток (длина и края столбца ``idx``) стоит
+    микросекунды и страхует от подвыборки с тем же ``id``.
+    """
+    stamp = (len(df), int(df["idx"].iat[0]), int(df["idx"].iat[-1])) \
+        if len(df) else (0, -1, -1)
+    key = id(df)
+    c = _SEL_CACHE.get(key)
+    if c is None or c["stamp"] != stamp:
+        c = {"stamp": stamp, "столбцы": {}, "слагаемые": {}}
+        _SEL_CACHE[key] = c
+        weakref.finalize(df, _SEL_CACHE.pop, key, None)
+    return c
+
+
+def _codes(df: pd.DataFrame) -> dict:
+    """Числовые столбцы, нужные выборке на каждом запросе."""
+    c = _cache(df)
+    got = c.get("числа")
+    if got is None:
+        got = {"idx": df["idx"].to_numpy(),
+               "root_id": df["root_id"].to_numpy(np.int64)}
+        c["числа"] = got
+    return got
+
+
+def _column(df: pd.DataFrame, col: str):
+    """Столбец как ``(коды, различные значения)``.
+
+    Предикат считается по различным значениям, а не по строкам: в
+    ``side`` их пять на 138 639 строк, в ``cell_type`` — 8 846. Результат
+    тот же до бита, потому что и ``str.contains``, и ``str.fullmatch``
+    применяются к каждому элементу независимо, а ``astype(str)``
+    выполняется до разбиения — значит пропусков в значениях уже нет и
+    ``na=False`` ни на что не влияет.
+    """
+    c = _cache(df)
+    got = c["столбцы"].get(col)
+    if got is None:
+        codes, uniques = pd.factorize(df[col].astype(str), sort=False)
+        got = (codes, pd.Series(uniques, dtype=object))
+        c["столбцы"][col] = got
+    return got
 
 
 def _term_mask(df: pd.DataFrame, term: str) -> np.ndarray:
+    """Маска одного слагаемого; одинаковые слагаемые считаются один раз."""
+    key = term.strip().strip("\"'").strip()
+    c = _cache(df)
+    got = c["слагаемые"].get(key)
+    if got is None:
+        got = _term_mask_slow(df, key)
+        got.flags.writeable = False  # чтобы `mask &=` не испортил кэш
+        c["слагаемые"][key] = got
+    return got
+
+
+def _term_mask_slow(df: pd.DataFrame, term: str) -> np.ndarray:
     term = term.strip().strip("\"'").strip()
     if ":" in term:
         key, value = term.split(":", 1)
@@ -307,10 +393,15 @@ def _term_mask(df: pd.DataFrame, term: str) -> np.ndarray:
     value = value.strip()
 
     def contains(col):
-        return df[col].astype(str).str.contains(value, case=False, regex=True, na=False)
+        codes, uniques = _column(df, col)
+        hits = uniques.str.contains(value, case=False, regex=True,
+                                    na=False).to_numpy()
+        return hits[codes]
 
     def equals(col):
-        return df[col].astype(str).str.fullmatch(value, case=False, na=False)
+        codes, uniques = _column(df, col)
+        hits = uniques.str.fullmatch(value, case=False, na=False).to_numpy()
+        return hits[codes]
 
     hit = equals if exact else contains
 
@@ -321,7 +412,10 @@ def _term_mask(df: pd.DataFrame, term: str) -> np.ndarray:
     if key in ("super", "super_class", "s"):
         return hit("super_class")
     if key in ("region", "r"):
-        return df["region"].astype(str).str.fullmatch(value, case=False, na=False)
+        # Область сравнивается целиком всегда, даже без `=`.
+        codes, uniques = _column(df, "region")
+        hits = uniques.str.fullmatch(value, case=False, na=False).to_numpy()
+        return hits[codes]
     if key in ("superregion", "super_region"):
         return hit("super_region")
     if key in ("nt", "transmitter"):
@@ -333,9 +427,9 @@ def _term_mask(df: pd.DataFrame, term: str) -> np.ndarray:
     if key in ("lineage", "hemilineage"):
         return hit("ito_lee_hemilineage")
     if key in ("id", "root_id"):
-        return df["root_id"].astype(np.int64) == np.int64(value)
+        return _codes(df)["root_id"] == np.int64(value)
     if key == "idx":
-        return df["idx"].to_numpy() == int(value)
+        return _codes(df)["idx"] == int(value)
     if key == "all":
         return np.ones(len(df), dtype=bool)
     raise ValueError(f"unknown selector key: {key!r} in term {term!r}")
