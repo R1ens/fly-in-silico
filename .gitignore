@@ -27,3 +27,4 @@ __pycache__/
 MUJOCO_LOG.TXT
 imgui.ini
 *.ini
+_out/
