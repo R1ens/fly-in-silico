@@ -315,7 +315,8 @@ def _pose(obs):
 
 def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                 sources=None, progress=True, on_step=None, should_stop=None,
-                video_path=None, on_body=None, live=None):
+                video_path=None, on_body=None, live=None, engine=None,
+                resume=None, counts0=None, tape=None):
     """Эпизод в теле. ``on_body(body)`` зовётся один раз, когда тело собрано
     и сброшено: живому окну нужен доступ к физической модели, чтобы снимать
     кадры своим ``mujoco.Renderer`` — камера FlyGym отмеряет кадры по
@@ -336,6 +337,21 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
 
     Без ``live`` ни один из вызовов не делается, и эпизод считается в
     точности как раньше.
+
+    ``engine``, ``resume``, ``counts0`` и ``tape`` нужны продолжению
+    сеанса с сохранённого места (``flybrain.replay``), и контракт у них
+    тот же, что у арены:
+
+    * ``engine`` — готовый движок с поставленным состоянием; без него
+      собирается здесь, как и раньше;
+    * ``resume`` — снимок состояния (:class:`flybrain.replay.State`
+      вида ``body``). При нём **разогрев калибровки не идёт**: он звал бы
+      движок 75 раз и сдвинул бы то самое состояние, из которого
+      продолжают. Перекос, шум и яркость насыщения берутся из снимка, а
+      состояние MuJoCo и фаза походки ставятся сразу после сборки тела;
+    * ``counts0`` — счётчики спайков сеанса, чтобы частоты считались по
+      всему сеансу, а не по его последнему отрезку;
+    * ``tape`` — лента таймлайна; модель она не трогает.
     """
     import torch
 
@@ -367,8 +383,10 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         print(f"  {name:12s} {len(idx):6d} нейронов")
 
     driven = np.unique(np.concatenate(list(sensor_idx.values())))
-    engine = sim.build_engine(weights=weights, neurons=neurons, device=device,
-                              seed=cfg.seed, no_refractory=driven)
+    if engine is None:
+        engine = sim.build_engine(weights=weights, neurons=neurons,
+                                  device=device, seed=cfg.seed,
+                                  no_refractory=driven)
 
     t_sens = {k: torch.as_tensor(v, device=device) for k, v in sensor_idx.items()}
     t_ml = torch.as_tensor(motor_l, device=device)
@@ -417,6 +435,17 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         # нулевой шаг: при выключенных источниках муха «чуяла» бы
         # 0,005 и получала 150 Гц в рецепторы вместо нуля, а опора,
         # перекос и шум мерились бы на возбуждённом мозге.
+        obs = body.fly.get_observation(body)
+    resume_report = None
+    resume_smooth = (None, None)
+    if resume is not None:
+        # Состояние ставится ПОСЛЕ сборки и сброса тела, но ДО разогрева:
+        # разогрев зовёт движок 75 раз и сдвинул бы то самое состояние,
+        # из которого продолжают. Модель при этом не пересобирается —
+        # состояние ставится в неё.
+        from . import replay as RP
+
+        resume_smooth, resume_report = RP.restore_body(resume, body, engine)
         obs = body.fly.get_observation(body)
     if on_body is not None:
         on_body(body)
@@ -509,31 +538,48 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     warm = max(5, int(round(3000.0 * cfg.dn_tau_s / cfg.control_ms)))
     k = math.exp(-dt_s / max(cfg.dn_tau_s, 1e-6))
     mean_i = (li + ri) / 2.0
-    drive_brain(mean_i, mean_i, 0.0, odour_ref)
-    el = er = None
-    tot, asyms = 0.0, []
     stopped = False
-    for _ in range(warm):
-        _, dl, dr = step_brain()
-        tot += (dl + dr) / 2
-        el = dl if el is None else k * el + (1 - k) * dl
-        er = dr if er is None else k * er + (1 - k) * dr
-        asyms.append((el - er) / (el + er + 1e-9))
-        if should_stop is not None and should_stop():
-            # Разогрев при большой tau длиннее самого эпизода, и ждать его
-            # конца значит не отвечать на «стоп» десяток секунд.
-            stopped = True
-            break
-    settled = asyms[len(asyms) // 3:]
-    bias = float(np.mean(settled)) if settled else 0.0
-    noise = float(np.std(settled)) if len(settled) > 1 else 1e-4
-    calib = {
-        "odour_ref": round(odour_ref, 8),
-        "dn_ref_hz": round(tot / warm, 4),
-        "asym_bias": round(bias, 6),
-        "asym_noise": round(noise, 6),
-        "warm_steps": warm,
-    }
+    if resume is not None:
+        # Продолжение: калибровка взята из снимка, разогрев не идёт.
+        # Пересчитать её заново нельзя — разогрев двигает движок.
+        cal = resume.arrays.get("calib") or {}
+        bias = float(cal.get("bias", 0.0))
+        noise = float(cal.get("noise", 1e-4))
+        odour_ref = float(cal.get("odour_ref", odour_ref))
+        calib = {
+            "odour_ref": round(odour_ref, 8),
+            "dn_ref_hz": round(float(cal.get("dn_ref_hz", 0.0)), 4),
+            "asym_bias": round(bias, 6),
+            "asym_noise": round(noise, 6),
+            "warm_steps": 0,
+            "откуда": "снимок состояния: разогрев не повторялся, он "
+                      "сдвинул бы то состояние, из которого продолжают",
+        }
+    else:
+        drive_brain(mean_i, mean_i, 0.0, odour_ref)
+        el = er = None
+        tot, asyms = 0.0, []
+        for _ in range(warm):
+            _, dl, dr = step_brain()
+            tot += (dl + dr) / 2
+            el = dl if el is None else k * el + (1 - k) * dl
+            er = dr if er is None else k * er + (1 - k) * dr
+            asyms.append((el - er) / (el + er + 1e-9))
+            if should_stop is not None and should_stop():
+                # Разогрев при большой tau длиннее самого эпизода, и ждать
+                # его конца значит не отвечать на «стоп» десяток секунд.
+                stopped = True
+                break
+        settled = asyms[len(asyms) // 3:]
+        bias = float(np.mean(settled)) if settled else 0.0
+        noise = float(np.std(settled)) if len(settled) > 1 else 1e-4
+        calib = {
+            "odour_ref": round(odour_ref, 8),
+            "dn_ref_hz": round(tot / warm, 4),
+            "asym_bias": round(bias, 6),
+            "asym_noise": round(noise, 6),
+            "warm_steps": warm,
+        }
     print(f"  опора {calib['dn_ref_hz']} Гц, перекос {bias:+.5f}, "
           f"шум {noise:.5f}, яркость насыщения {odour_ref:.5f}")
 
@@ -543,12 +589,18 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         # ни итог, и вызывающему пришлось бы разбирать особый случай.
         n_steps = min(n_steps, 1)
     counts = torch.zeros(n, dtype=torch.int64, device=device)
+    if counts0 is not None and len(counts0) == n:
+        counts += torch.as_tensor(np.asarray(counts0, np.int64),
+                                  device=device)
     if not keep_steps:
         keep_steps = n_steps
     keep_steps = min(keep_steps, n_steps)
     bins = torch.zeros(keep_steps, n, dtype=torch.int16, device=device)
     records = []
-    el = er = None
+    # Накопитель сглаживания: у продолжения он из снимка, иначе пуст.
+    # Пустой — это не ноль: первый шаг берёт значение как есть, без
+    # фильтра, и подменять это нулём значит начинать сеанс с нуля герц.
+    el, er = resume_smooth
 
     bar = None
     if progress:
@@ -558,6 +610,21 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             bar = tqdm(total=n_steps, unit="шаг", ncols=78, desc="тело")
         except ImportError:
             bar = None
+
+    if tape is not None:
+        def _grab(t_now_ms):
+            from . import replay as RP
+
+            return RP.capture_body(
+                body, engine, cfg, calib, (el, er), sources,
+                slots=(live._read_sources() if live is not None else []),
+                counts=counts, t_ms=t_now_ms,
+                meta={"семя": int(cfg.seed),
+                      "шаг управления, мс": cfg.control_ms,
+                      "устройство": device,
+                      "популяция съёма": cfg.readout})
+
+        tape.begin(engine, grab=_grab)
 
     t1 = time.perf_counter()
     for step in range(n_steps):
@@ -665,8 +732,14 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             "spikes": int(acc.sum()),
         }
         records.append(rec)
+        row_cpu = None
+        if on_step is not None or tape is not None:
+            # Одна копия строки записи на шаг: она нужна и окну, и ленте.
+            row_cpu = bins[step % keep_steps].cpu().numpy()
+        if tape is not None:
+            tape.step(rec["t_ms"], rec, counts=row_cpu)
         if on_step is not None:
-            on_step(step, rec, bins[step % keep_steps].cpu().numpy())
+            on_step(step, rec, row_cpu)
         if closed:
             n_steps = step + 1
             break
@@ -745,9 +818,41 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             "траектория другая — расхождение начинается на втором шаге "
             "управления и накапливается. С эталонными прогонами такой "
             "эпизод не сравнивается.")
+    if resume_report is not None:
+        # Продолжение — часть результата, а не способ его получить: по
+        # сохранённому файлу должно быть видно, что сеанс начат не с
+        # нуля, с какого модельного времени и что в состоянии было.
+        timing["продолжение"] = resume_report
+        from . import replay as RP
+
+        timing.setdefault("оговорки", []).append(
+            "сеанс продолжен из сохранённого состояния на %.0f мс "
+            "модельного времени: разогрев калибровки не повторялся, "
+            "перекос и шум взяты из снимка. Траектория до этого момента "
+            "лежит в прежнем прогоне, а не здесь. Побитовое совпадение с "
+            "непрерывным сеансом измерено и ограничено: %d шагов "
+            "управления (%.0f мс), дальше расходится в последнем "
+            "записанном знаке — все названные поля состояния в миг "
+            "восстановления совпадают, и чего не хватает, не установлено "
+            "(probe/resume_state.py)."
+            % (float(resume_report.get("модельное, мс") or 0.0),
+               RP.EXACT_STEPS["body"],
+               RP.EXACT_STEPS["body"] * cfg.control_ms))
+    if tape is not None:
+        tape.finish(n_steps)
+        timing["таймлайн"] = {
+            k: v for k, v in tape.tl.schema().items()
+            if k in ("окно записи, с", "шагов записано", "шагов в сеансе",
+                     "запись с, мс", "запись до, мс", "предел памяти")}
     metrics = _metrics(records, dt_s)
-    return EmbodiedRun(records, counts.cpu().numpy(), bins.cpu().numpy(),
-                       neurons, cfg, sources, timing, metrics, calib, sensor_idx)
+    run = EmbodiedRun(records, counts.cpu().numpy(), bins.cpu().numpy(),
+                      neurons, cfg, sources, timing, metrics, calib,
+                      sensor_idx)
+    # Таймлайн и снимок состояния едут вместе с прогоном: их пишет
+    # `save`, один и тот же путь для окна и для командной строки.
+    run.timeline = None if tape is None else tape.tl
+    run.state = None if tape is None else tape.state
+    return run
 
 
 def _metrics(records, dt_s):
@@ -962,6 +1067,12 @@ def save(run: EmbodiedRun, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "embodied.json").write_text(
         json.dumps(run.meta(), ensure_ascii=False, indent=2), encoding="utf-8")
+    tl = getattr(run, "timeline", None)
+    if tl is not None:
+        tl.save(out_dir)
+    st = getattr(run, "state", None)
+    if st is not None:
+        st.save(out_dir)
     pd.DataFrame(run.records).to_parquet(out_dir / "track.parquet")
     sim.save(run.as_result(), out_dir)
     return out_dir

@@ -361,6 +361,57 @@ def _job_stim(spec, ctx):
     return JobResult("stim", res, summary, cancelled=cancelled)
 
 
+def _tape(spec, kind, neurons, control_ms, readout=None, motor=None):
+    """Лента таймлайна для прогона или `None`, если его не просили.
+
+    Зонды растра берутся из популяции съёма — той самой, по которой
+    считается выход: записывать «выбранную нейронную активность» и
+    выбирать при этом не ту популяцию, которой рулят, было бы странно.
+    Если популяция в растр не умещается (предел
+    `timeline.MAX_PROBE_NEURONS`), зонд не ставится вовсе, а причина
+    уходит в журнал таймлайна: обрезать популяцию молча нельзя — по
+    обрезку нельзя сказать, чья это активность.
+    """
+    from . import data as D, replay as RP, timeline as TL
+
+    block = getattr(spec, kind, None)
+    if block is None or not getattr(block, "timeline", True):
+        return None
+    keep = (float(getattr(block, "timeline_keep_s", 0.0) or 0.0)
+            or float(getattr(block, "keep_s", 0.0) or 0.0)
+            or TL.DEFAULT_KEEP_S)
+    probes, note = {}, ""
+    sels = []
+    if kind == "body" and readout:
+        from . import world
+
+        cands = world.probe_candidates(neurons)
+        if readout in cands:
+            sels = [(readout + " L", cands[readout][0]),
+                    (readout + " R", cands[readout][1])]
+    elif kind == "arena" and motor is not None:
+        sels = [("съём L", motor.motor_left), ("съём R", motor.motor_right)]
+    total = 0
+    for name, q in sels:
+        idx = D.select(neurons, q)
+        if total + len(idx) > TL.MAX_PROBE_NEURONS:
+            note = ("растр зондов не поставлен: популяция съёма (%d "
+                    "нейронов) не умещается в предел %d. Обрезать её "
+                    "молча нельзя — по обрезку нельзя сказать, чья это "
+                    "активность" % (len(idx), TL.MAX_PROBE_NEURONS))
+            probes = {}
+            break
+        probes[name] = idx
+        total += len(idx)
+    cap = getattr(block, "capture_at_ms", None)
+    return RP.Tape(kind=kind, control_ms=control_ms, keep_s=keep,
+                   probe_idx=probes, mode="пересчёт",
+                   capture_at_ms=cap,
+                   meta={"семя": int(spec.seed), "спека": spec.kind,
+                         "зонды": {k: int(len(v)) for k, v in probes.items()},
+                         "почему нет растра": note})
+
+
 def _job_arena(spec, ctx):
     from . import live, loop, world
 
@@ -382,6 +433,7 @@ def _job_arena(spec, ctx):
     state = live.ArenaLive(arena, body)
     n_steps = max(1, int(round(cfg.duration_s * 1000.0 / cfg.control_ms)))
     seen = {"n": 0}
+    tape = _tape(spec, "arena", neurons, cfg.control_ms, motor=body)
 
     def on_step(step, rec, bins_row, commentator=None):
         seen["n"] = step + 1
@@ -398,8 +450,9 @@ def _job_arena(spec, ctx):
     ep = _call(loop.run_episode, arena=arena, config=cfg, body_params=body,
                neurons=neurons, weights=weights, progress=False,
                probes=spec.arena.probes if spec.arena else False,
-               on_step=on_step, should_stop=ctx.should_stop)
+               on_step=on_step, should_stop=ctx.should_stop, tape=tape)
     _record_edits(ep.timing, state)
+    _record_tape(tape, state)
     summary = {"kind": "arena", "metrics": ep.metrics, "timing": ep.timing,
                "cancelled": seen["n"] < n_steps}
     return JobResult("arena", ep, summary, cancelled=summary["cancelled"])
@@ -422,6 +475,34 @@ def _record_edits(timing, state):
             "условия менялись на ходу, и среди правок есть меняющие смысл "
             "прогона: %s. С эталонными прогонами этот результат не "
             "сравнивается." % ", ".join(marked))
+
+
+def _record_tape(tape, state):
+    """Правки условий — события таймлайна, а не только журнал прогона.
+
+    Журнал `live.*.log` остаётся как был: он часть результата. Но
+    таймлайн обязан знать о правках по МОДЕЛЬНОМУ времени, иначе
+    «изменения среды» и «вмешательства» в нём есть только на словах.
+    """
+    if tape is None or not getattr(state, "log", None):
+        return
+    for rec in state.log:
+        what = rec.get("что") or "правка"
+        group = ("вмешательства"
+                 if "lesion" in (rec.get("стало") or {})
+                 or "снято" in rec else "среда")
+        tape.tl.event(rec.get("модельное, мс"), group, what,
+                      detail=rec.get("оговорка") or "",
+                      payload={"было": _short(rec.get("было")),
+                               "стало": _short(rec.get("стало"))})
+
+
+def _short(v, limit=600):
+    """Короткая запись значения для события: событий много, места мало."""
+    if v is None:
+        return None
+    text = repr(v)
+    return v if len(text) <= limit else text[:limit] + "…"
 
 
 def _job_body(spec, ctx):
@@ -448,6 +529,8 @@ def _job_body(spec, ctx):
     # там же — до разогрева, поэтому они и есть условия, а не правка.
     state = live.BodyLive(initial=(spec.body.live_initial
                                    if spec.body else None))
+    tape = _tape(spec, "body", neurons, cfg.control_ms,
+                 readout=cfg.readout)
 
     def on_step(step, rec, bins_row):
         seen["n"] = step + 1
@@ -490,8 +573,9 @@ def _job_body(spec, ctx):
     run = _call(B.run_episode, cfg=cfg, neurons=neurons, weights=weights,
                 sources=(spec.body.sources if spec.body else None),
                 progress=False, on_step=on_step, should_stop=ctx.should_stop,
-                on_body=ctx.on_body, video_path=video, live=state)
+                on_body=ctx.on_body, video_path=video, live=state, tape=tape)
     _record_edits(run.timing, state)
+    _record_tape(tape, state)
     if state.log:
         # Исходные условия — часть результата: без них по журналу правок
         # не восстановить, от чего сеанс отталкивался. Но писать их в
