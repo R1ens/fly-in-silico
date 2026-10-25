@@ -225,13 +225,18 @@ class ArenaLive:
 
     # -- применение -----------------------------------------------------
 
-    def apply(self, payload):
+    def apply(self, payload, initial=False, cmd_id=None, t_ms=None):
         """Проверить всё, потом записать. Возвращает применённое.
 
         Порядок именно такой: при отказе модель остаётся в том
         состоянии, в каком была, и подтверждение несёт причину. Иначе
         половина правки уже уехала бы в идущий расчёт.
+
+        ``cmd_id`` и ``t_ms`` идут в журнал прогона: без них по
+        сохранённому файлу не сказать, ни какая это была команда, ни на
+        какой миллисекунде она сработала.
         """
+        _ = initial
         if not isinstance(payload, dict):
             raise TypeError("правка должна быть словарём, пришло %r"
                             % type(payload).__name__)
@@ -272,7 +277,9 @@ class ArenaLive:
             now[name] = self._read(k)
 
         marked = sorted(n for n in ready if KNOBS[n].marked)
-        rec = {"было": was, "стало": now}
+        rec = {"модельное, мс": (None if t_ms is None
+                                 else round(float(t_ms), 3)),
+               "команда": cmd_id, "было": was, "стало": now}
         if marked:
             rec["помечено"] = marked
             rec["оговорка"] = (
@@ -331,6 +338,13 @@ BODY_KNOBS = {k.name: k for k in (
     # --- прямая стимуляция по DSL ---
     Knob("stim", "params", "stims", None, None, "",
          "прямые нейронные стимулы: запрос DSL и частота"),
+    # --- виртуальные вмешательства ---
+    #
+    # Помечено: вмешательство меняет не условия, а саму сеть. Прогон с
+    # поражением не сравнивается с эталонным, и оговорка должна ехать
+    # вместе с результатом.
+    Knob("lesion", "params", "lesions", None, None, "",
+         "вмешательства: запрос DSL, вид и длительность", marked=True),
 )}
 
 
@@ -383,6 +397,71 @@ def _stims(name, value):
                     "rate_hz": _num(tag + ".rate_hz",
                                     item.get("rate_hz", 0.0),
                                     0.0, MAX_STIM_HZ, "Гц")})
+    return out
+
+
+# ------------------------------------------------- виртуальные вмешательства
+
+# Сколько вмешательств держать одновременно. Предел не от скупости: на
+# каждое приходится выборка по DSL и объединение индексов при каждой
+# правке, а главное — список должен помещаться в панель и в журнал
+# целиком, иначе «какие вмешательства сейчас действуют» перестаёт быть
+# ответом и становится поиском.
+MAX_LESIONS = 8
+
+# Три операции над нейроном и то, что они значат в цепочке вычислений.
+# Четвёртая операция из задания — «восстановление нормальной работы» —
+# это пустой список: отдельного вида для неё нет нарочно, иначе
+# «снято» было бы состоянием, которое можно забыть снять.
+LESION_KINDS = {
+    "fire": "не выдают спайк",
+    "out": "исходящие отключены",
+    "in": "входящие отключены",
+}
+
+# Предел длительности вмешательства в модельном времени. Час модельного
+# времени при измеренной скорости около 0,06 — это больше полусуток по
+# стене; всё, что дольше, практичнее ставить «до ручной отмены».
+MAX_LESION_MS = 3_600_000.0
+
+
+def _lesions(name, value):
+    """Разобрать список вмешательств. Запросы DSL здесь не проверяются.
+
+    Как и у стимулов, разбор запроса требует таблицы нейронов и потому
+    делается в привязанном состоянии — но ТОЖЕ на этапе проверки, а не
+    записи: отказ после того, как часть масок уже поставлена, оставил бы
+    модель в состоянии, которого нет ни в одном описании опыта.
+    """
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("%s: нужен список, пришло %r"
+                         % (name, type(value).__name__))
+    if len(value) > MAX_LESIONS:
+        raise ValueError("%s: не больше %d вмешательств, пришло %d"
+                         % (name, MAX_LESIONS, len(value)))
+    out = []
+    for i, item in enumerate(value):
+        tag = "%s[%d]" % (name, i)
+        if not isinstance(item, dict):
+            raise ValueError("%s: нужен словарь, пришло %r"
+                             % (tag, type(item).__name__))
+        extra = set(item) - {"query", "kind", "ms"}
+        if extra:
+            raise ValueError("%s: лишние поля %s"
+                             % (tag, ", ".join(sorted(extra))))
+        q = str(item.get("query", "")).strip()
+        if not q:
+            raise ValueError("%s.query: пустой запрос" % tag)
+        kind = str(item.get("kind", "")).strip()
+        if kind not in LESION_KINDS:
+            raise ValueError("%s.kind: %r не из списка (%s)"
+                             % (tag, kind, ", ".join(sorted(LESION_KINDS))))
+        ms = item.get("ms")
+        if ms in (None, "", 0, 0.0):
+            ms = None
+        else:
+            ms = _num(tag + ".ms", ms, 0.1, MAX_LESION_MS, "мс")
+        out.append({"query": q, "kind": kind, "ms": ms})
     return out
 
 
@@ -444,15 +523,20 @@ class BodyLive:
         self._on = {}
         self._mocap = {}
         self._geom = {}
+        self.engine = None
+        self.lesions = []
 
     # -- привязка к собранной модели ------------------------------------
 
-    def attach(self, body, sources, cfg, neurons, device):
+    def attach(self, body, sources, cfg, neurons, device, engine=None):
         self.body = body
         self.sources = sources
         self.params = cfg
         self.neurons = neurons
         self.device = device
+        # Движок нужен вмешательствам: маски живут в нём, в той же
+        # памяти, которую читает шаг и захваченный CUDA-граф.
+        self.engine = engine
         self._marker_rows()
         if self.initial:
             # Это исходные условия сеанса, а не правка на ходу: зовётся
@@ -557,6 +641,8 @@ class BodyLive:
             elif k.name == "stim":
                 out["stim"] = [{"query": s["query"], "rate_hz": s["rate_hz"],
                                 "нейронов": s["n"]} for s in self._stims]
+            elif k.name == "lesion":
+                out["lesion"] = self.lesions_shown()
             else:
                 out[k.name] = getattr(self.params, k.name, None)
         return out
@@ -636,13 +722,122 @@ class BodyLive:
         return [{"query": s["query"], "rate_hz": s["rate_hz"],
                  "нейронов": s["n"]} for s in ready]
 
+    # -- вмешательства --------------------------------------------------
+
+    def _resolve_lesions(self, want, t_ms=None, cmd_id=None):
+        """Разобрать запросы и посчитать, сколько нейронов и связей задето.
+
+        Только проверка: ничего не ставится. Связи считаются по
+        `Engine.fan()` — он берёт длины строк и счётчик по столбцам
+        матрицы один раз за прогон, а не пересобирает 15 млн связей.
+        """
+        from . import data as D
+
+        if self.engine is None:
+            raise ValueError("движок не привязан: вмешиваться не во что")
+        n_in, n_out = self.engine.fan()
+        ready = []
+        for i, w in enumerate(want):
+            idx = self._idx_cache.get(w["query"])
+            if idx is None:
+                try:
+                    idx = D.select(self.neurons, w["query"])
+                except ValueError as exc:
+                    raise ValueError(
+                        "вмешательство %d: запрос %r не разбирается: %s"
+                        % (i + 1, w["query"], exc))
+                self._idx_cache[w["query"]] = idx
+            if not len(idx):
+                raise ValueError("вмешательство %d: запрос %r не нашёл ни "
+                                 "одного нейрона" % (i + 1, w["query"]))
+            import torch
+
+            t = torch.as_tensor(idx, device=self.engine.device)
+            # Какие связи задеты, зависит от вида: отключая исходящие,
+            # задеваем исходящие выбранных, отключая входящие — входящие.
+            # Подавление спайка задевает исходящие: получатели перестают
+            # получать, хотя сами связи целы.
+            syn = int((n_in[t] if w["kind"] == "in" else n_out[t]).sum())
+            ready.append(dict(w, idx=idx, n=int(len(idx)), synapses=syn,
+                              id=cmd_id or "—",
+                              from_ms=(float(t_ms) if t_ms is not None
+                                       else 0.0),
+                              until_ms=(None if w["ms"] is None
+                                        else float(t_ms or 0.0)
+                                        + float(w["ms"]))))
+        return ready
+
+    def _push_masks(self):
+        """Собрать три списка индексов из действующих вмешательств."""
+        import numpy as np
+
+        by = {k: [] for k in LESION_KINDS}
+        for w in self.lesions:
+            by[w["kind"]].append(w["idx"])
+        out = {}
+        for k, parts in by.items():
+            out[k] = (np.unique(np.concatenate(parts)) if parts
+                      else np.array([], dtype=np.int64))
+        self.engine.set_masks(fire=out["fire"], out=out["out"],
+                              inc=out["in"])
+        return out
+
+    def _install_lesions(self, ready):
+        self.lesions = list(ready)
+        self._push_masks()
+        return self.lesions_shown()
+
+    def lesions_shown(self):
+        """Действующие вмешательства — для подтверждения, окна и журнала."""
+        return [{"id": w["id"], "запрос": w["query"], "вид": w["kind"],
+                 "что": LESION_KINDS[w["kind"]], "нейронов": w["n"],
+                 "связей": w["synapses"],
+                 "с, мс": round(w["from_ms"], 3),
+                 "до, мс": (None if w["until_ms"] is None
+                            else round(w["until_ms"], 3))}
+                for w in self.lesions]
+
+    def tick(self, t_ms):
+        """Снять вмешательства, у которых вышел срок. Зовётся на границе шага.
+
+        Срок считается в МОДЕЛЬНОМ времени, а не по стене: при скорости
+        около 0,06 секунда по стене — это 60 мс модели, и вмешательство
+        «на полсекунды» по стене длилось бы восемь секунд модели.
+
+        Точность снятия — один шаг управления (20 мс): именно там
+        состояние модели целостно, и только там вмешательство можно
+        снять, не разрывая шаг физики посреди вычисления.
+        """
+        if not self.lesions:
+            return []
+        t = float(t_ms)
+        done = [w for w in self.lesions
+                if w["until_ms"] is not None and t >= w["until_ms"]]
+        if not done:
+            return []
+        self.lesions = [w for w in self.lesions if w not in done]
+        self._push_masks()
+        rec = {"что": "срок вмешательства вышел",
+               "модельное, мс": round(t, 3),
+               "снято": [{"id": w["id"], "запрос": w["query"],
+                          "вид": w["kind"], "нейронов": w["n"]}
+                         for w in done],
+               "осталось": self.lesions_shown()}
+        self.log.append(rec)
+        return done
+
     # -- применение -----------------------------------------------------
 
-    def apply(self, payload, initial=False):
+    def apply(self, payload, initial=False, cmd_id=None, t_ms=None):
         """Проверить всё, потом записать. Возвращает применённое.
 
         Порядок именно такой: при отказе модель остаётся в том
         состоянии, в каком была, и подтверждение несёт причину.
+
+        ``cmd_id`` и ``t_ms`` — номер команды и модельное время границы
+        шага, на которой её применили. Они идут в журнал прогона: без
+        них по сохранённому файлу нельзя сказать, ни какая команда это
+        была, ни на какой миллисекунде она сработала.
         """
         if self.body is None:
             raise ValueError("сеанс ещё не собран: менять нечего")
@@ -683,6 +878,9 @@ class BodyLive:
                 # Разбор запросов — здесь же, в проверке: иначе отказ
                 # пришёлся бы на этап записи, когда слоты уже переписаны.
                 ready[name] = self._resolve_stims(_stims(name, value))
+            elif k.kind == "lesions":
+                ready[name] = self._resolve_lesions(
+                    _lesions(name, value), t_ms=t_ms, cmd_id=cmd_id)
             else:                                     # pragma: no cover
                 raise ValueError("%s: неизвестный тип %r" % (name, k.kind))
 
@@ -695,16 +893,20 @@ class BodyLive:
                 now[name] = self._read_sources()
             elif name == "stim":
                 now[name] = self._install_stims(value)
+            elif name == "lesion":
+                now[name] = self._install_lesions(value)
             else:
                 setattr(self.params, name, value)
                 now[name] = getattr(self.params, name)
 
         marked = sorted(n for n in ready if BODY_KNOBS[n].marked)
         rec = {"что": "исходные условия" if initial else "правка",
-               # Время правки ставит `jobs.Ctx._apply_set`: только он
-               # знает модельное время границы шага. У исходных условий
-               # оно нулевое по смыслу — они применяются до разогрева.
-               "модельное, мс": 0.0 if initial else None,
+               # У исходных условий модельное время нулевое по смыслу:
+               # они применяются до разогрева.
+               "модельное, мс": (0.0 if initial else
+                                 (None if t_ms is None
+                                  else round(float(t_ms), 3))),
+               "команда": cmd_id,
                "было": was, "стало": now}
         if marked and not initial:
             rec["помечено"] = marked

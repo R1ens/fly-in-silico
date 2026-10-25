@@ -145,6 +145,27 @@ class Ctx:
         """
         if self._drain is None:
             return False
+        # Срок вмешательства истекает по МОДЕЛЬНОМУ времени, и снимается
+        # оно здесь же, на границе шага: только тут состояние модели
+        # целостно. Делается это до разбора очереди, чтобы команда,
+        # пришедшая в тот же миг, ложилась уже на снятое.
+        tick = getattr(state, "tick", None)
+        if tick is not None:
+            done = tick(t_ms) or ()
+            if done:
+                from . import ipc
+
+                for w in done:
+                    # Снятие по сроку подтверждается так же, как команда:
+                    # окну нужно узнать об этом от работника, а не
+                    # считать самому по часам.
+                    self.emit(ipc.Applied(
+                        str(w.get("id") or "—"), "set", float(t_ms),
+                        round(time.perf_counter() - self._t0, 4),
+                        "applied",
+                        {"вмешательство снято по сроку": w.get("query"),
+                         "вид": w.get("kind")},
+                        "срок вмешательства вышел"))
         self._take(t_ms, state)
         while self.paused and not self.should_stop():
             if self.stepping > 0:
@@ -186,7 +207,8 @@ class Ctx:
                 self.paused = False
                 self._asked_stop = True
             elif cmd.action == "set":
-                values, why = self._apply_set(cmd.payload, state, t_ms)
+                values, why = self._apply_set(cmd.payload, state, t_ms,
+                                              cmd.cmd_id)
                 outcome = "applied" if not why else "rejected"
             else:
                 outcome, why = "rejected", "неизвестное действие %r" % cmd.action
@@ -196,7 +218,7 @@ class Ctx:
             self.applied.append(rec)
             self.emit(rec)
 
-    def _apply_set(self, payload, state, t_ms=None):
+    def _apply_set(self, payload, state, t_ms=None, cmd_id=None):
         """Изменить параметр идущего расчёта. Пока — только то, что есть.
 
         Проверка значений делается здесь, в работнике: из окна приходит
@@ -212,12 +234,10 @@ class Ctx:
         if state is None:
             return None, "этот вид прогона менять на ходу не умеет"
         try:
-            values = state.apply(dict(payload or {}))
+            values = state.apply(dict(payload or {}), cmd_id=cmd_id,
+                                 t_ms=t_ms)
         except (ValueError, TypeError, KeyError) as exc:
             return None, str(exc)[:160]
-        log = getattr(state, "log", None)
-        if log and t_ms is not None:
-            log[-1]["модельное, мс"] = round(float(t_ms), 3)
         return values, ""
 
     # -- крючки для работника -------------------------------------------

@@ -40,6 +40,26 @@ def check(name, ok, info=""):
         fails.append(name)
 
 
+def _scroll_rail(app, offset):
+    """Прокрутить левую рейку. Иначе нижние секции в кадр не попадают.
+
+    Положение прокрутки живёт в виджетном контексте по опознавателю
+    области (`sb/insp`), а не в состоянии окна: это деталь показа, и
+    состоянию приложения о ней знать незачем.
+    """
+    ctx = getattr(app.sh, "ctx", None)
+    box = getattr(ctx, "_scrolls", None) if ctx is not None else None
+    if not box:
+        return False
+    st = box.get("sb/insp")
+    if st is None:
+        return False
+    st.offset = float(max(0, min(offset, st.max_offset)))
+    app.frame()
+    app.frame()
+    return True
+
+
 def main():                                                   # noqa: C901
     from flybrain.desk import ws_sandbox as X
     from flybrain.desk.app import App
@@ -113,7 +133,9 @@ def main():                                                   # noqa: C901
 
         # Отодвинуть камеру: источники в двенадцати миллиметрах, а охват
         # считается по габариту мухи.
-        cam = st.camera("body")
+        # У песочницы своя камера, а не камера «Тела»: иначе широкое
+        # отдаление уезжало бы в чужое пространство.
+        cam = st.camera("sandbox")
         cam.view, cam.dist = "back", 5.0
         pump(8.0)
         shot("sandbox-03-сеанс.png")
@@ -190,6 +212,53 @@ def main():                                                   # noqa: C901
         check("стимул по DSL применён", bool(sb.applied_stim),
               json.dumps(sb.applied_stim, ensure_ascii=False))
         shot("sandbox-08-стимул.png")
+
+        # 5б. Вмешательство: подавить спайки популяции на срок.
+        sb.les_query = "type:LC10+side:left"
+        sb.les_kind = "fire"
+        sb.les_ms = 400.0
+        cid = X._send(app, "вмешательство: LC10 слева, не выдают спайк",
+                      {"lesion": [{"query": sb.les_query,
+                                   "kind": "fire", "ms": 400.0}]},
+                      fields=("lesion",))
+        t_wait = time.perf_counter()
+        while cid in sb.pending and time.perf_counter() - t_wait < 60:
+            pump(0.1)
+        check("вмешательство применено и подтверждено",
+              bool(sb.applied_lesions),
+              json.dumps(sb.applied_lesions, ensure_ascii=False)[:160])
+        if sb.applied_lesions:
+            w = sb.applied_lesions[0]
+            rep["замеры"]["вмешательство"] = {
+                "нейронов": w.get("нейронов"), "связей": w.get("связей"),
+                "до, мс": w.get("до, мс")}
+            check("подтверждение несёт число нейронов и связей",
+                  int(w.get("нейронов", 0)) > 0
+                  and int(w.get("связей", 0)) > 0,
+                  "нейронов %s, связей %s" % (w.get("нейронов"),
+                                              w.get("связей")))
+        pump(3.0)
+        shot("sandbox-08б-вмешательство.png")
+        # Повыше и с прокруткой рейки: секция вмешательств лежит ниже
+        # источников и в кадр сама не попадает, а показать её надо.
+        app.frame()
+        st_scroll = app.sh.sc and None
+        _ = st_scroll
+        sr = getattr(app.sh, "ctx", None)
+        shot("sandbox-08г-вмешательство-высокое.png", 1600, 1200)
+        _scroll_rail(app, 900)
+        shot("sandbox-08д-вмешательство-в-рейке.png", 1600, 1200)
+        _scroll_rail(app, 0)
+        # Срок в модельном времени: 400 мс при скорости около 0,06 —
+        # это секунд семь по стене. Ждём снятия от работника, а не по
+        # своим часам.
+        t_wait = time.perf_counter()
+        while sb.applied_lesions and time.perf_counter() - t_wait < 90:
+            pump(0.2)
+        check("вмешательство снято работником по сроку",
+              not sb.applied_lesions,
+              "за %.1f с по стене" % (time.perf_counter() - t_wait))
+        shot("sandbox-08в-вмешательство-снято.png")
 
         # 6. Пауза, подготовка правки, один шаг.
         X._send(app, "пауза", action="pause")

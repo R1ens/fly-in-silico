@@ -418,8 +418,28 @@ class SandboxState:
     # Держится здесь, чтобы показания могли сказать, когда оба канала
     # упёрлись в потолок и двусторонней разницы не стало.
     orn_max_hz: float = 150.0
+    # То же число, подтверждённое работником. Нужно, чтобы отличить
+    # «пользователь ведёт ползунок» от «значение надо отправить».
+    applied_orn_hz: float = 150.0
     seed: int = 0
     readout: str = "ALPN"
+
+    # --- вмешательства ---
+    #
+    # Набранное в рейке отдельно от действующего: `lesions` — замысел,
+    # `applied_lesions` — то, что подтвердил работник. Пока они
+    # различаются, панель показывает именно различие.
+    les_query: str = "type:LC10+side:left"
+    les_kind: str = "fire"
+    les_ms: float = 0.0           # 0 — до ручной отмены
+    les_note: str = ""
+    les_bad: bool = False
+    applied_lesions: list = field(default_factory=list)
+    # Индексы нейронов каждого действующего вмешательства: запрос -> массив.
+    # Спрашиваются у работника по разу и нужны ровно для одного — показать
+    # активность той самой популяции, в которую вмешались.
+    les_idx: dict = field(default_factory=dict)
+    les_ask: dict = field(default_factory=dict)   # запрос -> номер запроса
 
     # --- прямой стимул ---
     query: str = "region:AL+side:left"
@@ -461,6 +481,9 @@ class SandboxState:
         """
         self.applied_slots = []
         self.applied_stim = []
+        self.applied_lesions = []
+        self.les_idx = {}
+        self.les_ask = {}
         self.pending = {}
         self.cam = None
         self.cam_seq = -1

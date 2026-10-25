@@ -38,6 +38,8 @@
 import math
 import time
 
+import numpy as np
+
 from . import layout as L
 from . import widgets as W
 from .state import BODY_VIEWS, SANDBOX_Z
@@ -92,6 +94,28 @@ STIM_HELP = (
     "ходу, — нет. Значит у них остаётся рефрактерный период, и та же "
     "частота даст меньше спайков, чем на антеннах. Менять это на ходу "
     "нельзя: это пересборка движка.")
+
+LESION_HELP = (
+    "Вмешательство действует только в этом сеансе и ничего не меняет на "
+    "диске: коннектом остаётся прежним. Три операции — «не выдают "
+    "спайк», «исходящие отключены», «входящие отключены»; четвёртая, "
+    "восстановление, это «Снять всё». Применяется на границе шага "
+    "управления, снимается по сроку в модельном времени или вручную. "
+    "Про хвост задержанных событий: отключение исходящих и подавление "
+    "спайка не мгновенны — то, что уже записано в кольцо задержек, "
+    "дойдёт до получателей за ближайшие 1,9 мс модельного времени, и "
+    "столько же длится пауза после снятия. Отключение входящих, "
+    "наоборот, действует сразу и в обе стороны. "
+    "Про сравнение с контролем честно: автоматического повтора сеанса "
+    "без вмешательства пока нет. Сравнимый контроль — это отдельный "
+    "сеанс с тем же зерном и теми же исходными условиями, но без "
+    "вмешательств; журнал правок с модельными отметками сохраняется "
+    "именно для этого, а сравнивает прогоны «Анализ».")
+
+LESION_NAMES = (("fire", "не выдают спайк"),
+                ("out", "исходящие отключены"),
+                ("in", "входящие отключены"))
+
 
 ODOUR_HELP = (
     "Яркость, которая считается насыщением рецепторов. Задана числом, а "
@@ -151,6 +175,24 @@ def answers(app):
                 0.7 * sb.ratio + 0.3 * r)
         sb.speed_ms, sb.speed_wall = ses.t_ms, now
 
+    # Индексы задетых популяций: спрашиваются у работника по разу на
+    # запрос. Нужны, чтобы показать активность именно той популяции, в
+    # которую вмешались, — иначе «наблюдать активность» означало бы
+    # смотреть на общий счётчик и верить на слово.
+    for w in sb.applied_lesions:
+        q = w.get("запрос")
+        if not q or q in sb.les_idx:
+            continue
+        req = sb.les_ask.get(q)
+        if req is None:
+            sb.les_ask[q] = ses.ask("select_idx", q)
+            continue
+        got = ses.answer(req)
+        if got is not None:
+            sb.les_ask.pop(q, None)
+            if not got.get("error"):
+                sb.les_idx[q] = np.asarray(got.get("idx", []), dtype=np.int64)
+
     for rec in take():
         row = sb.pending.pop(rec.cmd_id, None)
         what = (row or {}).get("что", rec.action)
@@ -162,6 +204,20 @@ def answers(app):
                     sb.applied_stim = list(rec.values["stim"])
                     sb.stim_note = ""
                     sb.stim_bad = False
+                if "orn_max_hz" in rec.values:
+                    sb.applied_orn_hz = float(rec.values["orn_max_hz"])
+                if "lesion" in rec.values:
+                    sb.applied_lesions = list(rec.values["lesion"])
+                    sb.les_note = ""
+                    sb.les_bad = False
+            if (rec.values or {}).get("вмешательство снято по сроку"):
+                # Снятие по сроку приходит таким же подтверждением, как
+                # команда: окно узнаёт об этом от работника, а не считает
+                # по своим часам.
+                sb.applied_lesions = [
+                    w for w in sb.applied_lesions
+                    if w.get("запрос")
+                    != rec.values["вмешательство снято по сроку"]]
             if rec.action == "pause":
                 sb.paused = True
             elif rec.action in ("resume", "step"):
@@ -184,10 +240,13 @@ def answers(app):
                 det += ("; " + ", ".join(parts)) if parts else                     "; сенсорный вход пока не изменился"
             sb.note(what, rec.t_model_ms, det, "ok")
         else:
-            if rec.action == "set" and "stim" in (
-                    (row or {}).get("поля") or ()):
+            fields = (row or {}).get("поля") or ()
+            if rec.action == "set" and "stim" in fields:
                 sb.stim_note = rec.why
                 sb.stim_bad = True
+            if rec.action == "set" and "lesion" in fields:
+                sb.les_note = rec.why
+                sb.les_bad = True
             sb.note(what, rec.t_model_ms,
                     "%s: %s" % (rec.outcome, rec.why or "без причины"),
                     "danger")
@@ -256,6 +315,18 @@ def _send(app, what, payload=None, action="set", fields=()):
 def _send_slots(app, what):
     return _send(app, what, {"sources": app.st.sb.payload()},
                  fields=("sources",))
+
+
+def _settled(ctx):
+    """Кнопка мыши отпущена: протяжка кончилась.
+
+    Ползунок отдаёт новое значение на каждом кадре, пока его ведут. Без
+    этой проверки одно движение мышью слало бы работнику десятки команд
+    подряд, и очередь управления забивалась бы на ровном месте — а
+    применяется каждая на своей границе шага, то есть одна треть
+    секунды по стене на команду.
+    """
+    return not bool(getattr(ctx.inp, "down", False))
 
 
 # ---------------------------------------------------------------- центр
@@ -516,6 +587,21 @@ def inspector(app, ctx, r):                                   # noqa: C901
                              label="насыщение", fmt="{:.4f}",
                              enabled=not live,
                              tip="яркость, считающаяся насыщением")
+    # Частота рецепторов при насыщении — на ходу: это она упирается в
+    # потолок, когда градиент пропадает, и подбирать её надо глядя на
+    # показания, а не перезапуском.
+    want_hz = W.slider(ctx, "sb/orn", s.take(sc.px(40)), sb.orn_max_hz,
+                       0.0, 400.0, "частота рецепторов", "Гц",
+                       fmt="{:.0f}", enabled=live,
+                       tip="сколько герц дают рецепторы при насыщении; "
+                           "меняется в идущем сеансе")
+    sb.orn_max_hz = want_hz
+    if (_settled(ctx) and live
+            and abs(sb.orn_max_hz - sb.applied_orn_hz) > 1e-9):
+        sb.applied_orn_hz = sb.orn_max_hz
+        _send(app, "частота рецепторов %s Гц" % _fmt(sb.orn_max_hz, 0),
+              {"orn_max_hz": float(sb.orn_max_hz)},
+              fields=("orn_max_hz",))
 
     # --- время сеанса ---
     W.section(ctx, s, "Время сеанса", wid="sb/time",
@@ -598,9 +684,12 @@ def inspector(app, ctx, r):                                   # noqa: C901
         row = s.take(sc.px(40))
         nst = W.slider(ctx, "sb/s%d" % i, row, slot.strength, 0.0, 10.0,
                        "сила", "", fmt="{:.2f}", enabled=live)
-        if (abs(nx - slot.x) > 1e-9 or abs(ny - slot.y) > 1e-9
-                or abs(nst - slot.strength) > 1e-9):
-            slot.x, slot.y, slot.strength = nx, ny, nst
+        changed = (abs(nx - slot.x) > 1e-9 or abs(ny - slot.y) > 1e-9
+                   or abs(nst - slot.strength) > 1e-9)
+        slot.x, slot.y, slot.strength = nx, ny, nst
+        # Команда уходит на отпускании: иначе протяжка ползунка силы
+        # слала бы по команде на кадр.
+        if changed and _settled(ctx):
             _send_slots(app, "слот %d: (%s, %s) мм, сила %s"
                              % (i + 1, _fmt(nx, 1), _fmt(ny, 1),
                                 _fmt(nst, 2)))
@@ -651,6 +740,91 @@ def inspector(app, ctx, r):                                   # noqa: C901
                 % (a.get("query", "?"), int(a.get("нейронов", 0)),
                    _fmt(a.get("rate_hz"), 0)),
                 role="micro", color=C.ok)
+
+    # --- вмешательства ---
+    W.section(ctx, s, "Вмешательства", wid="sb/les", info=LESION_HELP,
+              right=("действует %d" % len(sb.applied_lesions))
+              if sb.applied_lesions else "")
+    ti = ctx.editor("sb/lq", sb.les_query)
+    W.text_field(ctx, "sb/lq", s.take(sc.px(S.control)), ti, "селектор",
+                 icon="search", enabled=live)
+    sb.les_query = ti.text
+    keys = [k for k, _ in LESION_NAMES]
+    names = [t for _, t in LESION_NAMES]
+    cur = keys.index(sb.les_kind) if sb.les_kind in keys else 0
+    got = W.combo(ctx, "sb/lk", s.take(sc.px(S.control)), names, cur,
+                  enabled=live, tip="что именно отключить")
+    sb.les_kind = keys[got]
+    sb.les_ms = W.numeric(ctx, "sb/lms", s.take(sc.px(S.control)),
+                          sb.les_ms, 0.0, 600000.0, 100.0, "мс",
+                          label="длительность", enabled=live,
+                          tip="модельное время, а не по стене. 0 — до "
+                              "ручной отмены")
+    if sb.les_note and s.fits(f.small.gh * 2):
+        h = W.label(ctx, L.Rect(content.x, s.area.y, content.w, s.area.h),
+                    sb.les_note, role="small",
+                    color=C.danger if sb.les_bad else C.dim, wrapped=True)
+        s.take(h, sc.px(S.xs))
+    row = s.take(sc.px(S.control))
+    half = row.cols(2, gap=sc.px(S.sm))
+    if W.button(ctx, "sb/leson", half[0], "Применить", kind="primary",
+                enabled=live and bool(sb.les_query.strip())
+                and len(sb.applied_lesions) < 8):
+        want = [{"query": w["запрос"], "kind": w["вид"],
+                 "ms": None} for w in sb.applied_lesions]
+        want.append({"query": sb.les_query.strip(), "kind": sb.les_kind,
+                     "ms": (sb.les_ms or None)})
+        _send(app, "вмешательство: %s, %s"
+              % (sb.les_query.strip(),
+                 dict(LESION_NAMES).get(sb.les_kind, sb.les_kind)),
+              {"lesion": want}, fields=("lesion",))
+    if W.button(ctx, "sb/lesoff", half[1], "Снять всё", kind="danger",
+                enabled=live and bool(sb.applied_lesions)):
+        _send(app, "вмешательства сняты", {"lesion": []},
+              fields=("lesion",))
+
+    # Действующие — отдельным списком, как просили: не в общей куче с
+    # набранным в полях выше, потому что это состояние модели, а не
+    # замысел окна.
+    for i, w in enumerate(sb.applied_lesions):
+        if not s.fits(sc.px(S.row) + f.micro.gh):
+            break
+        head = s.take(sc.px(S.row))
+        ctx.dl.vline(head.x + sc.px(1), head.y, head.y1, C.danger,
+                     sc.px(2), 0.9)
+        W.label(ctx, L.Rect(head.x + sc.px(S.sm), head.y,
+                            max(1, head.w - sc.px(S.sm) - sc.px(44)),
+                            head.h),
+                str(w.get("запрос", "?")), role="small", color=C.ink)
+        if W.button(ctx, "sb/lrm%d" % i,
+                    L.Rect(head.x1 - sc.px(40), head.y + sc.px(2),
+                           sc.px(40), head.h - sc.px(4)),
+                    "Снять", kind="quiet", enabled=live):
+            want = [{"query": x["запрос"], "kind": x["вид"], "ms": None}
+                    for j, x in enumerate(sb.applied_lesions) if j != i]
+            _send(app, "снято вмешательство: %s" % w.get("запрос", "?"),
+                  {"lesion": want}, fields=("lesion",))
+        until = w.get("до, мс")
+        W.label(ctx, s.take(f.micro.gh + sc.px(2)),
+                "%s · нейронов %s · связей %s · %s"
+                % (w.get("что", "?"), _fmt(w.get("нейронов"), 0),
+                   _fmt(w.get("связей"), 0),
+                   ("до ручной отмены" if until is None
+                    else "до %s мс модельного" % _fmt(until, 0))),
+                role="micro", color=C.faint)
+        # Активность задетой популяции — то самое, ради чего вмешиваются.
+        # Считается окном по сглаженному следу кадров активности, а не
+        # берётся из подтверждения: подтверждение говорит, что маска
+        # стоит, а не что популяция замолчала.
+        idx = sb.les_idx.get(w.get("запрос"))
+        act = getattr(app.ses, "act", None) if app.ses is not None else None
+        if idx is not None and act is not None and len(idx) and s.fits(
+                f.micro.gh):
+            hz = float(np.asarray(act)[idx].mean())
+            W.label(ctx, s.take(f.micro.gh + sc.px(2)),
+                    "активность популяции: %s Гц на нейрон" % _fmt(hz, 2),
+                    role="micro",
+                    color=C.ok if hz < 0.05 else C.warn)
 
     W.scroll_done(ctx, "sb/insp", r, s.used, token)
 
@@ -726,6 +900,13 @@ def _meters(app, ctx, r):
     # честных числа, и выглядит всё работающим.
     top = float(getattr(app.st.sb, "orn_max_hz", 150.0) or 150.0)
     lo, hi = ex.get("orn_l"), ex.get("orn_r")
+    # Явная диагностика насыщения, а не только предупреждение: доля
+    # потолка по каждому каналу числом. Пока она меньше единицы,
+    # двусторонняя разница существует и рулёжке есть на что опереться.
+    if lo is not None and hi is not None and top > 0:
+        W.kv(ctx, s.take(sc.px(S.row)), "насыщение, слева и справа",
+             "%s %% · %s %%" % (_fmt(100.0 * float(lo) / top, 0),
+                                _fmt(100.0 * float(hi) / top, 0)))
     if (lo is not None and hi is not None
             and float(lo) >= top - 1e-6 and float(hi) >= top - 1e-6):
         h = W.label(ctx, L.Rect(content.x, s.area.y, content.w, s.area.h),

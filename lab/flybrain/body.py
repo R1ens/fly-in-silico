@@ -283,7 +283,7 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     ``live`` — состояние живых условий (:class:`flybrain.live.BodyLive`) или
     ``None``. Контракт ровно из двух вызовов, и оба на виду:
 
-    * ``live.attach(body, sources, cfg, neurons, device)`` — один раз,
+    * ``live.attach(body, sources, cfg, neurons, device, engine)`` — раз,
       когда тело собрано: состояние получает ссылки на настоящую модель
       MuJoCo, на массив положений источников и на настройку, и дальше
       меняет их на месте;
@@ -370,7 +370,7 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     if live is not None:
         # До разогрева: то, что состояние применит здесь, — исходные
         # условия сеанса, а не правка на ходу.
-        live.attach(body, sources, cfg, neurons, device)
+        live.attach(body, sources, cfg, neurons, device, engine=engine)
         # Наблюдение надо перечитать. `reset` снял его ДО применения
         # условий, и дальше по нему считается и калибровка разогрева, и
         # нулевой шаг: при выключенных источниках муха «чуяла» бы

@@ -224,11 +224,98 @@ class Engine:
         self.spikes = torch.zeros(batch, n, device=device)
         self.refrac = self.refrac_steps.unsqueeze(0).repeat(batch, 1).clone()
 
+        # --- вмешательства: три вектора-маски по нейрону ---
+        #
+        # Единица — обычная работа, ноль — вмешательство. Векторы, а не
+        # правка матрицы: связей 15 091 983, и пересобирать их на каждое
+        # включение нельзя. Маски живут в той же памяти всю жизнь движка
+        # и меняются на месте, поэтому их видят и CUDA-графы: граф
+        # читает те же тензоры, что и обычный шаг.
+        #
+        # При всех единицах результат ПОБАЙТОВО прежний: умножение на
+        # 1.0 в IEEE754 точное для любого конечного числа.
+        self.m_fire = torch.ones(batch, n, device=device)
+        self.m_out = torch.ones(batch, n, device=device)
+        self.m_in = torch.ones(batch, n, device=device)
+
         # CUDA-графы: по одному на каждое положение кольца задержек.
         # Пусто, пока не позвали `use_graphs()`.
         self._graphs = None
         self._vstim = None
         self._pool = None
+
+    # --- вмешательства -------------------------------------------------
+
+    def set_masks(self, fire=None, out=None, inc=None):
+        """Поставить маски вмешательств по спискам индексов нейронов.
+
+        Ничего не пересобирает: три вектора заполняются единицами и
+        обнуляются по индексам. Это десятки микросекунд на 138 639
+        нейронов против пересборки 15 091 983 связей.
+
+        ``fire`` — не выдают спайк вовсе; ``out`` — спайк есть, но никуда
+        не уходит; ``inc`` — ничего не получают. Пустой список снимает
+        соответствующее вмешательство.
+
+        **Что при этом происходит с мембраной подавленного нейрона.**
+        Сброс идёт по замаскированному спайку, то есть подавленный
+        нейрон не сбрасывается и продолжает копить потенциал. Значит при
+        снятии подавления он выдаёт ОДИН спайк сразу (после него сброс
+        срабатывает обычным порядком) — не залп, а ровно один. Другой
+        выбор — держать мембрану на ``vReset`` всё время подавления —
+        менял бы уравнение мембраны, а не только выдачу спайка; здесь
+        выбран меньший из двух, и его последствие измерено пробой
+        `probe/lesion.py`, а не оставлено на удивление.
+
+        **Что с уже запланированными задержанными событиями** — см.
+        :meth:`_core`: ``inc`` действует мгновенно и в обе стороны,
+        ``out`` и ``fire`` имеют хвост до ``buf_len`` шагов (1,9 мс
+        модельного времени), потому что в кольце лежит сумма и
+        отправителя в ней уже не различить.
+        """
+        for vec, idx in ((self.m_fire, fire), (self.m_out, out),
+                         (self.m_in, inc)):
+            if idx is None:
+                continue
+            vec.fill_(1.0)
+            if len(idx):
+                t = torch.as_tensor(np.asarray(idx, dtype=np.int64),
+                                    device=self.device)
+                vec.index_fill_(1, t, 0.0)
+
+    def fan(self):
+        """Сколько у каждого нейрона входящих и исходящих связей.
+
+        Считается один раз и запоминается: окно показывает, сколько
+        связей заденет вмешательство, а не только сколько нейронов, и
+        пересчитывать для этого 15 млн связей на каждое движение
+        ползунка нельзя.
+
+        Матрица лежит как ``W[post, pre]`` в CSR, поэтому входящие — это
+        длины строк, а исходящие — счётчик по столбцам.
+        """
+        got = getattr(self, "_fan", None)
+        if got is None:
+            crow = self.w_csr.crow_indices()
+            cols = self.w_csr.col_indices()
+            n_in = (crow[1:] - crow[:-1]).to(torch.int64)
+            n_out = torch.bincount(cols.to(torch.int64), minlength=self.n)
+            got = self._fan = (n_in, n_out)
+        return got
+
+    def mask_counts(self):
+        """Сколько нейронов под каждой маской — для подтверждения и отчёта."""
+        return {
+            "не выдают спайк": int((self.m_fire[0] == 0).sum()),
+            "исходящие отключены": int((self.m_out[0] == 0).sum()),
+            "входящие отключены": int((self.m_in[0] == 0).sum()),
+        }
+
+    def masks_clear(self):
+        """Вмешательств нет вовсе: все три маски — единицы."""
+        return not (bool((self.m_fire == 0).any())
+                    or bool((self.m_out == 0).any())
+                    or bool((self.m_in == 0).any()))
 
     def advance_ptr(self):
         self.ptr = (self.ptr + 1) % self.buf_len
@@ -349,10 +436,35 @@ class Engine:
         return self.w_scale * poisson
 
     def _core(self, voltage_stim):
-        """Детерминированная часть шага. Её и пишем в граф."""
+        """Детерминированная часть шага. Её и пишем в граф.
+
+        Три маски вмешательств стоят в трёх разных местах цепочки, и
+        места выбраны не для удобства, а по смыслу.
+
+        * ``m_out`` — перед матричным умножением, по ПРЕсинаптическому
+          нейрону: спайк случается и считается, но никуда не уходит.
+        * ``m_in`` — при ЧТЕНИИ кольца задержек, по ПОСТсинаптическому:
+          нейрон не получает ничего, включая то, что уже летит к нему.
+        * ``m_fire`` — после порога: нейрон не выдаёт спайк вовсе, и его
+          нет ни в растре, ни в счётчиках, ни в передаче.
+
+        Отсюда важное следствие, которое надо знать, а не выяснять на
+        опыте. ``m_in`` действует МГНОВЕННО и в обе стороны: включили —
+        и уже запланированные события до нейрона не доходят, выключили —
+        и доставка возобновляется сразу, без накопленного залпа.
+        ``m_out`` и ``m_fire`` так не умеют: в кольце лежит уже СУММА
+        по всем пресинаптическим нейронам, и к моменту доставки, через
+        ``tDelay``, отправителя в ней не различить. Значит у отключения
+        исходящих есть хвост: события, записанные в кольцо до
+        вмешательства, дойдут до получателей — до ``buf_len`` шагов,
+        то есть 1,9 мс модельного времени. Столько же длится и пауза
+        после снятия вмешательства, прежде чем передача возобновится.
+        Очистить кольцо нельзя: вместе с чужими событиями оно выбросило
+        бы и события всех остальных нейронов.
+        """
         # recurrent input: W[post, pre] @ spikes[pre]
         recurrent = self.w_scale * torch.sparse.mm(
-            self.w_csr, self.spikes.t().contiguous()).t()
+            self.w_csr, (self.spikes * self.m_out).t().contiguous()).t()
 
         # refractory counter: reset on spike, otherwise count up
         self.refrac.add_(1.0).mul_(1.0 - self.spikes)
@@ -361,7 +473,7 @@ class Engine:
         # synaptic conductance with axonal delay.  The upstream code rolls a
         # (delay+1)-slot buffer every step; reading and then overwriting slot
         # ``step mod L`` of a ring buffer is the same thing without the copy.
-        delayed = self.delay_buffer[:, self.ptr, :]
+        delayed = self.delay_buffer[:, self.ptr, :] * self.m_in
         conductance_new = self.conductance * (1.0 - self.tau_syn_f) + delayed * gate
         self.delay_buffer[:, self.ptr, :] = recurrent
         self.advance_ptr()
@@ -374,6 +486,10 @@ class Engine:
         self.v.add_(self.tau_mem_f * (
             self.conductance - (self.v - self.v_rest)))
         self.spikes.copy_(self.v > self.v_th)
+        self.spikes.mul_(self.m_fire)
+        # Сброс мембраны идёт по УЖЕ замаскированному спайку: подавленный
+        # нейрон не сбрасывается и продолжает копить потенциал. Это не
+        # оплошность, а выбор, и он важен — см. `set_masks`.
         self.v.sub_((self.v - self.v_reset) * self.spikes)
         self.conductance.copy_(conductance_new
                                - conductance_new * self.spikes)
