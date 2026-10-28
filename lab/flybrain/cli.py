@@ -136,7 +136,13 @@ def _spec_from_args(args, kind):
             readout=args.readout, dn_tau_s=args.dn_tau,
             control_ms=args.control_ms, physics_dt=args.physics_dt,
             swap_antennae=args.control, cross=not args.no_cross,
-            video=args.video, play_speed=args.play_speed, view=args.view)
+            video=args.video, play_speed=args.play_speed, view=args.view,
+            motor=getattr(args, "motor_decoder", "legacy"),
+            motor_weights=getattr(args, "motor_weights", None),
+            gf_bridge=getattr(args, "gf_bridge", "none"),
+            head_stab=bool(getattr(args, "head_stab", False)),
+            neck_kp=getattr(args, "neck_kp", None),
+            probes=not getattr(args, "no_probes", False))
     elif kind == "lateral":
         sp.lateral = S.LateralSpec(base_hz=args.base, depth=args.depth,
                                    period_s=args.period, top=args.top)
@@ -876,6 +882,28 @@ def build_parser():
     s.add_argument("--bench", type=int, default=0,
                    help="серия эпизодов: норма против перестановки антенн")
     s.add_argument("--bench-seed", type=int, default=100)
+    # --- инженерный моторный путь; по умолчанию всё как было ---
+    s.add_argument("--motor-decoder", default="legacy",
+                   choices=("legacy", "dn_linear", "dn_trained"),
+                   help="чем активность становится командой: legacy — "
+                        "прежнее среднее по полушарию; dn_linear — прямые "
+                        "зонды нисходящих с объявленными коэффициентами; "
+                        "dn_trained — те же зонды, веса из файла")
+    s.add_argument("--motor-weights", default=None,
+                   help="файл весов для --motor-decoder dn_trained")
+    s.add_argument("--gf-bridge", default="none",
+                   choices=("none", "gain_v1"),
+                   help="ИНЖЕНЕРНЫЙ мост через обрыв «Giant Fiber → "
+                        "мотонейроны». По умолчанию его нет: пути в v783 "
+                        "нет вовсе")
+    s.add_argument("--head-stab", action="store_true",
+                   help="опубликованная ОБУЧЕННАЯ стабилизация головы "
+                        "(инженерная деталь тела, обходит коннектом)")
+    s.add_argument("--neck-kp", type=float, default=None,
+                   help="жёсткость приводов шеи при --head-stab (по "
+                        "умолчанию 500, опубликованное значение)")
+    s.add_argument("--no-probes", action="store_true",
+                   help="не писать readout_* прямых зондов в запись")
     s.add_argument("--device", default=None)
     s.add_argument("--out", default=None)
     s.add_argument("--no-open", action="store_true")

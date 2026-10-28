@@ -112,8 +112,23 @@ def main():
               "%s против %s" % (slow[key], fast[key]))
     check("конечная поза совпала", slow["конец"] == fast["конец"],
           "%s против %s" % (slow["конец"], fast["конец"]))
-    same_m = all(abs(float(slow["метрики"][k]) - float(fast["метрики"][k]))
-                 < 1e-12 for k in slow["метрики"])
+    # `None` среди метрик — не «нет значения», а «величина не
+    # существует»: так `body._motor_metrics` отвечает про корреляцию с
+    # раздражителем, когда команда постоянна (у постоянного ряда
+    # корреляции нет, и ноль здесь был бы выдумкой). Поэтому сравнение
+    # идёт через `_num`, а не через `float`: прежний `float(None)` падал
+    # с TypeError на первом же эпизоде с заглушённым съёмом, то есть
+    # шлюз ломался ровно на том прогоне, который и надо проверить.
+    def _num(v):
+        return None if v is None else float(v)
+
+    def _eq(a, b):
+        if a is None or b is None:
+            return a is None and b is None
+        return abs(a - b) < 1e-12
+
+    same_m = all(_eq(_num(slow["метрики"][k]), _num(fast["метрики"].get(k)))
+                 for k in slow["метрики"])
     check("метрики совпали", same_m,
           "grad_alignment %s против %s"
           % (slow["метрики"].get("grad_alignment"),

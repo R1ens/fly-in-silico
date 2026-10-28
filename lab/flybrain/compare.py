@@ -139,6 +139,22 @@ def _params_of(run, d=None):
               "swap_antennae", "motor_left", "turn_sign"):
         if body.get(k) is not None:
             out.setdefault("измерено/задано: " + k, body[k])
+    # Нефизиологичные детали моторного пути. В сверку они идут отдельной
+    # строкой на деталь, с именем и версией: два прогона с разными
+    # декодерами не должны выглядеть как два прогона одного опыта.
+    eng = ep.get("engineered") or {}
+    if eng:
+        out["инженерное: версия пути"] = eng.get("версия моторного пути")
+        for det in (eng.get("детали") or []):
+            if not isinstance(det, dict):
+                continue
+            label = "инженерное: " + str(det.get("имя"))
+            val = "v%s" % det.get("версия")
+            if det.get("вид"):
+                val += ", " + str(det["вид"])
+            if det.get("sha256"):
+                val += ", sha256 " + str(det["sha256"])[:12]
+            out[label] = val
     m = d.get("meta.json") or {}
     for s in (m.get("stimuli") or []):
         out.setdefault("стимул", "%s, %d нейронов, %g Гц"

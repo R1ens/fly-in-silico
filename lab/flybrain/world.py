@@ -133,6 +133,22 @@ SENSORS = {
 }
 
 # Descending output, read out per hemisphere.
+#
+# ВНИМАНИЕ: это съём по ВСЕМУ полушарию — 645 и 646 нейронов. Giant Fiber
+# в нём 2 из 1299, и его спайк арифметически неотличим от шума: при
+# 209 Гц один GF поднимает это среднее примерно на 0,32 Гц, а обычный
+# уровень 2,5…4,1 Гц при 51…88 активных нейронах. Прямые зонды по
+# названным типам живут в :mod:`flybrain.motor` (``DN_PROBES``), и для
+# научного утверждения о конкретном нисходящем нейроне нужны они, а не
+# это среднее. Здесь селекторы оставлены как есть: по ним посчитаны все
+# прежние прогоны.
+#
+# И отдельно, чтобы не вводило в заблуждение: в ТЕЛЕ съём по умолчанию
+# не этот. `BodyConfig.readout = "ALPN"`, а `class:ALPN` — 685 нейронов,
+# пересечение с `super:descending` ноль, с `DNp01` ноль, `super_class`
+# у всех 685 равен `central`. То есть по умолчанию ноги ведёт сенсорная
+# популяция, в которой премоторных нейронов нет вовсе, и Giant Fiber там
+# не «растворён», а отсутствует. Замер — `probe/motor_audit.py`.
 MOTOR = {
     "dn_left": "super:descending+side:left",
     "dn_right": "super:descending+side:right",
@@ -148,10 +164,43 @@ PROBES = {
     "LH": ("region:LH+side:left", "region:LH+side:right"),
     "MBON": ("type:MBON+side:left", "type:MBON+side:right"),
     "DN": ("super:descending+side:left", "super:descending+side:right"),
+    # ВНИМАНИЕ, ловушка имён. `type=DNa01` даёт ЧЕТЫРЕ нейрона, а не два:
+    # пару с `hemibrain_type = DNa01` (их `cell_type` — `DNae001`, GNG) и
+    # отдельную пару с `cell_type = DNa01` (их `hemibrain_type` —
+    # `VES006`, область VES). Так же `type=DNp09`: в нём ещё и пара
+    # `cell_type = DNp71`. Эти три строки оставлены как были — по ним
+    # посчитаны прежние прогоны, и менять их значило бы молча изменить
+    # чужие числа. Для нового разбора есть `motor.DN_PROBES`, где
+    # селекторы адресуют ОДИН столбец, а размер проверяется.
     "DNa02": ("type=DNa02+side:left", "type=DNa02+side:right"),
     "DNa01": ("type=DNa01+side:left", "type=DNa01+side:right"),
     "DNp09": ("type=DNp09+side:left", "type=DNp09+side:right"),
 }
+
+def dn_probe_candidates():
+    """Прямые зонды моторного пути как пары селекторов, под своими именами.
+
+    Отдельно от :func:`probe_candidates` нарочно, и причина
+    арифметическая: тот список отбрасывает всё, где меньше восьми
+    нейронов на сторону, а у прямых зондов их один-два — то есть они бы
+    в него просто не попали. Подкрутить порог нельзя: он защищает
+    общий перебор примерно 250 популяций от групп, где асимметрия
+    двух нейронов — это не измерение, а монетка. Для прямых зондов это
+    препятствием не является, потому что их асимметрию делает
+    измеримой сглаживание по времени, а не число нейронов, — но знать
+    об этом должен тот, кто их просит, и поэтому они живут здесь.
+
+    Собираются из `motor.DN_PROBES`, а не выписаны второй раз: два
+    списка одних и тех же селекторов неизбежно разъехались бы.
+    """
+    from .motor import DN_PROBES, SHADOW_PROBES
+
+    out = {}
+    for src in (DN_PROBES, SHADOW_PROBES):
+        for name, p in src.items():
+            out["зонд:" + name] = (f"{p.sel}+side:left",
+                                   f"{p.sel}+side:right")
+    return out
 
 # Named cell families worth screening as a steering readout, on top of every
 # neuropil taken as a whole.  The central-complex ones are here because PFL2
