@@ -267,8 +267,11 @@ def select(df: pd.DataFrame, query: str) -> np.ndarray:
 
     Supported forms, comma-separated and combined as a union::
 
-        type:Gr64f           cell_type or hemibrain_type contains (regex, case-insensitive)
-        type=MBON01          cell_type or hemibrain_type equals exactly
+        type:Gr64f           ЛЕГАСИ: cell_type, hemibrain_type или label содержит
+        type=MBON01          ЛЕГАСИ: любой из тех же трёх столбцов равен точно
+        celltype=DNp01       только cell_type, точное равенство
+        hemibrain=DNa01      только hemibrain_type
+        label=...            только label
         class:gustatory      cell_class contains
         super:descending     super_class contains
         region:AL            region equals
@@ -279,6 +282,27 @@ def select(df: pd.DataFrame, query: str) -> np.ndarray:
 
     A bare word is treated as ``type:<word>``.  Terms can be chained with ``+``
     to intersect, e.g. ``type:LC10+side:left``.
+
+    **Какой ключ брать для научной выборки.** ``type`` — легаси, и он
+    берёт ОБЪЕДИНЕНИЕ трёх столбцов. На большинстве имён это одно и то
+    же, но у нисходящих нейронов номенклатуры столкнулись, и
+    объединение молча склеивает две разные популяции: ``type=DNa01``
+    даёт **четыре** нейрона — пару с ``hemibrain_type = DNa01`` (их
+    ``cell_type`` — ``DNae001``, область GNG) и совсем другую пару с
+    ``cell_type = DNa01`` (их ``hemibrain_type`` — ``VES006``, область
+    VES). То же у ``type=DNp09``.
+
+    Поэтому: ``type`` оставлен ровно таким, какой был, потому что по
+    нему считаны все сохранённые прогоны; для нового научного кода есть
+    ``celltype=``, ``hemibrain=`` и ``label=``, каждый по одному
+    столбцу. Проверка — ``probe/select_exact.py``, и она сверяет
+    **конкретные номера нейронов**, а не только их число.
+
+    Отдельная ловушка, из-за которой и завелись новые ключи: ``type:X``
+    — это «СОДЕРЖИТ X» регулярным выражением, а не «начинается с X».
+    ``type:T4`` даёт 6400 нейронов, среди которых ни одного T4
+    (затягивает ``LHCENT4``, ``LPT42_Nod4``, ``AC neuron``), а
+    ``type=T4`` даёт ноль, потому что настоящие типы — ``T4a``…``T4d``.
     """
     idx = _codes(df)["idx"]
     parts = []
@@ -405,8 +429,30 @@ def _term_mask_slow(df: pd.DataFrame, term: str) -> np.ndarray:
 
     hit = equals if exact else contains
 
-    if key in ("type", "cell_type", "t"):
+    if key in ("type", "t"):
+        # Легаси и только легаси: объединение трёх столбцов. Так считаны
+        # все сохранённые прогоны, и менять это нельзя. Для научной
+        # выборки пользуйся ключами ниже — объединение здесь склеивает
+        # разные популяции, когда имена двух номенклатур столкнулись.
         return hit("cell_type") | hit("hemibrain_type") | hit("label")
+    # По одному столбцу, без объединения. Единственный способ развести
+    # столкнувшиеся имена: `type=DNa01` даёт четыре нейрона — пару с
+    # `hemibrain_type = DNa01` (их `cell_type` — `DNae001`, область GNG)
+    # и совсем другую пару с `cell_type = DNa01` (их `hemibrain_type` —
+    # `VES006`, область VES).
+    #
+    # `cell_type` до этой правки был ПСЕВДОНИМОМ `type`, то есть значил
+    # объединение трёх столбцов, а не одноимённый столбец. Это ловушка
+    # в чистом виде, и она снята: теперь `cell_type` значит столбец
+    # `cell_type`. Проверено, что в коде, документации и сохранённых
+    # прогонах этот ключ не употреблялся ни разу, так что совместимость
+    # не задета.
+    if key in ("celltype", "cell_type", "ct"):
+        return hit("cell_type")
+    if key in ("hemibrain", "hemibrain_type", "hb"):
+        return hit("hemibrain_type")
+    if key == "label":
+        return hit("label")
     if key in ("class", "cell_class", "c"):
         return hit("cell_class") | hit("cell_sub_class")
     if key in ("super", "super_class", "s"):
