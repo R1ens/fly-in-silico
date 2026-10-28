@@ -459,8 +459,18 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     # остаётся невидимым (2 нейрона из 1299 в усреднённом съёме). Прежний
     # съём по полушарию подключён к тому же измерителю под именем
     # `__readout__`, чтобы у старого и нового декодера был один вход.
+    # Строгость размеров зондов нужна ровно тогда, когда от них зависят
+    # ЧИСЛА. У `legacy` они не зависят: зонды там только записываются, а
+    # команду считает прежний съём `__readout__`. Поэтому при `legacy`
+    # расхождение размера пишется в прогон строкой «совпало: false» и
+    # оговоркой, а прогон считается; при новых декодерах оно по-прежнему
+    # останавливает счёт. Иначе смена версии набора данных ломала бы и
+    # те прогоны, которые воспроизводят эталон и зондов не используют, —
+    # то есть побитовая сверка легаси стала бы недоступна первой.
+    strict_probes = cfg.motor != "legacy"
     readout = motor.DnReadout(
-        neurons, device, pairs={"__readout__": (ql, qr)}) \
+        neurons, device, pairs={"__readout__": (ql, qr)},
+        strict=strict_probes) \
         if cfg.probes or cfg.motor != "legacy" else None
     shape = motor.DecoderShape(
         amp_base=cfg.amp_base, amp_span=cfg.amp_span, amp_min=cfg.amp_min,
@@ -902,6 +912,19 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         c = obj.caveat() if obj is not None else None
         if c:
             timing.setdefault("оговорки", []).append(c)
+    # Зонды не сошлись по размеру, а прогон всё равно посчитался (это
+    # возможно только при `legacy`, где от них не зависят числа). Молчать
+    # об этом нельзя: `readout_*` такого прогона относятся не к тем
+    # популяциям, про которые сказано в отчёте.
+    bad_probes = [r["зонд"] for r in readout.rows if not r.get("совпало")]
+    if bad_probes:
+        timing.setdefault("оговорки", []).append(
+            "прямые зонды не сошлись с таблицей нейронов: %s. Команду "
+            "считал прежний съём `%s`, и на неё это не влияет, но поля "
+            "`readout_*` этих зондов относятся НЕ к тем популяциям, "
+            "которые названы: размер в таблице изменился. Числа таких "
+            "зондов из этого прогона брать нельзя."
+            % (", ".join(bad_probes), cfg.readout))
     if cfg.motor != "legacy":
         timing.setdefault("оговорки", []).append(
             "моторная команда посчитана ИНЖЕНЕРНЫМ декодером "
