@@ -308,6 +308,12 @@ BODY_KNOBS = {k.name: k for k in (
     # --- источники запаха: настоящие mocap-тела модели MuJoCo ---
     Knob("sources", "arena", "body_sources", None, None, "",
          "слоты источника запаха: x, y, сила, включён"),
+    # --- зрительные объекты: тот же приём, что и у источников ---
+    # Слоты созданы до компиляции модели (`objects.inject`), потому что
+    # MuJoCo не добавляет тела в собранную модель. «Появление» объекта —
+    # это включение свободного слота, а не создание тела.
+    Knob("objects", "arena", "body_objects", None, None, "",
+         "слоты зрительного объекта: x, y, z, радиус, серость, включён"),
     # --- вход рецепторов ---
     Knob("orn_max_hz", "params", "float", 0.0, MAX_STIM_HZ, "Гц",
          "частота обонятельных рецепторов при насыщении"),
@@ -362,6 +368,33 @@ def _body_source(tag, d):
         "y": _num(tag + ".y", d.get("y", 0.0), -150.0, 150.0, "мм"),
         "strength": _num(tag + ".strength", d.get("strength", 1.0),
                          0.0, 100.0, ""),
+        "on": on,
+    }
+
+
+def _body_object(tag, d):
+    """Один слот зрительного объекта: проверка до записи.
+
+    Пределы те же, что у источника запаха: половина арены `OdorArena`
+    (300×300 мм). Высота ограничена отдельно — объект ниже пола не
+    виден, а выше 60 мм выходит из поля зрения мухи и смысла не имеет.
+    """
+    extra = set(d) - {"x", "y", "z", "radius", "grey", "on"}
+    if extra:
+        raise ValueError("%s: лишние поля %s" % (tag, ", ".join(sorted(extra))))
+    on = d.get("on", False)
+    if not isinstance(on, bool):
+        raise ValueError("%s.on: нужно да или нет, пришло %r" % (tag, on))
+    return {
+        "x": _num(tag + ".x", d.get("x", 0.0), -150.0, 150.0, "мм"),
+        "y": _num(tag + ".y", d.get("y", 0.0), -150.0, 150.0, "мм"),
+        "z": _num(tag + ".z", d.get("z", 1.5), 0.0, 60.0, "мм"),
+        "radius": _num(tag + ".radius", d.get("radius", 1.0),
+                       0.05, 20.0, "мм"),
+        # Серость, а не цвет: объект нужен как зрительный раздражитель, и
+        # различать его по оттенку сетчатка всё равно не может — два
+        # канала фоторецептора сводятся в один (`retina.intensity`).
+        "grey": _num(tag + ".grey", d.get("grey", 0.1), 0.0, 1.0, ""),
         "on": on,
     }
 
@@ -532,6 +565,12 @@ class BodyLive:
         self._on = {}
         self._mocap = {}
         self._geom = {}
+        # Пул зрительных объектов. Находится по именам тел при привязке
+        # (`objects.discover`), а не передаётся снаружи: иначе подпись
+        # привязки пришлось бы менять, а её зовёт `body.run_episode`.
+        # `None` значит, что пул в арену не вписывали — тогда эпизод
+        # считается ровно как раньше.
+        self.pool = None
         self.engine = None
         self.lesions = []
 
@@ -585,6 +624,12 @@ class BodyLive:
         Проверяется и `mocapid`: у немокапного тела он −1, и запись в
         `mocap_pos[-1]` молча сдвинула бы чужое тело.
         """
+        # Пул зрительных объектов ищется тем же способом и здесь же: по
+        # именам тел в уже собранной модели. Нет пула — нет и ручки.
+        from . import objects as _objects
+
+        self.pool = _objects.discover(self.body)
+
         m = self.body.physics.model
         self._mocap, self._geom = {}, {}
         for i in range(int(m.nbody)):
@@ -622,6 +667,39 @@ class BodyLive:
         if self.body is None:
             return 0
         return int(self.body.arena.odor_source.shape[0])
+
+    # -- зрительные объекты ---------------------------------------------
+
+    def object_slots(self):
+        return 0 if self.pool is None else len(self.pool.slots)
+
+    def _read_objects(self):
+        """Что в пуле сейчас. Пустой список, если пул не вписан."""
+        if self.pool is None:
+            return []
+        out = []
+        for s in self.pool.slots:
+            out.append({"x": round(float(s.pos[0]), 4),
+                        "y": round(float(s.pos[1]), 4),
+                        "z": round(float(s.pos[2]), 4),
+                        "radius": round(float(s.radius), 4),
+                        "grey": round(float(s.rgba[0]), 4),
+                        "on": bool(s.on)})
+        return out
+
+    def _write_objects(self, want, t_ms=None, cmd_id=None):
+        """Слоты объектов — в модель, через тот же `Pool.set`.
+
+        Модельное время и номер команды уходят в историю слота: правка,
+        которой нет в журнале, не считается сделанной, и по этим полям
+        событие попадает в таймлайн сеанса.
+        """
+        for i, d in enumerate(want):
+            g = float(d["grey"])
+            self.pool.set(i, on=d["on"],
+                          pos=(d["x"], d["y"], d["z"]),
+                          radius=d["radius"], rgba=(g, g, g, 1.0),
+                          t_ms=t_ms, cmd=cmd_id)
 
     def _read_sources(self):
         if self.body is None:
@@ -668,6 +746,8 @@ class BodyLive:
         for k in BODY_KNOBS.values():
             if k.name == "sources":
                 out["sources"] = self._read_sources()
+            elif k.name == "objects":
+                out["objects"] = self._read_objects()
             elif k.name == "stim":
                 out["stim"] = [{"query": s["query"], "rate_hz": s["rate_hz"],
                                 "нейронов": s["n"]} for s in self._stims]
@@ -955,6 +1035,26 @@ class BodyLive:
                     _body_source("sources[%d]" % i,
                                  d if isinstance(d, dict) else {})
                     for i, d in enumerate(value)]
+            elif k.kind == "body_objects":
+                n = self.object_slots()
+                if not isinstance(value, (list, tuple)):
+                    raise ValueError("objects: нужен список из %d слотов"
+                                     % n)
+                if not n:
+                    raise ValueError(
+                        "objects: в модели нет слотов зрительных объектов. "
+                        "Их создаёт `objects.inject` ДО компиляции модели; "
+                        "добавить тело в собранную модель MuJoCo нельзя")
+                if len(value) != n:
+                    raise ValueError(
+                        "objects: слотов в модели %d, а пришло %d. Слот — "
+                        "это тело MJCF, их число задаётся при сборке модели "
+                        "и на ходу не меняется: «добавить объект» — это "
+                        "включить свободный слот" % (n, len(value)))
+                ready[name] = [
+                    _body_object("objects[%d]" % i,
+                                 d if isinstance(d, dict) else {})
+                    for i, d in enumerate(value)]
             elif k.kind == "stims":
                 # Разбор запросов — здесь же, в проверке: иначе отказ
                 # пришёлся бы на этап записи, когда слоты уже переписаны.
@@ -972,6 +1072,9 @@ class BodyLive:
             if name == "sources":
                 self._write_sources(value)
                 now[name] = self._read_sources()
+            elif name == "objects":
+                self._write_objects(value, t_ms=t_ms, cmd_id=cmd_id)
+                now[name] = self._read_objects()
             elif name == "stim":
                 now[name] = self._install_stims(value)
             elif name == "lesion":

@@ -70,11 +70,19 @@ RGBA = (0.1, 0.1, 0.1, 1.0)   # почти чёрный: объект долже
 
 @dataclass
 class Slot:
-    """Один объект пула и всё, что про него известно."""
+    """Один объект пула и всё, что про него известно.
+
+    ``pos`` — положение ЗАКАЗАННОЕ, а не то, что сейчас в модели. У
+    выключенного слота в модели стоит :data:`PARK`, но показывать и
+    отдавать наружу надо заказанное: иначе включение выглядело бы как
+    появление объекта из-под пола, а снимок состояния не прошёл бы
+    собственную проверку (``z`` парковки отрицателен). Точно так же
+    устроена сила выключенного источника запаха в `live.BodyLive`.
+    """
 
     i: int
     on: bool = False
-    pos: tuple = PARK
+    pos: tuple = (0.0, 0.0, 1.5)
     radius: float = RADIUS
     rgba: tuple = RGBA
     # Что с этим слотом делали. Нужно журналу сеанса: по этому списку
@@ -105,6 +113,31 @@ def inject(arena, n=POOL, radius=RADIUS, rgba=RGBA):
                  contype=0, conaffinity=0)
         slots.append(Slot(i=i, radius=float(radius), rgba=tuple(rgba)))
     return slots
+
+
+def discover(body, n=POOL):
+    """Найти пул в уже собранной модели по именам тел.
+
+    Нужно, чтобы живые условия (`live.BodyLive`) могли управлять пулом,
+    не меняя подписи своей привязки и не завязываясь на то, кто именно
+    собирал арену. Тот же приём там уже применён к mocap-строкам
+    маркеров запаха: номера ищутся по имени, а не предполагаются.
+
+    Возвращает привязанный :class:`Pool`, если в модели есть хотя бы
+    один слот, и ``None``, если пул не вписывали вовсе — тогда эпизод
+    считается ровно как раньше.
+    """
+    import mujoco
+
+    m = body.physics.model.ptr
+    slots = []
+    for i in range(int(n)):
+        if mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, NAME % i) < 0:
+            break
+        slots.append(Slot(i=i))
+    if not slots:
+        return None
+    return Pool(slots).attach(body)
 
 
 class Pool:
