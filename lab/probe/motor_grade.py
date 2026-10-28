@@ -335,7 +335,19 @@ def part_neg(neurons, weights, device, trained=None):
             ("dn_linear", "маска посторонних"),
             ("legacy", "норма"), ("legacy", "маска съёма")]
     if trained:
-        jobs += [("dn_trained", "норма"), ("dn_trained", "маска съёма")]
+        # Файл весов может оказаться непригодным, и это не повод падать:
+        # `DnTrainedDecoder` отказывается от файла, не записавшего свою
+        # нормировку, потому что веса применились бы в другом масштабе
+        # молча. Такой отказ надо ПОКАЗАТЬ, а не обойти.
+        from flybrain import motor as M
+        try:
+            M.make_decoder("dn_trained",
+                           shape=M.DecoderShape(dn_tau_s=TAU_S),
+                           weights_path=trained)
+            jobs += [("dn_trained", "норма"), ("dn_trained", "маска съёма")]
+        except (ValueError, FileNotFoundError) as e:
+            note("обученный декодер в проверку НЕ взят: %s" % e)
+            rep["замеры"]["dn_trained пропущен"] = str(e)
     rows = []
     for dec_name, cond in jobs:
         t0 = time.perf_counter()

@@ -454,8 +454,21 @@ def main():
     part_g(neurons, weights, device)
 
     trained = OUT / "motor_decoder_v1.npz"
-    part_bv(neurons, weights, device,
-            trained=str(trained) if trained.exists() else None)
+    use_trained = None
+    if trained.exists():
+        # Пригодность файла весов проверяется ДО прогона, иначе проба
+        # падала бы посередине. `DnTrainedDecoder` отказывается от файла,
+        # не записавшего свою нормировку: веса применились бы в другом
+        # масштабе молча. Отказ показывается, а не обходится.
+        try:
+            motor.make_decoder("dn_trained",
+                               shape=motor.DecoderShape(dn_tau_s=TAU_S),
+                               weights_path=str(trained))
+            use_trained = str(trained)
+        except (ValueError, FileNotFoundError) as e:
+            print("\n  обученный декодер в проверку НЕ взят: %s" % e)
+            rep["замеры"]["dn_trained пропущен"] = str(e)
+    part_bv(neurons, weights, device, trained=use_trained)
 
     (OUT / "motor_check.json").write_text(
         json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")

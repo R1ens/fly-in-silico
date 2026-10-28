@@ -847,11 +847,31 @@ class DnTrainedDecoder(Decoder):
         self.b = float(np.asarray(z["b"]).reshape(-1)[0])
         self.train_meta = {k: z[k].tolist() for k in z.files
                            if k.startswith("meta_")}
-        if "meta_norm" in z.files:
-            self.norm = str(np.asarray(z["meta_norm"]).reshape(-1)[0])
-        if "meta_probe_ref_hz" in z.files:
-            self.probe_ref_hz = float(
-                np.asarray(z["meta_probe_ref_hz"]).reshape(-1)[0])
+        # Нормировка входа — ЧАСТЬ ОБУЧЕНИЯ: веса подогнаны под тот
+        # масштаб `z`, в котором собиралась выборка. Файл, который её не
+        # записал, не говорит, на чём обучался, и применить его молча —
+        # значит посчитать веса в другом масштабе и не узнать об этом.
+        #
+        # Отказ, а не предупреждение, по замеру: `motor_decoder_v1.npz`
+        # от 25.10 06:35 этих ключей НЕ содержит, а `motor_train.py`,
+        # который их пишет, правлен в 06:46 — то есть файл снят до
+        # перехода на `norm="rate"`, под прежней нормировкой на
+        # измеренный шум. Применённый с нынешним умолчанием он считал бы
+        # веса в масштабе, которого при обучении не было, и r² = 0,079
+        # из `motor_train.json` описывал бы не этот декодер.
+        missing_norm = [k for k in ("meta_norm", "meta_probe_ref_hz")
+                        if k not in z.files]
+        if missing_norm:
+            raise ValueError(
+                "%s: в файле весов нет %s. Нормировка входа — часть "
+                "обучения, и файл, который её не записал, применять "
+                "нельзя: веса посчитались бы в другом масштабе молча. "
+                "Этот файл снят до перехода на norm=\"rate\". "
+                "Переобучить — `probe/motor_train.py`."
+                % (self.path, " и ".join(missing_norm)))
+        self.norm = str(np.asarray(z["meta_norm"]).reshape(-1)[0])
+        self.probe_ref_hz = float(
+            np.asarray(z["meta_probe_ref_hz"]).reshape(-1)[0])
         if len(self.w) != len(self.probe_order):
             raise ValueError(
                 "%s: весов %d, а зондов в файле %d — файл испорчен"
