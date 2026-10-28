@@ -27,3 +27,7 @@ __pycache__/
 MUJOCO_LOG.TXT
 imgui.ini
 *.ini
+
+# Рабочие деревья субагентов: это отдельные чекауты, им не место
+# в истории этого.
+.claude/worktrees/
