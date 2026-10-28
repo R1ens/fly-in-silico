@@ -107,6 +107,13 @@ class Run:
     # кто считал (`timing.оговорки`), а каталог обязан их показать —
     # оговорка, которую никто не видит, оговоркой не является.
     caveats: tuple = ()
+    # Сеанс песочницы: прогон, у которого есть единый таймлайн
+    # модельного времени (`timeline.npz`) и не было заранее заданного
+    # конца. Это не новый вид прогона, а признак: вид остаётся прежним
+    # («В теле», «Арена»), а по признаку «Анализ» показывает таймлайн и
+    # называет сеанс сеансом, а не оборванным эпизодом.
+    session: bool = False
+    timeline: dict | None = None     # схема taймлайна без массивов
 
     @property
     def kind_title(self):
@@ -122,6 +129,15 @@ class Run:
 
     def has(self, name):
         return name in self.files
+
+    @property
+    def has_timeline(self):
+        return "timeline.npz" in self.files and "timeline.json" in self.files
+
+    @property
+    def has_state(self):
+        """Есть ли снимок состояния: с него сеанс можно продолжить."""
+        return "state.npz" in self.files and "state.json" in self.files
 
 
 def _kind_of(files, spec, run_json):
@@ -351,6 +367,20 @@ def _fill_times(r):
                 caveats.append(line)
     r.caveats = tuple(caveats)
 
+    # Таймлайн: читается только схема (`timeline.json`), массивы —
+    # нет. Обзор каталога не должен открывать ни одного `npz`.
+    if r.has_timeline:
+        tl, err = read_json(r.path / "timeline.json")
+        if err:
+            r.errors["timeline.json"] = err
+        elif isinstance(tl, dict):
+            r.timeline = {k: v for k, v in tl.items() if k != "события"}
+            r.timeline["событий"] = len(tl.get("события") or [])
+            endless = any("без заранее заданного конца" in str(c)
+                          for c in r.caveats)
+            r.session = bool(endless or r.run_json is None
+                             or (r.run_json or {}).get("cancelled"))
+
     main = MAIN_FILE.get(r.kind)
     if main and main in r.errors:
         # Запись остаётся видимой: папка найдена, остальные файлы целы.
@@ -395,7 +425,7 @@ def detail(run):
     out = {}
     for name in ("meta.json", "episode.json", "embodied.json", "lateral.json",
                  "bench.json", "probes.json", "verify.json", "spec.json",
-                 "run.json"):
+                 "run.json", "timeline.json", "state.json"):
         if name not in run.files:
             continue
         v, err = read_json(run.path / name)
