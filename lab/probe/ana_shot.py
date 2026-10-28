@@ -183,6 +183,34 @@ def main():
                      view.cost()["вызовов движка LIF"]))
             shot("ana_timeline.png", "таймлайн сеанса: момент между шагами")
 
+        # Три ряда из таймлайна в «Графиках»: их читает `plots.load`, и
+        # без этого проверялся бы только список, а не чтение.
+        from flybrain import plots as PL
+
+        have = {pl.key for pl in PL.available(r)}
+        for key, note in (("tl_cost", "вызовов движка за шаг"),
+                          ("tl_probe", "зонды популяций"),
+                          ("tl_wall", "шаг по стене")):
+            if key not in have:
+                check("график «%s» предложен для сеанса" % key, False,
+                      "в списке только: %s" % ", ".join(sorted(have)))
+                continue
+            pick(r.name)
+            st["view"] = 1
+            st["plot"] = key
+            wait_data()
+            d = st["data"]
+            check("график «%s» прочитан из таймлайна" % key,
+                  isinstance(d, dict) and d.get("kind") == "line"
+                  and bool(d.get("series")),
+                  "%s; рядов %d"
+                  % (note, len((d or {}).get("series") or [])))
+        pick(r.name)
+        st["view"] = 1
+        st["plot"] = "tl_cost"
+        wait_data()
+        shot("ana_plot_tl_cost.png", "подпись стоимости режима по шагам")
+
     # --- обзор ---
     by = {r.name: r for r in runs}
     for name, note in (("arena-lal", "эпизод арены"),

@@ -339,6 +339,90 @@ def part_resume(device, a, where):
              per[0] if per else -1))
 
 
+def part_jobs_path(device):
+    """Тем же путём, которым считает окно: спека → `jobs.run` → каталог.
+
+    Проба выше собирала ленту руками. Здесь не собирается ничего: спека
+    уходит в `jobs.run`, как её отправляет работник, результат пишется
+    тем же `loop.save`, и дальше проверяется, что «Анализ» видит прогон
+    СЕАНСОМ — прогоном с таймлайном внутри существующего пространства, а
+    не новым видом и не новым пространством.
+    """
+    import json
+
+    from flybrain import jobs as J, loop, plots as PL, replay as RP
+    from flybrain import runs as RN, spec as S
+    from flybrain.desk import ws_analysis as WA
+
+    n = 30
+    spec = S.RunSpec(
+        kind="arena", t=n * CONTROL_MS / 1000.0, bin_ms=CONTROL_MS, seed=0,
+        device=device, comment=False, open_report=False,
+        arena=S.ArenaSpec(timeline=True, timeline_keep_s=20.0,
+                          capture_at_ms=10 * CONTROL_MS))
+    res = J.run(spec, ctx=J.PrintCtx(device=device))
+    check("спека с таймлайном посчиталась через jobs.run",
+          res.obj is not None and getattr(res.obj, "timeline", None)
+          is not None,
+          "вид %s, шагов %s" % (res.kind, res.summary.get("timing", {})
+                                .get("n_steps", "?")))
+    if res.obj is None:
+        return
+    root = Path(probe._isolate.OUT) / "_jobs_path"
+    if root.exists():
+        shutil.rmtree(root)
+    out = root / "sandbox-session"
+    loop.save(res.obj, out)
+    # Так помечает сеанс работник, когда его остановили: по этой отметке
+    # каталог и отличает сеанс от эпизода с заранее заданным концом.
+    (out / "run.json").write_text(
+        json.dumps({"cancelled": True}, ensure_ascii=False),
+        encoding="utf-8")
+
+    found = {r.name: r for r in RN.scan(root)}
+    r = found.get("sandbox-session")
+    check("каталог нашёл сеанс и не завёл под него нового вида",
+          r is not None and r.kind == "arena",
+          "вид %r, подпись %r" % (r and r.kind, r and r.kind_title))
+    if r is None:
+        return
+    check("у сеанса есть таймлайн и снимок состояния",
+          r.has_timeline and r.has_state,
+          "файлов %d: %s" % (len(r.files), ", ".join(r.files)))
+    check("каталог назвал прогон сеансом", bool(r.session),
+          "признак session=%s, шагов записано %s"
+          % (r.session, (r.timeline or {}).get("шагов записано")))
+    check("обзор каталога прочитал схему таймлайна, но не массивы",
+          isinstance(r.timeline, dict) and "события" not in r.timeline
+          and r.timeline.get("шагов записано") == n,
+          "в схеме полей %d, шагов записано %s"
+          % (len(r.timeline or {}), (r.timeline or {}).get("шагов записано")))
+    keys = {p.key for p in PL.available(r)}
+    check("«Графики» предлагают ряды таймлайна",
+          {"tl_cost", "tl_probe", "tl_wall"} <= keys,
+          "графиков %d: %s" % (len(keys), ", ".join(sorted(keys))))
+    d = PL.load(r, "tl_cost")
+    y = (d or {}).get("series") or [("", [])]
+    check("ряд «вызовов движка за шаг» прочитан и равен %d на каждом шаге"
+          % RP.lif_per_step(CONTROL_MS),
+          bool(d) and set(int(v) for v in y[0][1])
+          == {RP.lif_per_step(CONTROL_MS)},
+          "точек %d, значения %s" % (len(y[0][1]),
+                                     sorted(set(int(v) for v in y[0][1]))))
+    view = RP.View.open(out)
+    check("сеанс открывается видом «Таймлайн» внутри «Анализа»",
+          "Таймлайн" in WA.VIEWS and len(view.tl.times()) == n,
+          "вид №%d из %d, шагов в записи %d"
+          % (WA.VIEWS.index("Таймлайн") + 1, len(WA.VIEWS),
+             len(view.tl.times())))
+    rep["замеры"]["путь окна"] = {
+        "вид прогона": r.kind, "сеанс": bool(r.session),
+        "шагов записано": (r.timeline or {}).get("шагов записано"),
+        "файлов в папке": len(r.files),
+        "видов в «Анализе»": len(WA.VIEWS),
+    }
+
+
 def main():
     import torch
 
@@ -354,6 +438,8 @@ def main():
     part_recompute(device, a)
     print("\n— режим «продолжение» —")
     part_resume(device, a, where)
+    print("\n— путь окна: спека → jobs.run → «Анализ» —")
+    part_jobs_path(device)
 
     (OUT / "replay_modes.json").write_text(
         json.dumps(rep, ensure_ascii=False, indent=1, default=str),
