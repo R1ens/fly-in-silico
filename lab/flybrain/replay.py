@@ -47,11 +47,12 @@ from pathlib import Path
 
 import numpy as np
 
-from . import sim, timeline as TL
+from . import timeline as TL
 
 __all__ = ["MODES", "Mode", "PARTS", "Part", "Tape", "State", "View",
            "capture_arena", "restore_arena", "capture_body", "restore_body",
-           "parts_of", "lif_per_step", "open_run"]
+           "parts_of", "lif_per_step", "open_run", "ENGINE_STATE",
+           "ENGINE_MASKS", "engine_lists_agree"]
 
 
 @dataclass(frozen=True)
@@ -68,7 +69,10 @@ MODES = {m.key: m for m in (
          "ряды и растр читаются с диска; модель не считается вовсе",
          "ноль",
          "`sim.Engine.calls` не растёт, потому что движка в этом режиме "
-         "нет: `View` не импортирует torch и не держит ни весов, ни тела"),
+         "нет: `View` не держит ни весов, ни тела, а сам модуль "
+         "импортируется без torch. Это замер, а не слово: "
+         "`probe/replay_modes.py` открывает запись и отвечает на вопросы "
+         "в процессе, где импорт torch запрещён"),
     Mode("пересчёт", "Пересчёт заново",
          "тот же прогон считается с начала по сохранённой спеке и семени",
          "шаг управления",
@@ -101,7 +105,41 @@ EXACT_STEPS = {"arena": 170, "body": 21}
 
 def lif_per_step(control_ms=20.0):
     """Сколько вызовов движка стоит один шаг управления. Из кода, не из вкуса."""
+    from . import sim
+
     return max(1, int(round(float(control_ms) / sim.DT)))
+
+
+# Состав состояния движка, перечисленный здесь ЛИТЕРАЛЬНО. Это не копия
+# ради копии: `sim` тянет за собой `torch`, а подпись стоимости
+# просмотра — «движка нет вовсе, torch не нужен» — обязана быть не
+# словом, а свойством модуля. Замер прямой: в процессе с запрещённым
+# `torch` этот модуль обязан импортироваться и запись открываться
+# (`probe/replay_modes.py`).
+#
+# Расхождение этих списков со `sim.Engine` ловит
+# :func:`engine_lists_agree`, и ловит оно его замером, а не доверием:
+# проба зовёт её и падает, если списки разъехались.
+ENGINE_STATE = ("v", "conductance", "spikes", "refrac", "delay_buffer")
+ENGINE_MASKS = ("m_fire", "m_out", "m_in", "m_hold", "v_hold")
+
+
+def engine_lists_agree():
+    """Сверить перечень полей движка со `sim.Engine`. Для пробы.
+
+    Возвращает ``(сошлось, что разошлось)``. Зовётся там, где `torch`
+    уже есть: сама сверка его требует, а просмотр записи — нет.
+    """
+    from . import sim
+
+    bad = []
+    if tuple(sim.Engine.STATE_TENSORS) != ENGINE_STATE:
+        bad.append("STATE_TENSORS: %s против %s"
+                   % (tuple(sim.Engine.STATE_TENSORS), ENGINE_STATE))
+    if tuple(sim.Engine.MASK_TENSORS) != ENGINE_MASKS:
+        bad.append("MASK_TENSORS: %s против %s"
+                   % (tuple(sim.Engine.MASK_TENSORS), ENGINE_MASKS))
+    return (not bad), bad
 
 
 # ------------------------------------------------------------- состояние
@@ -124,7 +162,7 @@ class Part:
 
 
 PARTS = (
-    Part("состояние движка", "engine", sim.Engine.STATE_TENSORS, ("arena", "body"),
+    Part("состояние движка", "engine", ENGINE_STATE, ("arena", "body"),
          "мембрана, проводимость, спайки, рефрактерный счётчик и кольцо "
          "аксональной задержки — всё, что шаг читает и пишет"),
     Part("указатель кольца задержек", "engine", ("ptr",), ("arena", "body"),
@@ -135,7 +173,7 @@ PARTS = (
          "поток случайных чисел пуассоновского входа. Единственное место "
          "со случайностью в шаге; без него продолжение идёт по другим "
          "числам"),
-    Part("маски вмешательств", "engine", sim.Engine.MASK_TENSORS,
+    Part("маски вмешательств", "engine", ENGINE_MASKS,
          ("arena", "body"),
          "четыре вектора по нейрону: не выдаёт спайк, исходящие "
          "отключены, входящие отключены, мембрана удержана"),
@@ -289,6 +327,16 @@ class State:
             for f in list(eng):
                 if f in where:
                     del eng[f]
+        # То же про среду, и найдено это замером. Среда лежит не
+        # массивами, а в паспорте (`meta`), потому что восстанавливать её
+        # надо целиком, а не по полям. Пока `drop` чистил только
+        # `arrays`, выбрасывание среды НИЧЕГО не выбрасывало:
+        # `restore_arena` всё равно читал её из паспорта, и замер полноты
+        # по среде показывал ложное «элемент не влияет» — 150 шагов
+        # побитово при выброшенной среде (`probe/resume_state.py`).
+        if "env" in where:
+            for k in ("среда", "источники", "слоты"):
+                out.meta.pop(k, None)
         return out
 
 
@@ -353,7 +401,7 @@ def restore_arena(state, neurons, weights=None, device=None, drop=(),
     ``allow_incomplete`` отказ снимается, но в отчёт ложится, чего не
     хватало; это нужно одному — замеру полноты выбрасыванием.
     """
-    from . import data as D, world
+    from . import data as D, sim, world
 
     if state.kind != "arena":
         raise ValueError("это состояние вида %r, а не арены" % state.kind)
