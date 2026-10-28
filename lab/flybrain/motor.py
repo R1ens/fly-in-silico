@@ -71,6 +71,7 @@ __all__ = [
     "verify_probes", "DnReadout", "MotorCommand", "LegacyAsymDecoder",
     "DnLinearDecoder", "DnTrainedDecoder", "make_decoder", "DECODERS",
     "GiantFiberBridge", "HeadStabilizer", "engineered_block",
+    "readout_provenance", "command_source",
 ]
 
 
@@ -1257,8 +1258,89 @@ class HeadStabilizer:
 # --------------------------------------------------- блок `engineered`
 
 
+def command_source(neurons, motor_name, readout_name, left_q, right_q):
+    """Какая популяция ВЕДЁТ команду при выбранном декодере.
+
+    Это не то же, что `BodyConfig.readout`. При `legacy` команду
+    считает именно он, а при `dn_linear`/`dn_trained` — прямые зонды
+    нисходящих, и `readout` остаётся при них лишь измерением. Справка о
+    сенсорном съёме обязана относиться к тому, что команду ведёт, иначе
+    она помечает не то.
+    """
+    if motor_name == "legacy":
+        src = readout_provenance(neurons, readout_name, left_q, right_q)
+        src["ведёт команду"] = True
+        return [src]
+    out = []
+    for nm, pr in DN_PROBES.items():
+        q = pr.sel
+        row = readout_provenance(neurons, nm, q + "+side:left",
+                                 q + "+side:right")
+        row["ведёт команду"] = True
+        out.append(row)
+    legacy = readout_provenance(neurons, readout_name, left_q, right_q)
+    legacy["ведёт команду"] = False
+    legacy["оговорка"] = (
+        "съём «%s» при декодере «%s» команду НЕ ведёт: он остаётся "
+        "измерением и попадает в запись как `readout_*`."
+        % (readout_name, motor_name))
+    out.append(legacy)
+    return out
+
+
+def readout_provenance(neurons, name, left_q, right_q):
+    """Что за популяция ведёт команду — измерением, а не названием.
+
+    Требование владельца: прежний съём обязан быть **явно помечен** как
+    сенсорная популяция, а не нисходящий моторный путь. Пометить его
+    только в исходниках недостаточно: читают сохранённый прогон, и
+    справка обязана лежать там.
+
+    Поэтому здесь не подпись, а замер: сколько нейронов, сколько из них
+    нисходящих, есть ли среди них Giant Fiber, и какие у них классы.
+    Числа считаются по таблице на месте, так что устареть вместе с
+    набором данных они не могут.
+    """
+    import numpy as np
+
+    from . import data as D
+
+    left = D.select(neurons, left_q)
+    right = D.select(neurons, right_q)
+    both = np.union1d(left, right)
+    desc = D.select(neurons, "super:descending")
+    gf = D.select(neurons, "celltype=DNp01")
+    n_desc = int(len(np.intersect1d(both, desc)))
+    n_gf = int(len(np.intersect1d(both, gf)))
+    sc = neurons["super_class"].astype(str).to_numpy()
+    u, c = np.unique(sc[both], return_counts=True)
+    kind = ("нисходящий моторный путь" if n_desc == len(both)
+            else "сенсорная популяция" if n_desc == 0
+            else "смешанная популяция")
+    return {
+        "имя": name,
+        "селекторы": [left_q, right_q],
+        "нейронов": int(len(both)),
+        "слева": int(len(left)), "справа": int(len(right)),
+        "из них нисходящих": n_desc,
+        "из них Giant Fiber (DNp01)": n_gf,
+        "классы": {str(k): int(v) for k, v in zip(u, c)},
+        "что это": kind,
+        # Оговорка — только когда есть что оговаривать. Съём, целиком
+        # составленный из нисходящих, — это нормальный случай, и
+        # помечать его оговоркой значит засорять список, который читают
+        # указатель, обзор прогонов и отчёт.
+        "оговорка": (
+            "съём «%s» — это %s: нисходящих нейронов в нём %d из %d, "
+            "Giant Fiber %d. Команду ног ведёт он, и биологическим "
+            "нисходящим моторным путём этот прогон не является."
+            % (name, kind, n_desc, len(both), n_gf)
+            if n_desc < len(both) else ""),
+    }
+
+
 def engineered_block(decoder=None, bridge=None, head_stab=None,
-                     readout_rows=None, extra=None):
+                     readout_rows=None, readout_src=None, extra=None):
     """Собрать блок ``engineered`` прогона: что нефизиологично и какой версии.
 
     Кладётся в снимок прогона рядом с ``timing`` и ``calibration``.
@@ -1272,6 +1354,8 @@ def engineered_block(decoder=None, bridge=None, head_stab=None,
         out["детали"].append(obj.spec())
     if readout_rows is not None:
         out["прямые зонды"] = readout_rows
+    if readout_src is not None:
+        out["популяция съёма"] = readout_src
     if extra:
         out.update(extra)
     return out

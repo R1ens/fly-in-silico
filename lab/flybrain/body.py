@@ -60,6 +60,21 @@ class BodyConfig:
     seed: int = 0
     device: str | None = None
 
+    # С какой популяции снимается выход мозга. **Значение по умолчанию
+    # `ALPN` — СЕНСОРНАЯ популяция, а не нисходящий моторный путь**, и
+    # это замер, а не мнение: 685 нейронов, пересечение с
+    # `super:descending` ноль, с `DNp01` ноль, `super_class` у всех
+    # `central`. То есть по умолчанию ноги ведёт популяция, в которой
+    # премоторных нейронов нет вовсе, и Giant Fiber там не «растворён в
+    # среднем», а отсутствует.
+    #
+    # Значение оставлено прежним нарочно: по нему посчитаны все
+    # сохранённые прогоны, и менять его молча нельзя. Нисходящий путь
+    # выбирается отдельно — `motor="dn_linear"` плюс `readout`
+    # соответствующего зонда, см. `flybrain/motor.py` и `MOTOR.md`.
+    # Справка о том, какая популяция вела команду, уезжает в блок
+    # `engineered` каждого прогона (`motor.readout_provenance`), и
+    # оговорка о сенсорном съёме — в `timing["оговорки"]`.
     readout: str = "ALPN"
     dn_tau_s: float = 0.5
     swap_antennae: bool = False
@@ -1041,9 +1056,20 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     # версией, параметрами и, где есть файл весов, его sha256. Он едет в
     # `embodied.json`, а оттуда в отчёт и в сверку — то есть отличить
     # инженерную часть от измеренной можно машинно, а не на глаз.
+    # Справка о популяции съёма — замером, а не названием. Нужна затем,
+    # что прежний съём `ALPN` сенсорный, и прогон обязан говорить это о
+    # себе сам: читают его, а не исходники.
+    src = motor.command_source(neurons, cfg.motor, cfg.readout, ql, qr)
     engineered = motor.engineered_block(
         decoder=decoder, bridge=bridge, head_stab=head_stab,
-        readout_rows=readout.rows if cfg.probes else None)
+        readout_rows=readout.rows if cfg.probes else None,
+        readout_src=src)
+    # В оговорки идёт только то, что ведёт команду: иначе прогон на
+    # нисходящем декодере нёс бы оговорку про сенсорный ALPN, который в
+    # нём команду не ведёт вовсе.
+    for row in src:
+        if row.get("ведёт команду") and row.get("оговорка"):
+            timing.setdefault("оговорки", []).append(row["оговорка"])
     for obj in (bridge, head_stab):
         c = obj.caveat() if obj is not None else None
         if c:
