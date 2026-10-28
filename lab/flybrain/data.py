@@ -269,6 +269,8 @@ def select(df: pd.DataFrame, query: str) -> np.ndarray:
 
         type:Gr64f           cell_type or hemibrain_type contains (regex, case-insensitive)
         type=MBON01          cell_type or hemibrain_type equals exactly
+        celltype=DNp09       ТОЛЬКО cell_type, точное совпадение
+        hemibrain=DNa01      ТОЛЬКО hemibrain_type, точное совпадение
         class:gustatory      cell_class contains
         super:descending     super_class contains
         region:AL            region equals
@@ -279,6 +281,19 @@ def select(df: pd.DataFrame, query: str) -> np.ndarray:
 
     A bare word is treated as ``type:<word>``.  Terms can be chained with ``+``
     to intersect, e.g. ``type:LC10+side:left``.
+
+    **Зачем нужны ``celltype=`` и ``hemibrain=``.** ``type=`` сравнивает с
+    тремя столбцами сразу (``cell_type``, ``hemibrain_type``, ``label``) и
+    берёт их объединение. На большинстве имён это одно и то же, но у
+    нисходящих имена двух номенклатур столкнулись: ``type=DNa01`` даёт
+    **четыре** нейрона — пару с ``hemibrain_type = DNa01`` (их
+    ``cell_type`` — ``DNae001``, область GNG) и совершенно другую пару с
+    ``cell_type = DNa01`` (их ``hemibrain_type`` — ``VES006``, область
+    VES). Так же устроен ``type=DNp09``: четыре нейрона, из них два с
+    ``cell_type = DNp71``. Для научной выборки объединение здесь — не
+    «точный селектор», а молчаливое слияние двух популяций, и отличить
+    их можно только по столбцу. Это та же ловушка, что ``type:LC4``
+    (319 вместо 104), только на уровень глубже.
     """
     idx = _codes(df)["idx"]
     parts = []
@@ -407,6 +422,14 @@ def _term_mask_slow(df: pd.DataFrame, term: str) -> np.ndarray:
 
     if key in ("type", "cell_type", "t"):
         return hit("cell_type") | hit("hemibrain_type") | hit("label")
+    # Один столбец, без объединения: единственный способ развести
+    # столкнувшиеся имена двух номенклатур (см. докстринг `select`).
+    if key in ("celltype", "ct"):
+        return hit("cell_type")
+    if key in ("hemibrain", "hemibrain_type", "hb"):
+        return hit("hemibrain_type")
+    if key == "label":
+        return hit("label")
     if key in ("class", "cell_class", "c"):
         return hit("cell_class") | hit("cell_sub_class")
     if key in ("super", "super_class", "s"):

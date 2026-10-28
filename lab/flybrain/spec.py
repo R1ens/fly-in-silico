@@ -92,6 +92,20 @@ class BodySpec:
     # записывается в результат отдельно от правок на ходу.
     live_initial: dict = None
 
+    # --- инженерный моторный путь (`flybrain.motor`) ---
+    #
+    # Значения по умолчанию воспроизводят прежний прогон до бита:
+    # `motor = "legacy"`, моста через обрыв GF нет, стабилизации головы
+    # нет. Эти три ручки — НЕ условия опыта, а модель моторного пути, и
+    # прогон с другими значениями с эталонными не сравнивается; в
+    # `timing["оговорки"]` об этом пишется прямо.
+    motor: str = "legacy"
+    motor_weights: str = None
+    gf_bridge: str = "none"
+    head_stab: bool = False
+    neck_kp: float = None
+    probes: bool = True
+
 
 @dataclass
 class LateralSpec:
@@ -291,6 +305,12 @@ class RunSpec:
             view=b.view,
             keep_s=b.keep_s or 0.0,
             odour_ref=b.odour_ref,
+            motor=b.motor,
+            motor_weights=b.motor_weights,
+            gf_bridge=b.gf_bridge,
+            head_stab=b.head_stab,
+            neck_kp=b.neck_kp,
+            probes=b.probes,
         )
 
     # ------------------------------------------------------------- хранение

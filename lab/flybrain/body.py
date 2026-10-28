@@ -10,14 +10,33 @@
   «нисходящий сигнал поворота». Ноги, их фазы, прилипание и спотыкание
   считает он.
 
-Придуманными остаются два места, и оба отмечены в коде: пересчёт
-интенсивности запаха в частоту рецепторов и пересчёт асимметрии нисходящих
-в амплитуду шага. Заместителем грудного ганглия работает контроллер FlyGym.
+Придуманными остаются два места: пересчёт интенсивности запаха в частоту
+рецепторов — он здесь, и помечен, — и пересчёт активности в команду телу.
+Второй с этапа 2 живёт не здесь, а в :mod:`flybrain.motor`: там у каждого
+нефизиологичного преобразования есть имя, версия и список параметров, и
+оттуда они уезжают в блок ``engineered`` снимка прогона. Заместителем
+грудного ганглия работает контроллер FlyGym.
 
 Семантика команды (прочитана из turning_controller.py): ``action[0]`` задаёт
 амплитуду шага левых трёх ног, ``action[1]`` — правых, знак задаёт
 направление. Замер показал, что более сильные левые ноги уводят муху вправо,
 поэтому связь мозга с ногами перекрёстная: левое полушарие — правые ноги.
+
+Разведённые имена в записи по шагам
+-----------------------------------
+
+* ``readout_<зонд>_l/r`` — ИЗМЕРЕНИЕ: частота прямого зонда в герцах,
+  сумма спайков на число нейронов и длительность блока. Шесть названных
+  нисходящих (DNp01, DNp04, DNa01, DNa02, DNp09, MDN) плюс теневые
+  зонды — см. :mod:`flybrain.motor`;
+* ``cmd_turn``, ``cmd_drive``, ``cmd_escape`` — ИНЖЕНЕРНАЯ команда;
+* ``dn_l``, ``dn_r``, ``asym``, ``z``, ``amp_l``, ``amp_r`` — прежние
+  поля, оставлены как есть: на них держатся ряды, графики, отчёт,
+  песочница и отпечатки эталонных прогонов.
+
+Значения по умолчанию (``motor = "legacy"``, моста через обрыв Giant
+Fiber нет, стабилизации головы нет) воспроизводят прежний эпизод
+ПОБИТОВО — проверено `probe/motor_equal.py` на двух деревьях кода.
 """
 
 from __future__ import annotations
@@ -30,7 +49,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import data as D, sim, world
+from . import data as D, motor, sim, world
 
 
 @dataclass
@@ -98,6 +117,40 @@ class BodyConfig:
     amp_span: float = 0.8   # на сколько её меняет одна сигма асимметрии
     amp_min: float = 0.1
     amp_max: float = 1.4
+    turn_sign: float = 1.0  # +1: как считались все прежние эпизоды
+
+    # --- инженерный моторный путь (`flybrain.motor`) ---
+    #
+    # `motor` — какой декодер превращает активность в команду телу:
+    #
+    # * `"legacy"` — то, что было: среднее по ОДНОЙ популяции на
+    #   полушарие (`readout`), асимметрия, нормировка на собственный шум.
+    #   Значение по умолчанию, и менять его нельзя: иначе эталонные
+    #   прогоны станут несравнимыми молча.
+    # * `"dn_linear"` — вариант А: линейная карта по шести ПРЯМЫМ зондам
+    #   (DNp01, DNp04, DNa01, DNa02, DNp09, MDN) с объявленными
+    #   коэффициентами.
+    # * `"dn_trained"` — вариант Б: те же зонды, веса из файла
+    #   (`motor_weights`), обучены гребневой регрессией.
+    #
+    # `gf_bridge` — инженерный мост через обрыв «Giant Fiber →
+    # мотонейроны». По умолчанию `"none"`: биологического пути в v783 нет
+    # вовсе, и подменять его молча хуже, чем не иметь реакции.
+    #
+    # `head_stab` — опубликованная ОБУЧЕННАЯ стабилизация головы. По
+    # умолчанию выключена: при включении в модель тела добавляются
+    # приводы на шею, то есть модель становится ДРУГОЙ.
+    #
+    # Прямые зонды пишутся в запись ВСЕГДА, при любом декодере: это
+    # измерение, оно ничего не меняет и стоит доли процента шага.
+    motor: str = "legacy"
+    motor_weights: str | None = None
+    gf_bridge: str = "none"
+    gf_ref_hz: float = 100.0
+    escape_gain: float = 0.5
+    head_stab: bool = False
+    neck_kp: float | None = None
+    probes: bool = True  # писать readout_* прямых зондов в запись
 
     # --- запись видео ---
     video: bool = False
@@ -145,6 +198,10 @@ DEFAULT_SOURCES = np.array([
 
 
 class EmbodiedRun:
+    # Блок нефизиологичных деталей моторного пути. Отдельным полем, а не
+    # внутри `timing`: `timing` — про время, а это про модель.
+    engineered = None
+
     def __init__(self, records, counts, bins, neurons, config, sources, timing,
                  metrics, calib, sensor_idx):
         self.records = records
@@ -173,7 +230,7 @@ class EmbodiedRun:
                           np.array([], np.int64), self.neurons, self.timing)
 
     def meta(self):
-        return {
+        out = {
             "config": asdict(self.config),
             "sources": self.sources.tolist(),
             "timing": self.timing,
@@ -181,6 +238,9 @@ class EmbodiedRun:
             "calibration": self.calib,
             "n_steps": len(self.records),
         }
+        if self.engineered is not None:
+            out["engineered"] = self.engineered
+        return out
 
 
 def _fly_class(fast):
@@ -239,7 +299,15 @@ def _fly_class(fast):
     return _FlyNoReforward
 
 
-def _build_body(cfg: BodyConfig, sources, video_path=None):
+def _build_body(cfg: BodyConfig, sources, video_path=None, head_stab=None):
+    """Тело FlyGym. ``head_stab`` — переходник :class:`motor.HeadStabilizer`.
+
+    Передавать его — не настройка, а ПРАВКА МОДЕЛИ: при включённой
+    стабилизации `Fly` добавляет два привода на шейные суставы
+    (`joint_Head_yaw`, `joint_Head`), которых без неё в модели нет
+    вовсе. Поэтому эпизод со стабилизацией и без неё — это две разные
+    механические модели, а не два режима одной.
+    """
     from flygym_gymnasium import YawOnlyCamera
     from flygym_gymnasium.arena import OdorArena
     from flygym_gymnasium.preprogrammed import default_leg_sensor_placements
@@ -251,6 +319,10 @@ def _build_body(cfg: BodyConfig, sources, video_path=None):
         odor_source=sources,
         peak_odor_intensity=np.ones((len(sources), 1)),
     )
+    extra = {}
+    if head_stab is not None:
+        extra = {"head_stabilization_model": head_stab,
+                 "neck_kp": head_stab.neck_kp}
     fly = Fly(
         enable_adhesion=True,
         enable_olfaction=True,
@@ -258,6 +330,7 @@ def _build_body(cfg: BodyConfig, sources, video_path=None):
         init_pose="stretch",
         control="position",
         spawn_pos=(0.0, 0.0, 0.2),
+        **extra,
     )
     cams = []
     if video_path is not None:
@@ -353,6 +426,10 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
 
     # --- кого слушаем и кого зажигаем ---
     cands = world.probe_candidates(neurons)
+    # Прямые зонды доступны и как съём для прежнего декодера — под
+    # именами с приставкой `зонд:`. В общий список они не входят: там
+    # порог восемь нейронов на сторону (см. `world.dn_probe_candidates`).
+    cands = {**cands, **world.dn_probe_candidates()}
     if cfg.readout not in cands:
         raise SystemExit(f"нет популяции {cfg.readout!r}; см. вывод `fly lateral`")
     ql, qr = cands[cfg.readout]
@@ -374,6 +451,40 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     t_ml = torch.as_tensor(motor_l, device=device)
     t_mr = torch.as_tensor(motor_r, device=device)
     rates = torch.zeros(1, n, device=device)
+
+    # --- прямые зонды и инженерный декодер (`flybrain.motor`) ---
+    #
+    # Измеритель строится ВСЕГДА, при любом декодере: прямые зонды — это
+    # измерение, они ничего не меняют, а без них спайк Giant Fiber
+    # остаётся невидимым (2 нейрона из 1299 в усреднённом съёме). Прежний
+    # съём по полушарию подключён к тому же измерителю под именем
+    # `__readout__`, чтобы у старого и нового декодера был один вход.
+    readout = motor.DnReadout(
+        neurons, device, pairs={"__readout__": (ql, qr)}) \
+        if cfg.probes or cfg.motor != "legacy" else None
+    shape = motor.DecoderShape(
+        amp_base=cfg.amp_base, amp_span=cfg.amp_span, amp_min=cfg.amp_min,
+        amp_max=cfg.amp_max, cross=cfg.cross, turn_sign=cfg.turn_sign,
+        dn_tau_s=cfg.dn_tau_s)
+    dec_kw = {}
+    if cfg.motor == "dn_trained":
+        dec_kw["weights_path"] = cfg.motor_weights
+    decoder = motor.make_decoder(cfg.motor, shape=shape, **dec_kw)
+    bridge = motor.GiantFiberBridge(kind=cfg.gf_bridge,
+                                    gf_ref_hz=cfg.gf_ref_hz,
+                                    escape_gain=cfg.escape_gain)
+    if readout is None:
+        # Декодер `legacy` без зондов: измеритель всё равно нужен, но
+        # только под один прежний съём. Так выключение зондов ничего не
+        # меняет в числах, а не «почти ничего».
+        readout = motor.DnReadout(neurons, device, probes={}, shadow=False,
+                                  pairs={"__readout__": (ql, qr)})
+    if cfg.motor != "legacy":
+        missing = [k for k in getattr(decoder, "turn_weights", {})
+                   if k not in readout.names]
+        if missing:
+            raise ValueError("декодер %r просит зонды, которых нет: %s"
+                             % (cfg.motor, ", ".join(missing)))
 
     dt_s = cfg.control_ms / 1000.0
     brain_steps = max(1, int(round(cfg.control_ms / sim.DT)))
@@ -405,7 +516,10 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         # предыдущий. Молча писать не туда хуже, чем отказаться.
         raise ValueError("включено видео, но путь не задан: укажите "
                          "video_path — иначе файл уйдёт мимо прогона")
-    body, cams = _build_body(cfg, sources, video_path if cfg.video else None)
+    head_stab = motor.HeadStabilizer(neck_kp=cfg.neck_kp) \
+        if cfg.head_stab else None
+    body, cams = _build_body(cfg, sources, video_path if cfg.video else None,
+                             head_stab=head_stab)
     obs, _ = body.reset(seed=cfg.seed)
     t_setup = time.perf_counter() - t0
     if live is not None:
@@ -496,6 +610,16 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         dr = float(acc[t_mr].sum()) / (len(motor_r) * block_s)
         return acc, dl, dr
 
+    def step_measure():
+        """Один блок управления: мозг + ИЗМЕРЕНИЕ всех зондов.
+
+        `readout_*` здесь и остаются измерением: ни одного
+        преобразования, только сумма спайков на число нейронов и
+        длительность блока.
+        """
+        acc, dl, dr = step_brain()
+        return acc, dl, dr, readout.read(acc, block_s)
+
     # --- разогрев: симметричный вход, меряем опору, перекос и шум ---
     li, ri = read_odour(obs)
     if cfg.odour_ref is not None:
@@ -510,29 +634,32 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     k = math.exp(-dt_s / max(cfg.dn_tau_s, 1e-6))
     mean_i = (li + ri) / 2.0
     drive_brain(mean_i, mean_i, 0.0, odour_ref)
-    el = er = None
-    tot, asyms = 0.0, []
+    tot = 0.0
     stopped = False
     for _ in range(warm):
-        _, dl, dr = step_brain()
+        _, dl, dr, rd = step_measure()
         tot += (dl + dr) / 2
-        el = dl if el is None else k * el + (1 - k) * dl
-        er = dr if er is None else k * er + (1 - k) * dr
-        asyms.append((el - er) / (el + er + 1e-9))
+        # Разогрев идёт ЧЕРЕЗ декодер: перекос и шум считаются для
+        # каждого зонда сразу, одним и тем же кодом. Прежняя арифметика
+        # при этом та же — просто у популяции `__readout__` она теперь
+        # не отдельной веткой.
+        decoder.observe(rd, dt_s)
         if should_stop is not None and should_stop():
             # Разогрев при большой tau длиннее самого эпизода, и ждать его
             # конца значит не отвечать на «стоп» десяток секунд.
             stopped = True
             break
-    settled = asyms[len(asyms) // 3:]
-    bias = float(np.mean(settled)) if settled else 0.0
-    noise = float(np.std(settled)) if len(settled) > 1 else 1e-4
+    per_probe = decoder.calibrate()
+    bias = decoder.bias.get("__readout__", 0.0)
+    noise = decoder.noise.get("__readout__", 1e-4)
+    decoder.reset_state()
     calib = {
         "odour_ref": round(odour_ref, 8),
         "dn_ref_hz": round(tot / warm, 4),
         "asym_bias": round(bias, 6),
         "asym_noise": round(noise, 6),
         "warm_steps": warm,
+        "зонды": per_probe,
     }
     print(f"  опора {calib['dn_ref_hz']} Гц, перекос {bias:+.5f}, "
           f"шум {noise:.5f}, яркость насыщения {odour_ref:.5f}")
@@ -591,25 +718,29 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         k = math.exp(-dt_s / max(cfg.dn_tau_s, 1e-6))
         rl, rr = drive_brain(li, ri, taste, ref_now)
 
-        acc, dl, dr = step_brain()
+        acc, dl, dr, rd = step_measure()
         # Счётчики копятся за весь сеанс, запись — только за окно:
         # иначе частоты (`counts / t_run_s`) считались бы по обрезанной
         # записи и врали бы во столько раз, во сколько окно короче.
         bins[step % keep_steps] = acc.to(torch.int16)
         counts += acc.to(torch.int64)
 
-        el = dl if el is None else k * el + (1 - k) * dl
-        er = dr if er is None else k * er + (1 - k) * dr
-        asym = (el - er) / (el + er + 1e-9) - bias
-        # Придуманная часть: нормируем на собственный шум и разводим ноги.
-        z = float(np.clip(asym / max(noise, 1e-9), -3.0, 3.0))
-        gain = cfg.amp_span / 3.0
-        amp_l = cfg.amp_base - gain * z   # перекрёстно: левое полушарие -> правые ноги
-        amp_r = cfg.amp_base + gain * z
-        if not cfg.cross:
-            amp_l, amp_r = amp_r, amp_l
-        action = np.array([np.clip(amp_l, cfg.amp_min, cfg.amp_max),
-                           np.clip(amp_r, cfg.amp_min, cfg.amp_max)])
+        # Инженерная часть: измеренные частоты -> команда телу. Вся
+        # арифметика живёт в `flybrain.motor`; здесь только вызов, и
+        # `dn_tau_s` подхватывается с настройки на каждом шаге, как и
+        # раньше, чтобы живая правка применялась, а не подтверждалась.
+        decoder.shape.dn_tau_s = cfg.dn_tau_s
+        escape = bridge.escape(rd)
+        cmd = decoder.command(rd, dt_s, escape=escape)
+        # Прежние поля записи. Берутся из самого декодера, а не
+        # пересчитываются рядом: пересчёт «эквивалентным» выражением уже
+        # один раз развёл траектории на последнем бите мантиссы.
+        asym = cmd.detail.get("asym")
+        if asym is None:
+            asym = (decoder._asym(*decoder._sm["__readout__"])
+                    - decoder.bias.get("__readout__", 0.0))
+        z = cmd.detail.get("z_raw", cmd.u_turn * 3.0)
+        action = cmd.as_array()
 
         for _ in range(body_steps):
             obs, _, term, trunc, _ = body.step(action)
@@ -664,6 +795,21 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             "source": int(nearest),
             "spikes": int(acc.sum()),
         }
+        # Разведённые имена. `readout_*` — ИЗМЕРЕНИЕ: частота зонда в
+        # герцах, без единого преобразования. `cmd_*` — ИНЖЕНЕРНАЯ
+        # команда: поворот, тяга и вклад моста через обрыв GF. Старые
+        # ключи (`dn_l`, `asym`, `z`, `amp_l`, `amp_r`) остаются на
+        # месте — на них держатся ряды, графики, отчёт и песочница.
+        if cfg.probes:
+            for name in readout.names:
+                if name == "__readout__":
+                    continue
+                l, r = rd[name]
+                rec["readout_%s_l" % name] = round(l, 3)
+                rec["readout_%s_r" % name] = round(r, 3)
+        rec["cmd_turn"] = round(cmd.u_turn, 5)
+        rec["cmd_drive"] = round(cmd.u_drive, 5)
+        rec["cmd_escape"] = round(cmd.escape, 5)
         records.append(rec)
         if on_step is not None:
             on_step(step, rec, bins[step % keep_steps].cpu().numpy())
@@ -745,9 +891,33 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             "траектория другая — расхождение начинается на втором шаге "
             "управления и накапливается. С эталонными прогонами такой "
             "эпизод не сравнивается.")
+    # Блок `engineered`: всё нефизиологичное моторного пути с именем,
+    # версией, параметрами и, где есть файл весов, его sha256. Он едет в
+    # `embodied.json`, а оттуда в отчёт и в сверку — то есть отличить
+    # инженерную часть от измеренной можно машинно, а не на глаз.
+    engineered = motor.engineered_block(
+        decoder=decoder, bridge=bridge, head_stab=head_stab,
+        readout_rows=readout.rows if cfg.probes else None)
+    for obj in (bridge, head_stab):
+        c = obj.caveat() if obj is not None else None
+        if c:
+            timing.setdefault("оговорки", []).append(c)
+    if cfg.motor != "legacy":
+        timing.setdefault("оговорки", []).append(
+            "моторная команда посчитана ИНЖЕНЕРНЫМ декодером "
+            "`%s` v%d по прямым зондам нисходящих, а не прежним средним "
+            "по полушарию. Коэффициенты (или веса) этого декодера — не "
+            "условия прогона, а его модель: см. блок `engineered`. С "
+            "эталонными прогонами, посчитанными `legacy`, такой эпизод "
+            "не сравнивается."
+            % (decoder.name, decoder.version))
     metrics = _metrics(records, dt_s)
-    return EmbodiedRun(records, counts.cpu().numpy(), bins.cpu().numpy(),
-                       neurons, cfg, sources, timing, metrics, calib, sensor_idx)
+    metrics.update(_motor_metrics(records))
+    run = EmbodiedRun(records, counts.cpu().numpy(), bins.cpu().numpy(),
+                      neurons, cfg, sources, timing, metrics, calib,
+                      sensor_idx)
+    run.engineered = engineered
+    return run
 
 
 def _metrics(records, dt_s):
@@ -790,6 +960,39 @@ def _metrics(records, dt_s):
         "mean_dn_hz": round(float(np.mean([(r["dn_l"] + r["dn_r"]) / 2
                                            for r in records])), 3),
     })
+    return out
+
+
+def _motor_metrics(records):
+    """Насколько команда вообще ШЕВЕЛИЛАСЬ и следовала ли за раздражителем.
+
+    Две величины, и обе нужны вместе. Разброс команды отвечает на «а
+    зависит ли выход хоть от чего-нибудь»: при заглушённом съёме он
+    обязан уйти в ноль. Корреляция с асимметрией раздражителя отвечает
+    на «от ЧЕГО именно»: при заглушённом съёме она обязана перестать
+    существовать. По одной из них ничего не доказывается: постоянная
+    команда даёт нулевую корреляцию честно, а шумящая ни с чем не
+    связанная команда даёт большой разброс так же честно.
+    """
+    if len(records) < 3:
+        return {}
+    turn = np.array([r.get("cmd_turn", 0.0) for r in records], float)
+    amp = np.array([r["amp_l"] - r["amp_r"] for r in records], float)
+    stim = np.array([(r["orn_l"] - r["orn_r"])
+                     / (r["orn_l"] + r["orn_r"] + 1e-9) for r in records],
+                    float)
+    out = {
+        "cmd_turn_sd": round(float(np.std(turn)), 6),
+        "cmd_amp_diff_sd": round(float(np.std(amp)), 6),
+        "stim_asym_sd": round(float(np.std(stim)), 6),
+    }
+    for name, a in (("r_cmd_stim", turn), ("r_amp_stim", amp)):
+        if np.std(a) < 1e-12 or np.std(stim) < 1e-12:
+            # Постоянный ряд: корреляции НЕ существует, и ноль здесь был
+            # бы выдумкой. None читается как «не определена».
+            out[name] = None
+        else:
+            out[name] = round(float(np.corrcoef(a, stim)[0, 1]), 4)
     return out
 
 
@@ -950,9 +1153,15 @@ def load(out_dir, neurons=None) -> EmbodiedRun:
     timing = dict(meta.get("timing") or res.timing or {})
     if unknown:
         timing["unknown_config_keys"] = unknown
-    return EmbodiedRun(records, res.counts, res.bins, res.neurons, cfg,
-                       sources, timing, meta.get("metrics") or {},
-                       meta.get("calibration") or {}, sensor_idx)
+    run = EmbodiedRun(records, res.counts, res.bins, res.neurons, cfg,
+                      sources, timing, meta.get("metrics") or {},
+                      meta.get("calibration") or {}, sensor_idx)
+    # Блок нефизиологичных деталей восстанавливается как есть. Его
+    # отсутствие — не ошибка: прогоны до этого этапа его не писали, и у
+    # них он равен None, а не пустому словарю. Разница существенная:
+    # пустой словарь читался бы как «инженерных деталей не было».
+    run.engineered = meta.get("engineered")
+    return run
 
 
 def save(run: EmbodiedRun, out_dir):
