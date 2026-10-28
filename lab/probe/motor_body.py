@@ -36,6 +36,13 @@ import numpy as np  # noqa: E402
 
 OUT = Path(__file__).parent
 DURATION = 2.0
+CONTROL_MS = 20.0
+TAU_S = 0.5
+# Для негативного контроля эпизод длиннее: из него выбрасываются первые
+# три tau сглаживания (75 шагов), и на двухсекундном эпизоде в 100 шагов
+# после этого осталось бы 25 — слишком мало, чтобы считать развороты
+# раздражителя. Четыре секунды дают 125 шагов в счёте.
+DURATION_MASK = 4.0
 fails = []
 rep = {"проверки": {}, "замеры": {}}
 
@@ -68,7 +75,7 @@ def _neck_names(body):
 
 
 def episode(neurons, weights, device, label, mask=None, neck_angles=False,
-            **kw):
+            duration=None, **kw):
     """Один эпизод. ``mask`` — индексы для маски ``fire`` на весь эпизод.
 
     Маска ставится на ПЕРВОМ шаге эпизода, а не до разогрева: перекос и
@@ -79,7 +86,9 @@ def episode(neurons, weights, device, label, mask=None, neck_angles=False,
     from flybrain import body as B
     import flybrain.sim as S
 
-    cfg = B.BodyConfig(duration_s=DURATION, control_ms=20.0, seed=0,
+    cfg = B.BodyConfig(duration_s=(DURATION if duration is None
+                                   else duration),
+                       control_ms=CONTROL_MS, seed=0,
                        device=device, readout="ALPN", **kw)
     hook, neck = {}, []
     idx = None if mask is None else np.asarray(mask, np.int64)
@@ -116,17 +125,56 @@ def episode(neurons, weights, device, label, mask=None, neck_angles=False,
     wall = time.perf_counter() - t0
 
     recs = run.records
-    turn = np.array([r.get("cmd_turn", 0.0) for r in recs], float)
-    amp = np.array([r["amp_l"] - r["amp_r"] for r in recs], float)
-    stim = np.array([r["orn_l"] - r["orn_r"] for r in recs], float)
+    # Окно счёта начинается через ТРИ tau после начала эпизода.
+    # Причина замерена: сглаживание с tau = 0,5 с релаксирует от
+    # значения, набранного на разогреве, к новому уровню, и на эпизоде
+    # 2 с (100 шагов) этот переходный процесс занимает всю запись. Проба
+    # БЕЗ тела ровно поэтому отбрасывает первую tau; здесь то же самое.
+    skip = min(int(round(3 * TAU_S / (CONTROL_MS / 1000.0))),
+               max(len(recs) - 10, 0))
+    turn = np.array([r.get("cmd_turn", 0.0) for r in recs], float)[skip:]
+    amp = np.array([r["amp_l"] - r["amp_r"] for r in recs], float)[skip:]
+    stim = np.array([r["orn_l"] - r["orn_r"] for r in recs], float)[skip:]
+    # Сколько раз ряд разворачивается. Это и есть решающая величина, а
+    # не корреляция: команда, которая СЛЕДУЕТ за раздражителем, не может
+    # разворачиваться реже него. У замороженного входа команда — чистая
+    # релаксация фильтра, и разворотов у неё ноль.
+    def turns(y):
+        d = np.diff(y)
+        d = d[d != 0]
+        return int(np.sum(np.diff(np.sign(d)) != 0)) if len(d) > 1 else 0
+
+    # Все ли съёмные зонды действительно молчат на окне счёта.
+    probe_max = {}
+    for p in ("DNp01", "DNp04", "DNa01", "DNa02", "DNp09", "MDN"):
+        vals = [max(abs(r.get("readout_%s_l" % p, 0.0)),
+                    abs(r.get("readout_%s_r" % p, 0.0)))
+                for r in recs[skip:]]
+        probe_max[p] = round(float(max(vals)) if vals else 0.0, 4)
     out = {
         "условие": label,
         "нейронов под маской": masked,
         "по стене, с": round(wall, 1),
         "шагов": len(recs),
-        "sd cmd_turn": round(float(np.std(turn)), 6),
+        "шагов в счёте": int(len(turn)),
+        "отброшено шагов (три tau)": int(skip),
+        "sd cmd_turn": round(float(np.std(turn)), 8),
+        "размах cmd_turn": round(float(turn.max() - turn.min()), 6),
+        "разворотов команды": turns(turn),
+        "разворотов раздражителя": turns(stim),
+        "max |Гц| по съёмным зондам": probe_max,
+        "вход декодера постоянен": all(v == 0.0 for v in probe_max.values()),
         "sd (amp_l - amp_r)": round(float(np.std(amp)), 6),
         "sd (orn_l - orn_r), Гц": round(float(np.std(stim)), 4),
+        # Корреляция СЧИТАЕТСЯ, но проверкой в теле не является, и это
+        # не оговорка ради осторожности, а замер: в теле петля замкнута —
+        # раздражитель вырабатывается движением мухи, которым правит сама
+        # команда. Под маской и команда, и запах оказываются медленными
+        # трендами, и r выходит +0,63 при РОВНО постоянном входе
+        # декодера, то есть при полном отсутствии канала влияния.
+        # Количественный контроль |r| <= 0,1 поэтому стоит на стенде без
+        # тела (`probe/motor_grade.py`), где раздражитель задан
+        # расписанием и от команды не зависит.
         "r(cmd_turn, orn_l-orn_r)": (
             None if np.std(turn) < 1e-12 or np.std(stim) < 1e-12
             else round(float(np.corrcoef(turn, stim)[0, 1]), 4)),
@@ -170,7 +218,8 @@ def main():
             ("dn_linear, норма", {"motor": "dn_linear"}, None),
             ("dn_linear, маска съёма", {"motor": "dn_linear"}, probes_idx),
             ("legacy, норма", {"motor": "legacy"}, None)):
-        r = episode(neurons, weights, device, label, mask=mask, **kw)
+        r = episode(neurons, weights, device, label, mask=mask,
+                    duration=DURATION_MASK, **kw)
         rows.append(r)
         print("  %-24s sd(cmd_turn) %.6f  sd(запах) %.3f Гц  r %s  "
               "%.0f с" % (label, r["sd cmd_turn"], r["sd (orn_l - orn_r), Гц"],
@@ -179,13 +228,41 @@ def main():
     norm, mask_r = rows[0], rows[1]
     check("в теле команда dn_linear шевелится", norm["sd cmd_turn"] > 1e-4,
           "sd %.6f" % norm["sd cmd_turn"])
-    check("ВСТРЕЧНЫЙ ЗАМЕР в теле: при маске съёма команда постоянна",
-          mask_r["sd cmd_turn"] < 1e-6,
-          "sd %.3g при разбросе запаха %.3f Гц"
-          % (mask_r["sd cmd_turn"], mask_r["sd (orn_l - orn_r), Гц"]))
+    # Что В ТЕЛЕ проверяемо, а что нет.
+    #
+    # Проверяемо: доходит ли маска (зонды читаются РОВНО ноль) и
+    # перестаёт ли команда следовать за раздражителем (разворотов у неё
+    # ноль, а у раздражителя десятки).
+    #
+    # НЕ проверяемо: |r| <= 0,1. В теле петля замкнута, раздражитель
+    # вырабатывается движением мухи, и под маской оба ряда становятся
+    # медленными трендами: замер даёт r = +0,63 при РОВНО постоянном
+    # входе декодера, то есть при отсутствии канала влияния вообще.
+    # Количественный контроль по r стоит на стенде без тела.
+    check("ВСТРЕЧНЫЙ ЗАМЕР в теле: маска дошла, вход декодера постоянен",
+          mask_r["вход декодера постоянен"],
+          "max |Гц| по шести зондам: %s"
+          % mask_r["max |Гц| по съёмным зондам"])
+    check("ВСТРЕЧНЫЙ ЗАМЕР в теле: команда перестала СЛЕДОВАТЬ за "
+          "раздражителем",
+          mask_r["разворотов команды"] == 0
+          and mask_r["разворотов раздражителя"] > 5,
+          "разворотов у команды %d, у раздражителя %d — следящий сигнал "
+          "не может разворачиваться реже ведущего; это релаксация "
+          "сглаживания"
+          % (mask_r["разворотов команды"],
+             mask_r["разворотов раздражителя"]))
+    check("ВСТРЕЧНЫЙ ЗАМЕР в теле: остаточный разброс команды упал",
+          mask_r["sd cmd_turn"] < 0.5 * norm["sd cmd_turn"],
+          "sd %.8f против %.8f в норме, размах %.6f против %.6f"
+          % (mask_r["sd cmd_turn"], norm["sd cmd_turn"],
+             mask_r["размах cmd_turn"], norm["размах cmd_turn"]))
     check("ВСТРЕЧНЫЙ ЗАМЕР в теле: запах при маске продолжал меняться",
-          mask_r["sd (orn_l - orn_r), Гц"] > 0.5,
-          "sd %.3f Гц" % mask_r["sd (orn_l - orn_r), Гц"])
+          mask_r["sd (orn_l - orn_r), Гц"]
+          >= 0.5 * norm["sd (orn_l - orn_r), Гц"],
+          "sd %.4f Гц против %.4f в норме"
+          % (mask_r["sd (orn_l - orn_r), Гц"],
+             norm["sd (orn_l - orn_r), Гц"]))
     check("прогон с новым декодером помечен оговоркой",
           any("ИНЖЕНЕРНЫМ" in s for s in norm["оговорки"]),
           "%d оговорок" % len(norm["оговорки"]))
