@@ -582,6 +582,42 @@ def part_budget():
           how != "прошло молча" and str(TL.MAX_PROBE_NEURONS) in how,
           "предел %d нейронов; ответ: %s" % (TL.MAX_PROBE_NEURONS, how[:80]))
 
+    # Сколько популяций съёма в предел не влезают — числом, точными
+    # селекторами. Прежнее примечание в `timeline.py` называло «самую
+    # крупную популяцию — 6400 нейронов T4»: ни то, ни другое не верно,
+    # и оба раза из-за ловушки селектора (`RESEARCH.md` §9).
+    from flybrain import data as D, world
+
+    neurons = D.load_neurons()
+    cands = world.probe_candidates(neurons)
+    sizes = {}
+    for name, (ql, qr) in cands.items():
+        sizes[name] = len(D.select(neurons, ql)) + len(D.select(neurons, qr))
+    over = {k: v for k, v in sizes.items() if v > TL.MAX_PROBE_NEURONS}
+    top = sorted(sizes.items(), key=lambda kv: -kv[1])[:6]
+    rep["замеры"]["популяции съёма"] = {
+        "кандидатов": len(sizes), "крупнее предела": len(over),
+        "крупнейшие": [list(kv) for kv in top],
+        "нисходящие (super:descending)": sizes.get("DN")
+        or (len(D.select(neurons, "super:descending+side:left"))
+            + len(D.select(neurons, "super:descending+side:right"))),
+        "type:T4 свободно": len(D.select(neurons, "type:T4")),
+        "type=T4 точно": len(D.select(neurons, "type=T4")),
+    }
+    check("в предел растра влезает НЕ любая популяция съёма, и это "
+          "посчитано точными селекторами",
+          len(over) >= 1 and top[0][1] > TL.MAX_PROBE_NEURONS,
+          "кандидатов %d, крупнее предела %d, крупнейший %s — %d нейронов"
+          % (len(sizes), len(over), top[0][0], top[0][1]))
+    check("прежнее число «6400 нейронов T4» — ловушка селектора: точный "
+          "селектор даёт ноль",
+          len(D.select(neurons, "type=T4")) == 0
+          and len(D.select(neurons, "type:T4")) == 6400
+          and "T4" not in sizes,
+          "type:T4 свободно %d, type=T4 точно %d, среди кандидатов съёма "
+          "T4 нет" % (len(D.select(neurons, "type:T4")),
+                      len(D.select(neurons, "type=T4"))))
+
     # Таймлайна без объявленного окна записи не бывает вовсе: окно и
     # есть предел, и без него запись растёт по строке на шаг без конца.
     how2 = "прошло молча"
