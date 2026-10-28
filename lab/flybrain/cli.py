@@ -458,7 +458,7 @@ def cmd_body(args):
     """Мозг в теле NeuroMechFly v2: ноги считает MuJoCo, запах даёт симулятор."""
     import torch
 
-    from . import body, report
+    from . import body, jobs, report
 
     df = D.load_neurons()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -490,7 +490,16 @@ def cmd_body(args):
     name = args.out or (time.strftime("%Y%m%d-%H%M%S") + "-body")
     out_dir = D.OUT / name
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Лента таймлайна собирается и здесь, а не только на пути окна.
+    # Иначе прогон из командной строки ложится на диск без
+    # `timeline.npz`, и в виде «Таймлайн» такой сеанс не открывается
+    # вовсе — а он ничем не хуже посчитанного окном.
+    tape = jobs.tape_for("body", df, cfg.control_ms,
+                         keep_s=getattr(cfg, "keep_s", None),
+                         readout=cfg.readout, seed=cfg.seed,
+                         origin="командная строка")
     run = body.run_episode(cfg=cfg, neurons=df, weights=weights,
+                           tape=tape,
                            video_path=out_dir / "walk.mp4" if args.video else None)
     body.save(run, out_dir)
 
@@ -545,7 +554,7 @@ def cmd_arena(args):
     """Closed loop: the brain drives a fly around a 2D arena."""
     import torch
 
-    from . import loop, report, world
+    from . import jobs, loop, report, world
 
     df = D.load_neurons()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -585,8 +594,12 @@ def cmd_arena(args):
         model=args.model,
     )
     print(f"эпизод {cfg.duration_s} с, шаг управления {cfg.control_ms} мс")
+    tape = jobs.tape_for("arena", df, cfg.control_ms,
+                         keep_s=getattr(cfg, "keep_s", None),
+                         motor=body, seed=cfg.seed,
+                         origin="командная строка")
     ep = loop.run_episode(config=cfg, body_params=body, neurons=df,
-                          weights=weights, probes=args.probe)
+                          weights=weights, probes=args.probe, tape=tape)
 
     name = args.out or (time.strftime("%Y%m%d-%H%M%S") + "-arena")
     out_dir = D.OUT / name

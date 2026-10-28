@@ -361,25 +361,24 @@ def _job_stim(spec, ctx):
     return JobResult("stim", res, summary, cancelled=cancelled)
 
 
-def _tape(spec, kind, neurons, control_ms, readout=None, motor=None):
-    """Лента таймлайна для прогона или `None`, если его не просили.
+def tape_for(kind, neurons, control_ms, keep_s=None, readout=None,
+             motor=None, capture_at_ms=None, seed=0, origin="спека"):
+    """Лента таймлайна по простым параметрам, без объекта спеки.
 
-    Зонды растра берутся из популяции съёма — той самой, по которой
-    считается выход: записывать «выбранную нейронную активность» и
-    выбирать при этом не ту популяцию, которой рулят, было бы странно.
-    Если популяция в растр не умещается (предел
-    `timeline.MAX_PROBE_NEURONS`), зонд не ставится вовсе, а причина
-    уходит в журнал таймлайна: обрезать популяцию молча нельзя — по
-    обрезку нельзя сказать, чья это активность.
+    Нужна командной строке. Прежде лента собиралась только из спеки, то
+    есть только на пути окна, и прогоны `fly arena` с `fly body` ложились
+    на диск без `timeline.npz` — такой сеанс в виде «Таймлайн» не
+    открывался вовсе. Сама обвязка при этом была готова целиком:
+    `run_episode` принимает `tape=`, а `save` пишет ленту рядом с
+    прогоном. Не хватало только создать её.
+
+    ``origin`` попадает в паспорт ленты: по нему видно, кто её собрал —
+    окно или командная строка. Это не косметика: пути разные, и если
+    лента окажется неполной, первым делом надо знать, чьей она.
     """
     from . import data as D, replay as RP, timeline as TL
 
-    block = getattr(spec, kind, None)
-    if block is None or not getattr(block, "timeline", True):
-        return None
-    keep = (float(getattr(block, "timeline_keep_s", 0.0) or 0.0)
-            or float(getattr(block, "keep_s", 0.0) or 0.0)
-            or TL.DEFAULT_KEEP_S)
+    keep = float(keep_s or 0.0) or TL.DEFAULT_KEEP_S
     probes, note = {}, ""
     sels = []
     if kind == "body" and readout:
@@ -403,13 +402,34 @@ def _tape(spec, kind, neurons, control_ms, readout=None, motor=None):
             break
         probes[name] = idx
         total += len(idx)
-    cap = getattr(block, "capture_at_ms", None)
     return RP.Tape(kind=kind, control_ms=control_ms, keep_s=keep,
                    probe_idx=probes, mode="пересчёт",
-                   capture_at_ms=cap,
-                   meta={"семя": int(spec.seed), "спека": spec.kind,
+                   capture_at_ms=capture_at_ms,
+                   meta={"семя": int(seed), "спека": origin,
                          "зонды": {k: int(len(v)) for k, v in probes.items()},
                          "почему нет растра": note})
+
+
+def _tape(spec, kind, neurons, control_ms, readout=None, motor=None):
+    """Лента таймлайна для прогона или `None`, если его не просили.
+
+    Зонды растра берутся из популяции съёма — той самой, по которой
+    считается выход: записывать «выбранную нейронную активность» и
+    выбирать при этом не ту популяцию, которой рулят, было бы странно.
+    Если популяция в растр не умещается (предел
+    `timeline.MAX_PROBE_NEURONS`), зонд не ставится вовсе, а причина
+    уходит в журнал таймлайна: обрезать популяцию молча нельзя — по
+    обрезку нельзя сказать, чья это активность.
+    """
+    block = getattr(spec, kind, None)
+    if block is None or not getattr(block, "timeline", True):
+        return None
+    keep = (float(getattr(block, "timeline_keep_s", 0.0) or 0.0)
+            or float(getattr(block, "keep_s", 0.0) or 0.0))
+    return tape_for(kind, neurons, control_ms, keep_s=keep,
+                    readout=readout, motor=motor,
+                    capture_at_ms=getattr(block, "capture_at_ms", None),
+                    seed=int(spec.seed), origin=spec.kind)
 
 
 def _job_arena(spec, ctx):
