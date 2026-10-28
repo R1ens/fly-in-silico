@@ -583,6 +583,17 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     print(f"  опора {calib['dn_ref_hz']} Гц, перекос {bias:+.5f}, "
           f"шум {noise:.5f}, яркость насыщения {odour_ref:.5f}")
 
+    # В снимок состояния калибровка уходит НЕОКРУГЛЁННОЙ. Числа в
+    # `calib` округлены для чтения глазами и для `embodied.json` (перекос
+    # до шестого знака, яркость насыщения до восьмого), а цикл считает по
+    # вот этим значениям. Разница не больше 5e-7 — и её хватает: `asym`
+    # на границе своего округления расходится, и продолжение держалось
+    # ОДИН шаг вместо всего хвоста. Поймано замером
+    # (`probe/resume_state.py --part body`), а не рассуждением; после
+    # правки — все проверенные шаги побитово.
+    calib_exact = {"bias": bias, "noise": noise, "odour_ref": odour_ref,
+                   "dn_ref_hz": float(calib["dn_ref_hz"])}
+
     # --- эпизод ---
     if stopped:
         # Один шаг всё же делаем: на пустой записи не считаются ни метрики,
@@ -616,7 +627,7 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             from . import replay as RP
 
             return RP.capture_body(
-                body, engine, cfg, calib, (el, er), sources,
+                body, engine, cfg, calib_exact, (el, er), sources,
                 slots=(live._read_sources() if live is not None else []),
                 counts=counts, t_ms=t_now_ms,
                 meta={"семя": int(cfg.seed),
@@ -830,11 +841,11 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             "модельного времени: разогрев калибровки не повторялся, "
             "перекос и шум взяты из снимка. Траектория до этого момента "
             "лежит в прежнем прогоне, а не здесь. Побитовое совпадение с "
-            "непрерывным сеансом измерено и ограничено: %d шагов "
-            "управления (%.0f мс), дальше расходится в последнем "
-            "записанном знаке — все названные поля состояния в миг "
-            "восстановления совпадают, и чего не хватает, не установлено "
-            "(probe/resume_state.py)."
+            "непрерывным сеансом измерено на %d шагах управления "
+            "(%.0f мс) и на всей этой длине полное: записи шагов, "
+            "состояние движка, счётчики и ось модельного времени. Где "
+            "оно кончается, не установлено — дальше сверка не гонялась "
+            "(probe/resume_state.py --part body)."
             % (float(resume_report.get("модельное, мс") or 0.0),
                RP.EXACT_STEPS["body"],
                RP.EXACT_STEPS["body"] * cfg.control_ms))

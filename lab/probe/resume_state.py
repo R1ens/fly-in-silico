@@ -327,13 +327,17 @@ def _resume_arena(state, neurons, weights, device, drop, n_steps):
 def part_body(device, tail=25):
     """То же в теле: горизонт продолжения и выбрасывание фазы походки.
 
-    Здесь требование «150 шагов побитово» заранее не выполняется, и это
-    замер предыдущего исполнителя, который надо перепроверить своим:
-    `replay.EXACT_STEPS['body']` = 21 шаг. Поэтому хвост короткий, а
-    итог — число шагов, на которых совпало, и честное «дальше
-    расходится».
+    Тело — отдельная задача, потому что состояние сеанса здесь не только
+    в движке: MuJoCo, фаза походки, поток случайных чисел CPG, калибровка
+    разогрева. Итог — число шагов, на которых совпало побитово, и оно
+    сверяется с объявленным в `replay.EXACT_STEPS`: объявить больше, чем
+    замерено, нельзя.
+
+    Этим замером и нашлась причина, по которой прежде объявлялся
+    горизонт 21 шаг: в снимок уходила ОКРУГЛЁННАЯ калибровка. См.
+    `body.py`, `calib_exact`.
     """
-    from flybrain import body as B, data as D, replay as RP, sim
+    from flybrain import body as B, data as D, replay as RP, sim, world
 
     neurons = D.load_neurons()
     weights = D.load_weights(device=device)
@@ -345,10 +349,22 @@ def part_body(device, tail=25):
                     mode="пересчёт",
                     capture_at_ms=CAPTURE_STEP * CONTROL_MS,
                     meta={"семя": 0})
-    print("  сеанс A: непрерывно, снимок на шаге %d" % CAPTURE_STEP)
+    # Движок собирается здесь, а не внутри эпизода, ровно по одной
+    # причине: сеансу нужно НАСТОЯЩЕЕ вмешательство. Без него маски все
+    # единицы, и их выбрасывание ничего не меняет по построению, а не по
+    # замеру — проверка маской тогда не проверяет ничего.
+    driven = np.unique(np.concatenate([
+        D.select(neurons, world.SENSORS[k])
+        for k in ("odour_left", "odour_right", "taste")]))
+    engA = sim.build_engine(weights=weights, neurons=neurons, device=device,
+                            seed=cfg.seed, no_refractory=driven)
+    engA.set_masks(hold=np.arange(60000, 60000 + HOLD_N, dtype=np.int64))
+    engA.calls = 0
+    print("  сеанс A: непрерывно, снимок на шаге %d, удержано %d нейронов"
+          % (CAPTURE_STEP, HOLD_N))
     t0 = time.perf_counter()
     runA = B.run_episode(cfg=cfg, neurons=neurons, weights=weights,
-                         progress=False, tape=tapeA)
+                         progress=False, engine=engA, tape=tapeA)
     rep["замеры"]["тело: A, с"] = round(time.perf_counter() - t0, 2)
     state = runA.state
     check("тело: снимок снят на границе шага",
@@ -372,17 +388,28 @@ def part_body(device, tail=25):
     rep["замеры"]["тело: шагов совпало побитово"] = n_same
     rep["замеры"]["тело: объявлено в replay.EXACT_STEPS"] = \
         RP.EXACT_STEPS["body"]
+    # Сверять надо с объявленным, но не дальше проверенного: при коротком
+    # хвосте требование «не меньше объявленного» провалилось бы не
+    # потому, что продолжение разошлось, а потому, что сверка туда не
+    # доходила. Объявить больше, чем проверено, при этом всё равно
+    # нельзя — об этом отдельная проверка ниже.
+    want = min(RP.EXACT_STEPS["body"], len(ref))
     check("тело: продолжение совпадает побитово не меньше объявленного "
           "горизонта",
-          n_same >= RP.EXACT_STEPS["body"],
-          "совпало %d шагов из %d проверенных, объявлено %d"
-          % (n_same, len(ref), RP.EXACT_STEPS["body"]))
+          n_same >= want,
+          "совпало %d шагов из %d проверенных, объявлено %d, спрошено %d"
+          % (n_same, len(ref), RP.EXACT_STEPS["body"], want))
+    check("тело: объявленный горизонт не больше того, что эта проба "
+          "проверила",
+          len(ref) >= RP.EXACT_STEPS["body"],
+          "объявлено %d шагов, проверено %d — запускайте с --tail не "
+          "меньше объявленного"
+          % (RP.EXACT_STEPS["body"], len(ref)))
     if n_same < len(ref):
         rep["находки"].append(
             "тело: продолжение побитово держится %d шагов управления "
-            "(%.0f мс) из %d проверенных, дальше расходится. Требование "
-            "«150 шагов» в теле НЕ выполняется, и это свойство сеанса в "
-            "MuJoCo, а не таймлайна: все названные поля состояния в миг "
+            "(%.0f мс) из %d проверенных, дальше расходится. Это свойство "
+            "сеанса в MuJoCo, а не таймлайна: поля состояния в миг "
             "восстановления совпадают." % (n_same, n_same * CONTROL_MS,
                                            len(ref)))
 
