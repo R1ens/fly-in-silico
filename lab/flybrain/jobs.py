@@ -73,6 +73,25 @@ class Ctx:
         self.applied = []
         self._later = []          # просятся на будущее модельное время
         self._asked_stop = False
+        # Обработчик снятия состояния. Ставит его задача, когда лента
+        # собрана: точка управления про ленту ничего не знает и знать не
+        # должна. `None` значит, что этот вид прогона состояние снимать
+        # не умеет, и команда отклоняется с причиной, а не молча.
+        self._capture = None
+
+    def set_capture(self, fn):
+        """Назначить обработчик снятия состояния.
+
+        Именно МЕТОДОМ, а не присваиванием поля, и это не вкусовщина.
+        Контекст работника (`worker._WorkerCtx`) — не наследник, а
+        обёртка: он проводит к базе ЧТЕНИЕ через `__getattr__`, но
+        присваивание `ctx._capture = ...` садится на обёртку, и база
+        остаётся с `None`. Поймано замером: команда снимка отклонялась
+        словами «этот вид прогона снимать состояние не умеет» при
+        исправно собранной ленте. Поиск метода обёртка проводит, и
+        значение ложится туда, где его читает `control_point`.
+        """
+        self._capture = fn
         self._t0 = time.perf_counter()
 
     # -- данные ---------------------------------------------------------
@@ -210,6 +229,21 @@ class Ctx:
             elif cmd.action == "stop":
                 self.paused = False
                 self._asked_stop = True
+            elif cmd.action == "capture":
+                # Снимок состояния по требованию окна. Снимается на
+                # границе шага управления — между шагами состояние
+                # модели не целостно, и просить его там бессмысленно.
+                # Работает и на ходу, и на паузе: точка управления
+                # вызывается в обоих случаях, а снимает лента на
+                # следующем шаге.
+                if self._capture is None:
+                    outcome, why = "rejected", (
+                        "этот вид прогона снимать состояние не умеет")
+                else:
+                    values = self._capture(t_ms)
+                    if values.get("снимок") != "заказан":
+                        outcome = "rejected"
+                        why = values.get("почему") or ""
             elif cmd.action == "set":
                 values, why = self._apply_set(cmd.payload, state, t_ms,
                                               cmd.cmd_id)
@@ -454,6 +488,8 @@ def _job_arena(spec, ctx):
     n_steps = max(1, int(round(cfg.duration_s * 1000.0 / cfg.control_ms)))
     seen = {"n": 0}
     tape = _tape(spec, "arena", neurons, cfg.control_ms, motor=body)
+    if tape is not None:
+        ctx.set_capture(tape.ask_capture)
 
     def on_step(step, rec, bins_row, commentator=None):
         seen["n"] = step + 1
@@ -551,6 +587,8 @@ def _job_body(spec, ctx):
                                    if spec.body else None))
     tape = _tape(spec, "body", neurons, cfg.control_ms,
                  readout=cfg.readout)
+    if tape is not None:
+        ctx.set_capture(tape.ask_capture)
 
     def on_step(step, rec, bins_row):
         seen["n"] = step + 1
