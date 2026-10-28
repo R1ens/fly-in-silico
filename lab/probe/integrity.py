@@ -93,7 +93,7 @@ def main():
         st["cursor"] = r.name
         st["data"], st["data_key"], st["plot"] = None, "", ""
         st["loader"].cancel()
-        for view in range(5):
+        for view in range(len(A.VIEWS)):
             st["view"] = view
             for tab in range(4):
                 app.st.ws.set_tab(tab)
@@ -104,8 +104,8 @@ def main():
     check("просмотр всех прогонов в «Анализе» ничего не меняет",
           not ch and not gone and not new,
           "изменилось %s" % ch[:3] if ch else
-          "%d прогонов × 5 видов × 4 вкладки, худший кадр %.0f мс"
-          % (len(st["runs"] or []), worst))
+          "%d прогонов × %d видов × 4 вкладки, худший кадр %.0f мс"
+          % (len(st["runs"] or []), len(A.VIEWS), worst))
     rep["замеры"]["худший кадр обхода, мс"] = round(worst, 1)
 
     # --- 2a. пустой каталог в самом окне ---
@@ -114,7 +114,7 @@ def main():
     st["sel"] = []
     st["data"], st["data_key"] = None, ""
     ok_empty = True
-    for view in range(5):
+    for view in range(len(A.VIEWS)):
         st["view"] = view
         for tab in range(4):
             app.st.ws.set_tab(tab)
@@ -125,7 +125,7 @@ def main():
                 print("    упало на виде %d вкладке %d: %s"
                       % (view, tab, exc))
     check("окно «Анализа» живёт при пустом каталоге", ok_empty,
-          "5 видов × 4 вкладки без прогонов")
+          "%d видов × 4 вкладки без прогонов" % len(A.VIEWS))
     sh.shot(OUT / "integrity_empty.png")
     st["runs"] = None
     A._ensure(app)

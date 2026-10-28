@@ -42,6 +42,18 @@ def main():
     app = App(sh, ses)
     app.st.ws.switch("analysis")
 
+    # Инвариант пяти пространств — проверкой с числом, а не обещанием в
+    # тексте. Вид «Таймлайн» добавлен ВНУТРЬ «Анализа», и шестого
+    # пространства от этого взяться не должно. Отдельно и подробнее —
+    # `probe/five_spaces.py`.
+    from flybrain.desk.state import WORKSPACES
+
+    check("рабочих пространств ровно пять", len(WORKSPACES) == 5,
+          "записей %d: %s" % (len(WORKSPACES),
+                              ", ".join(n for _, n in WORKSPACES)))
+    rep["замеры"]["рабочих пространств"] = len(WORKSPACES)
+    rep["замеры"]["видов в «Анализе»"] = len(A.VIEWS)
+
     t0 = time.perf_counter()
     app.frame()
     first_ms = (time.perf_counter() - t0) * 1000.0
@@ -101,7 +113,7 @@ def main():
     bad = []
     for r in runs:
         pick(r.name)
-        for view in range(5):
+        for view in range(len(A.VIEWS)):
             st["view"] = view
             for _ in range(2):
                 a = time.perf_counter()
@@ -114,9 +126,62 @@ def main():
                                 (time.perf_counter() - a) * 1000.0)
     rep["замеры"]["худший кадр при обходе всех прогонов, мс"] = round(
         worst_all, 1)
-    check("все %d прогонов рисуются во всех пяти видах" % len(runs),
+    check("все %d прогонов рисуются во всех %d видах"
+          % (len(runs), len(A.VIEWS)),
           not bad, "; ".join(bad[:3]) if bad else
           "худший кадр %.0f мс" % worst_all)
+
+    # --- вид «Таймлайн»: сеанс внутри «Анализа» ---
+    # Вид есть всегда, а таймлайн — только у сеансов. Поэтому проверяются
+    # обе ветки: с записью и без неё. Без записи вид обязан сказать это
+    # словами, а не показать пустоту.
+    tlv = A.VIEWS.index("Таймлайн")
+    with_tl = [r for r in runs if getattr(r, "has_timeline", False)]
+    rep["замеры"]["прогонов с таймлайном"] = len(with_tl)
+    no_tl = next((r for r in runs if not getattr(r, "has_timeline", False)),
+                 None)
+    if no_tl is not None:
+        pick(no_tl.name)
+        st["view"] = tlv
+        app.frame()
+        app.frame()
+        check("у прогона без таймлайна вид «Таймлайн» не падает",
+              True, "прогон %s" % no_tl.name)
+    if with_tl:
+        r = with_tl[0]
+        pick(r.name)
+        st["view"] = tlv
+        worst, took = wait_data()
+        view = st["data"]
+        tl = getattr(view, "tl", None)
+        check("вид «Таймлайн» открыл запись сеанса",
+              tl is not None and len(tl.times()) > 0,
+              "прогон %s, шагов %d, за %.2f с, худший кадр %.0f мс"
+              % (r.name, 0 if tl is None else len(tl.times()), took, worst))
+        if tl is not None:
+            times = tl.times()
+            st["tl_t"] = float(times[0])
+            app.frame()
+            on = tl.row(float(times[0]))
+            mid = float((times[0] + times[1]) / 2.0)
+            st["tl_t"] = mid
+            app.frame()
+            app.frame()
+            between = tl.row(mid)
+            import flybrain.timeline as TLM
+
+            check("на границе шага вид показывает числа, между шагами — "
+                  "«нет данных»",
+                  isinstance(on, dict) and isinstance(between, TLM.Hole),
+                  "на %g мс каналов %d; на %g мс — %s"
+                  % (times[0], len(on) if isinstance(on, dict) else 0, mid,
+                     getattr(between, "why", "число")))
+            check("просмотр записи в «Анализе» движок LIF не зовёт",
+                  view.cost()["вызовов движка LIF"] == 0,
+                  "ответов %d, вызовов движка %d"
+                  % (view.cost()["ответов"],
+                     view.cost()["вызовов движка LIF"]))
+            shot("ana_timeline.png", "таймлайн сеанса: момент между шагами")
 
     # --- обзор ---
     by = {r.name: r for r in runs}
