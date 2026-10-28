@@ -24,6 +24,11 @@ from probe import _isolate  # noqa: E402  прогоны — во временн
 
 LAB = Path(__file__).resolve().parents[1]
 PY = LAB.parent / ".venv" / "Scripts" / "python.exe"
+if not PY.exists():
+    # Из рабочего дерева git окружения рядом нет: оно одно на весь
+    # репозиторий. Берётся тот интерпретатор, которым проба и запущена —
+    # это он же.
+    PY = Path(sys.executable)
 OUT = Path(__file__).parent
 fails = []
 rep = {"команды": {}, "проверки": {}}

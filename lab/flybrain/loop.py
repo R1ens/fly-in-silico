@@ -186,10 +186,34 @@ class Commentator:
 def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
                 body_params: BodyParams | None = None, neurons=None,
                 weights=None, start=None, progress=True, probes=False,
-                on_step=None, should_stop=None):
+                on_step=None, should_stop=None, engine=None, motor=None,
+                counts0=None, tape=None):
+    """Эпизод на арене.
+
+    Три последних параметра нужны одному — продолжению сеанса с
+    сохранённого места (``flybrain.replay``), и контракт у них объявлен:
+
+    * ``engine`` — готовый :class:`sim.Engine` с уже поставленным
+      состоянием. Без него движок собирается здесь, как и раньше.
+      Собирать его снаружи приходится потому, что состояние надо
+      поставить ДО первого шага, а разогрев калибровки движок двигает.
+    * ``motor`` — готовый :class:`world.Body` с накопителями сглаживания.
+      Его ``p`` и становится параметрами эпизода: передавать заодно
+      ``body_params`` не нужно.
+    * ``counts0`` — накопленные счётчики спайков сеанса, чтобы частоты
+      считались по всему сеансу, а не по его последнему отрезку.
+    * ``tape`` — лента таймлайна (:class:`flybrain.replay.Tape`): пишет
+      ряды по модельному времени и, если попросили, снимает состояние.
+      Модель она не трогает.
+
+    Разогрев калибровки при продолжении не идёт сам собой, без особого
+    условия: он включается только когда ``dn_ref_hz`` или
+    ``turn_gain_rad_s`` равны ``None``, а продолжение ставит их из
+    сохранённой калибровки.
+    """
     config = config or EpisodeConfig()
     arena = arena or world.default_arena(config.seed)
-    body = Body(body_params)
+    body = motor if motor is not None else Body(body_params)
     if neurons is None:
         neurons = D.load_neurons()
     device = config.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -208,8 +232,10 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
 
     sensor_all = np.unique(np.concatenate(list(sensor_idx.values())))
     t0 = time.perf_counter()
-    engine = sim.build_engine(weights=weights, neurons=neurons, device=device,
-                              seed=config.seed, no_refractory=sensor_all)
+    if engine is None:
+        engine = sim.build_engine(weights=weights, neurons=neurons,
+                                  device=device, seed=config.seed,
+                                  no_refractory=sensor_all)
     t_setup = time.perf_counter() - t0
 
     sensor_t = {k: torch.as_tensor(v, device=device) for k, v in sensor_idx.items()}
@@ -237,6 +263,12 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
 
     rates = torch.zeros(1, n, device=device)
     counts = torch.zeros(n, dtype=torch.int64, device=device)
+    if counts0 is not None and len(counts0) == n:
+        # Счётчики продолжаемого сеанса: частоты считаются делением на
+        # длительность, и начав их с нуля, продолжение показало бы
+        # частоты только своего отрезка, выдав их за частоты сеанса.
+        counts += torch.as_tensor(np.asarray(counts0, np.int64),
+                                  device=device)
     bins = torch.zeros(keep_steps, n, dtype=torch.int16, device=device)
 
     fly = start or FlyState(arena.width * 0.5, arena.height * 0.12,
@@ -296,6 +328,21 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
             bar = tqdm(total=n_steps, unit="шаг", ncols=78, desc="арена")
         except ImportError:
             bar = None
+
+    if tape is not None:
+        # Лента получает движок и способ снять состояние. Снимается оно
+        # на границе шага управления — там, где состояние модели целостно.
+        def _grab(t_now_ms):
+            from . import replay as RP
+
+            return RP.capture_arena(engine, body, fly, arena, counts=counts,
+                                    t_ms=t_now_ms,
+                                    meta={"семя": int(config.seed),
+                                          "шаг управления, мс":
+                                              config.control_ms,
+                                          "устройство": device})
+
+        tape.begin(engine, grab=_grab)
 
     t1 = time.perf_counter()
     for step in range(n_steps):
@@ -365,9 +412,15 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
             commentator.submit(t_ms, _snapshot(rec, fly, arena, neurons, acc))
             next_comment = t_ms + config.comment_every_ms
 
+        row_cpu = None
+        if on_step is not None or tape is not None:
+            # Одна копия на шаг, не две: строка записи нужна и окну, и
+            # ленте, а переносить её с видеокарты дважды незачем.
+            row_cpu = bins[step % keep_steps].cpu().numpy()
+        if tape is not None:
+            tape.step(t_ms, rec, counts=row_cpu)
         if on_step is not None:
-            on_step(step, rec, bins[step % keep_steps].cpu().numpy(),
-                    commentator)
+            on_step(step, rec, row_cpu, commentator)
         if should_stop is not None and should_stop():
             n_steps = step + 1
             records = records[:n_steps]
@@ -426,10 +479,30 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
             "(с %.0f мс). Счётчики и частоты посчитаны по всей сессии, "
             "растр и ход активности — только по окну."
             % (kept * dt_s, dur_s, bins_t0_ms))
+    if tape is not None and tape.mode == "продолжение":
+        # Продолжение — часть результата, а не способ его получить:
+        # по сохранённому файлу должно быть видно, что эпизод начат не с
+        # нуля, и с какого модельного времени.
+        timing.setdefault("оговорки", []).append(
+            "эпизод продолжен из сохранённого состояния с %.0f мс "
+            "модельного времени: разогрев калибровки не повторялся, опора "
+            "и перекос взяты из снимка. Траектория до этого момента лежит "
+            "в прежнем прогоне, а не здесь." % tape.t_offset_ms)
+    if tape is not None:
+        tape.finish(n_steps)
+        timing["таймлайн"] = {
+            k: v for k, v in tape.tl.schema().items()
+            if k in ("окно записи, с", "шагов записано", "шагов в сеансе",
+                     "запись с, мс", "запись до, мс", "предел памяти")}
     metrics = _metrics(records)
-    return Episode(arena, body.p, records, counts.cpu().numpy(),
-                   bins.cpu().numpy(), neurons, config, comments, timing,
-                   metrics, sensor_idx)
+    ep = Episode(arena, body.p, records, counts.cpu().numpy(),
+                 bins.cpu().numpy(), neurons, config, comments, timing,
+                 metrics, sensor_idx)
+    # Таймлайн и снимок состояния едут вместе с эпизодом: их пишет
+    # `save`, то есть один и тот же путь для окна и для командной строки.
+    ep.timeline = None if tape is None else tape.tl
+    ep.state = None if tape is None else tape.state
+    return ep
 
 
 def lateral_probe(neurons=None, weights=None, device=None, duration_s=10.0,
@@ -779,6 +852,12 @@ def load(out_dir, neurons=None) -> Episode:
 def save(episode: Episode, out_dir):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    tl = getattr(episode, "timeline", None)
+    if tl is not None:
+        tl.save(out_dir)
+    st = getattr(episode, "state", None)
+    if st is not None:
+        st.save(out_dir)
     (out_dir / "episode.json").write_text(
         json.dumps(episode.meta(), ensure_ascii=False, indent=2), encoding="utf-8")
     import pandas as pd

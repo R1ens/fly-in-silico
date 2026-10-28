@@ -25,10 +25,14 @@
 import threading
 import time
 
+import numpy as np
+
 from .. import compare as CP
 from .. import plots as PL
+from .. import replay as RP
 from .. import runs as RN
 from .. import stats as ST
+from .. import timeline as TLM
 from . import charts
 from . import layout as L
 from . import widgets as W
@@ -37,7 +41,8 @@ from .tokens import C, R, S
 __all__ = ["SPACE"]
 
 TABS = ("Параметры", "Файлы", "Оговорки", "Действия")
-VIEWS = ("Обзор", "Графики", "Таблицы", "Сравнение", "Статистика")
+VIEWS = ("Обзор", "Графики", "Таблицы", "Сравнение", "Статистика",
+         "Таймлайн")
 
 KIND_FILTER = (("", "все виды"), ("stim", "Стимуляция"), ("arena", "Арена"),
                ("body", "В теле"), ("lateral", "Перебор популяций"),
@@ -386,7 +391,8 @@ def centre(app, ctx, r):
            "графики по настоящим данным из файлов",
            "таблицы: нейроны, шаги, эпизоды",
            "несколько прогонов рядом",
-           "серия: среднее, разброс, sem, критерий"])])
+           "серия: среднее, разброс, sem, критерий",
+           "сеанс по модельному времени: что записано и чего нет"])])
     if "view" in picks:
         st["view"] = picks["view"]
         st["loader"].cancel()
@@ -395,8 +401,8 @@ def centre(app, ctx, r):
         W.label(ctx, body, "Выберите прогон в каталоге слева.",
                 role="small", color=C.faint, wrapped=True)
         return
-    (_overview, _plots, _tables, _compare, _stats)[st["view"]](app, ctx,
-                                                               body, run)
+    (_overview, _plots, _tables, _compare, _stats,
+     _timeline)[st["view"]](app, ctx, body, run)
 
 
 def _overview(app, ctx, r, run):
@@ -415,6 +421,26 @@ def _overview(app, ctx, r, run):
                 color=STATE_COLOR.get(run.state, C.faint), wrapped=True)
     s.take(h, sc.px(S.sm))
     _broken(app, ctx, s, content, run)
+
+    if run.has_timeline:
+        W.section(ctx, s, "Сеанс песочницы" if run.session
+                  else "Таймлайн модельного времени", wid="ana/ovt",
+                  right="вкладка «Таймлайн»",
+                  info="Рядом с прогоном лежит единый таймлайн по "
+                       "модельному времени: сенсорные каналы, выбранная "
+                       "нейронная активность, нисходящие, моторные "
+                       "команды, траектория и события среды. Смотреть "
+                       "его — в виде «Таймлайн»; там же видно, на какие "
+                       "моменты в записи данных нет.")
+        tlm = run.timeline or {}
+        for k in ("окно записи, с", "шагов записано", "шагов в сеансе",
+                  "запись с, мс", "запись до, мс", "событий"):
+            if tlm.get(k) is None or not s.fits(sc.px(S.row)):
+                continue
+            W.kv(ctx, s.take(sc.px(S.row)), k, _num(tlm[k]))
+        if run.has_state and s.fits(sc.px(S.row)):
+            W.kv(ctx, s.take(sc.px(S.row)), "снимок состояния",
+                 "есть: сеанс можно продолжить")
 
     W.section(ctx, s, "Когда и сколько")
     W.kv(ctx, s.take(sc.px(S.row)), "папка", run.name)
@@ -880,6 +906,242 @@ def _grid(ctx, s, content, cols, rows):
             dl.text(f.small, _num(v) if v is not None else "—", x,
                     box.y + sc.px(2), C.dim, max_px=w - sc.px(S.xs))
             x += w
+
+
+# ------------------------------------------------------------- таймлайн
+
+# Группы каналов показываются в этом порядке. Порядок объявлен здесь, а
+# не выведен из словаря: он читается сверху вниз как путь сигнала — от
+# входа к движению.
+TL_ORDER = ("сенсор", "нейронная активность", "нисходящие",
+            "моторные команды", "траектория")
+
+
+def _timeline(app, ctx, r, run):                              # noqa: C901
+    """Сеанс по модельному времени: что записано и чего нет.
+
+    Главное здесь — не график, а ответ на вопрос «что было в такой-то
+    миллисекунде». Ползунок ходит по модельному времени непрерывно, а
+    запись идёт шагами управления, поэтому между шагами окно обязано
+    сказать «нет данных» и назвать причину. Числа в такие моменты не
+    выдумываются и не интерполируются: на шаге 20 мс интерполяция
+    гладкой траектории отличается от правды на уровне шума, то есть
+    выглядела бы правдоподобно и была бы выдумкой.
+    """
+    sc, f = app.sh.sc, app.sh.fonts
+    st = _state(app)
+    content, token = W.scroll(ctx, "ana/tl", r)
+    s = L.Stack(L.Rect(content.x, content.y, content.w, 1 << 16),
+                gap=sc.px(S.sm))
+    if not run.has_timeline:
+        W.section(ctx, s, "Таймлайна нет", first=True)
+        h = W.label(ctx, L.Rect(content.x, s.area.y, content.w, s.area.h),
+                    "В папке нет `timeline.npz`. Это не поломка: единый "
+                    "таймлайн пишут эпизоды арены и сеансы в теле, у "
+                    "которых он включён (`ArenaSpec.timeline`, "
+                    "`BodySpec.timeline`), а прогоны, сделанные до него, "
+                    "его и не могли оставить. Ряды по шагам у таких "
+                    "прогонов есть в `track.parquet` — вид «Графики».",
+                    role="small", color=C.faint, wrapped=True)
+        s.take(h)
+        W.scroll_done(ctx, "ana/tl", r, s.used, token)
+        return
+
+    key = run.name + "/timeline"
+    view = _want(app, key, lambda: RP.View.open(run.path))
+    if view is None:
+        _loading(app, ctx, s, content, "таймлайн")
+        W.scroll_done(ctx, "ana/tl", r, s.used, token)
+        return
+    if isinstance(view, dict):
+        W.section(ctx, s, "Таймлайн не прочитался", first=True)
+        h = W.label(ctx, L.Rect(content.x, s.area.y, content.w, s.area.h),
+                    "чтение отменено" if view.get("cancelled")
+                    else str(view.get("error") or "неизвестно почему"),
+                    role="small", color=C.danger, wrapped=True)
+        s.take(h)
+        W.scroll_done(ctx, "ana/tl", r, s.used, token)
+        return
+
+    tl = view.tl
+    lo, hi = tl.window
+    if lo is None:
+        W.section(ctx, s, "Запись пуста", first=True)
+        W.scroll_done(ctx, "ana/tl", r, s.used, token)
+        return
+
+    W.section(ctx, s, "Окно записи", first=True, wid="ana/tlw",
+              right="%g — %g мс" % (lo, hi),
+              info="Кольцо держит последние `keep_s` секунд модельного "
+                   "времени. Что старше — вытеснено, и на такой момент "
+                   "окно отвечает «нет данных: раньше начала кольца», а "
+                   "не нулём.")
+    W.kv(ctx, s.take(sc.px(S.row)), "шаг управления",
+         _num(tl.control_ms), "мс")
+    W.kv(ctx, s.take(sc.px(S.row)), "шагов записано",
+         str(int(getattr(tl, "n_rows", 0))))
+    W.kv(ctx, s.take(sc.px(S.row)), "шагов в сеансе",
+         str(int(getattr(tl, "steps_total", 0))))
+    bud = tl.budget()
+    W.kv(ctx, s.take(sc.px(S.row)), "предел памяти записи",
+         _num(bud["всего, МБ"]), "МБ")
+    W.kv(ctx, s.take(sc.px(S.row)), "плотный растр был бы",
+         _num(bud["плотный растр был бы, МБ"]), "МБ")
+
+    # --- момент ---
+    cur = st.get("tl_t")
+    if cur is None or not (lo - tl.control_ms <= cur <= hi + tl.control_ms):
+        cur = lo
+    W.section(ctx, s, "Что было в этот момент", wid="ana/tlt",
+              info="Ползунок ходит по модельному времени непрерывно, а "
+                   "запись идёт шагами управления. Между шагами данных "
+                   "нет, и окно говорит именно это: интерполировать "
+                   "соседей значило бы выдумать состояние, которого "
+                   "модель не считала.")
+    row = s.take(sc.px(S.control_lg))
+    cur = W.slider(ctx, "ana/tl/t", row, float(cur),
+                   float(lo - tl.control_ms), float(hi + tl.control_ms),
+                   label="модельное время", unit="мс", fmt="{:.1f}",
+                   tip="ведите между делениями — окно скажет «нет данных»")
+    st["tl_t"] = cur
+    three = s.take(sc.px(S.control)).cols(3, gap=sc.px(S.sm))
+    if W.button(ctx, "ana/tl/snap", three[0], "На шаг", icon="check",
+                tip="подвинуть к ближайшему записанному шагу"):
+        times = tl.times()
+        if len(times):
+            st["tl_t"] = float(times[int(np.argmin(np.abs(times - cur)))])
+    if W.button(ctx, "ana/tl/mid", three[1], "Между", icon="close",
+                tip="встать ровно посередине между двумя записанными "
+                    "шагами: ответом обязано быть «нет данных»"):
+        times = tl.times()
+        if len(times) > 1:
+            j = int(np.clip(np.searchsorted(times, cur), 1, len(times) - 1))
+            st["tl_t"] = float((times[j - 1] + times[j]) / 2.0)
+    if W.button(ctx, "ana/tl/old", three[2], "До кольца", icon="reset",
+                tip="момент старше окна записи"):
+        st["tl_t"] = float(lo - tl.control_ms)
+
+    answer = tl.row(cur)
+    if isinstance(answer, TLM.Hole):
+        h = W.label(ctx, L.Rect(content.x, s.area.y, content.w, s.area.h),
+                    "НЕТ ДАННЫХ. " + answer.text, role="small",
+                    color=C.warn, wrapped=True)
+        s.take(h, sc.px(S.sm))
+        h = W.label(ctx, L.Rect(content.x, s.area.y, content.w, s.area.h),
+                    "Чисел в этот момент не будет. Соседние шаги записаны, "
+                    "но среднее между ними — это не состояние модели, а "
+                    "догадка о нём.", role="micro", color=C.faint,
+                    wrapped=True)
+        s.take(h, sc.px(S.sm))
+    else:
+        for group, _why in TLM.GROUPS:
+            if group not in TL_ORDER:
+                continue
+            chans = [c for c in tl.chans if c.group == group]
+            if not chans or not s.fits(sc.px(S.row) * 2):
+                continue
+            W.section(ctx, s, group)
+            for c in chans:
+                if not s.fits(sc.px(S.row)):
+                    break
+                v, hole = tl.value(cur, c.key)
+                W.kv(ctx, s.take(sc.px(S.row)), c.title,
+                     _num(v) if hole is None else "нет данных", c.unit)
+        for name in tl.probe_names:
+            if not s.fits(sc.px(S.row)):
+                break
+            v, hole = tl.population(cur, name)
+            W.kv(ctx, s.take(sc.px(S.row)), "зонд " + name,
+                 _num(v) if hole is None else "нет данных", "Гц")
+
+    # --- объявленное, но не подключённое ---
+    absent = [c for c in TLM.channels_of(tl.kind) if c.absent]
+    if absent:
+        W.section(ctx, s, "Объявлено, но не подключено",
+                  right="%d" % len(absent), wid="ana/tla",
+                  info="Канал объявлен заранее, чтобы спросить его можно "
+                       "было уже сейчас. Ответ при этом — «канал не "
+                       "подключён» с причиной, а не ноль: ноль значил бы "
+                       "«измерено и ничего нет».")
+        for c in absent:
+            if not s.fits(f.micro.gh * 2):
+                break
+            W.label(ctx, s.take(f.small.gh + sc.px(2)), c.title,
+                    role="small", color=C.dim)
+            h = W.label(ctx, L.Rect(content.x, s.area.y, content.w,
+                                    s.area.h), c.absent, role="micro",
+                        color=C.warn, wrapped=True)
+            s.take(h, sc.px(S.xs))
+
+    # --- нейрон ---
+    W.section(ctx, s, "Активность одного нейрона", wid="ana/tln",
+              info="В растр попали только нейроны зондов. На нейрон вне "
+                   "зондов ответ — «нет данных», а не ноль: «не "
+                   "записывался» и «молчал» — разные вещи, и путать их "
+                   "нельзя.")
+    nrow = s.take(sc.px(S.control))
+    ti = ctx.editor("ana/tl/n", st.get("tl_n", "0"))
+    W.text_field(ctx, "ana/tl/n", nrow, ti, "номер нейрона", icon="search")
+    st["tl_n"] = ti.text
+    try:
+        neuron = int(str(ti.text).strip() or "-1")
+    except ValueError:
+        neuron = -1
+    v, hole = tl.neuron(cur, neuron)
+    h = W.label(ctx, L.Rect(content.x, s.area.y, content.w, s.area.h),
+                ("спайков за шаг: %d" % v) if hole is None
+                else ("НЕТ ДАННЫХ. " + hole.text),
+                role="small", color=C.ink if hole is None else C.warn,
+                wrapped=True)
+    s.take(h, sc.px(S.sm))
+    if s.fits(f.micro.gh * 2):
+        h = W.label(ctx, L.Rect(content.x, s.area.y, content.w, s.area.h),
+                    "Растр целочислен: это счёт спайков за шаг. При "
+                    "рефрактерном периоде 2,2 мс и шаге %g мс нейрон не "
+                    "может выдать больше %d спайков, и дробное значение "
+                    "здесь было бы признаком выдумки, а не округления."
+                    % (tl.control_ms, tl.raster_ceiling()),
+                    role="micro", color=C.faint, wrapped=True)
+        s.take(h, sc.px(S.sm))
+
+    # --- события ---
+    ev = tl.events
+    W.section(ctx, s, "События сеанса", right="%d" % len(ev), wid="ana/tle",
+              info="Правки условий, вмешательства и изменения среды "
+                   "стоят не рядами, а событиями: они случаются в один "
+                   "момент модельного времени, и растягивать их на ряд "
+                   "значило бы придумывать им длительность.")
+    if not ev:
+        W.label(ctx, s.take(f.small.gh), "событий в записи нет",
+                role="small", color=C.faint)
+    for e in ev[-40:]:
+        if not s.fits(f.small.gh + f.micro.gh):
+            break
+        t = e.get("модельное, мс")
+        W.label(ctx, s.take(f.small.gh + sc.px(2)),
+                "%s мс · %s · %s" % ("—" if t is None else _num(t),
+                                     e.get("группа"), e.get("что")),
+                role="small", color=C.ink)
+        detail = str(e.get("подробно") or "")
+        if detail:
+            h = W.label(ctx, L.Rect(content.x, s.area.y, content.w,
+                                    s.area.h), detail, role="micro",
+                        color=C.warn, wrapped=True)
+            s.take(h, sc.px(S.xs))
+
+    # --- стоимость просмотра ---
+    W.section(ctx, s, "Чего стоил этот просмотр", wid="ana/tlc",
+              info="Подпись стоимости режима. Просмотр записанного не "
+                   "зовёт движок LIF ни разу — в этом режиме движка нет "
+                   "вовсе: ни весов, ни тела. Пересчёт того же сеанса "
+                   "стоил бы 200 вызовов на шаг управления.")
+    cost = view.cost()
+    for k in ("вызовов движка LIF", "ответов", "из них «нет данных»",
+              "мс на ответ"):
+        if not s.fits(sc.px(S.row)):
+            break
+        W.kv(ctx, s.take(sc.px(S.row)), k, _num(cost[k]))
+    W.scroll_done(ctx, "ana/tl", r, s.used, token)
 
 
 # ------------------------------------------------------------- сравнение

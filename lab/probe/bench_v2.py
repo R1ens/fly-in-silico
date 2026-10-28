@@ -82,11 +82,32 @@ def rss_mb():
                         ("PagefileUsage", ctypes.c_size_t),
                         ("PeakPagefileUsage", ctypes.c_size_t)]
 
+        # Типы объявляются, а не оставляются на усмотрение ctypes, и
+        # это не придирка. Без `restype` ctypes считает результат
+        # `c_int`, то есть 32-битным; псевдодескриптор текущего процесса
+        # равен (HANDLE)-1, и при передаче в 64-битный вызов он
+        # портился. `GetProcessMemoryInfo` при этом не падает, а
+        # возвращает ноль успеха — и функция отдавала **0.0 вместо
+        # отказа**. Замерено: `rss_mb()` возвращала 0.0, и во всех
+        # снимках `bench_v2_*.json` памяти нет ни одного значения, то
+        # есть она не записывалась никогда.
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.GetCurrentProcess.argtypes = []
+        psapi = ctypes.windll.psapi
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(PMC), wintypes.DWORD]
+
         pmc = PMC()
         pmc.cb = ctypes.sizeof(PMC)
-        ctypes.windll.psapi.GetProcessMemoryInfo(
-            ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(pmc),
-            pmc.cb)
+        ok = psapi.GetProcessMemoryInfo(
+            k32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb)
+        # Отказ обязан быть видимым. Ноль памяти — не измерение, и
+        # подставлять его вместо «не смогли» значит тихо врать в
+        # научном отпечатке.
+        if not ok or not pmc.PeakWorkingSetSize:
+            return None
         return round(pmc.PeakWorkingSetSize / 1e6, 1)
     except Exception:                                         # noqa: BLE001
         return None
