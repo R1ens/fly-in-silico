@@ -251,6 +251,18 @@ class Engine:
         self._vstim = None
         self._pool = None
 
+        # Счётчик вызовов шага. Это не отладка, а подпись стоимости: по
+        # ней режимы воспроизведения различаются не на слово. Просмотр
+        # записанного обязан не двигать движок вовсе (ноль вызовов),
+        # пересчёт — звать его `round(control_ms / DT)` раз на шаг
+        # управления. Подделать такую подпись, не посчитав, нельзя:
+        # счётчик растёт внутри самого шага, а не рядом с ним.
+        #
+        # Разогрев захвата графов (`use_graphs`) считается отдельно и в
+        # этот счётчик не идёт: он зовёт `_core` напрямую, минуя `step`,
+        # и состояние вокруг него восстанавливается.
+        self.calls = 0
+
     # --- вмешательства -------------------------------------------------
 
     def set_masks(self, fire=None, out=None, inc=None, hold=None,
@@ -467,6 +479,7 @@ class Engine:
         рассуждением, а `probe/lif_equal.py`: отпечатки состояния до и
         после правки совпали побайтово.
         """
+        self.calls += 1
         if self._graphs is not None:
             # Вход считаем как обычно и кладём в постоянный буфер, из
             # которого его читает граф.
@@ -476,6 +489,81 @@ class Engine:
             return self.spikes
         voltage_stim = self._poisson(rates)
         return self._core(voltage_stim)
+
+    # --- состояние движка целиком ---------------------------------------
+
+    # Что составляет состояние шага. Перечислено, а не выведено: по этому
+    # списку состояние снимается, восстанавливается и — главное —
+    # проверяется на полноту выбрасыванием по одному элементу
+    # (`probe/resume_state.py`). Элемент, выбрасывание которого ничего не
+    # меняет, в состояние не входит, и узнать это можно только замером.
+    STATE_TENSORS = ("v", "conductance", "spikes", "refrac", "delay_buffer")
+    MASK_TENSORS = ("m_fire", "m_out", "m_in", "m_hold", "v_hold")
+
+    def snapshot(self):
+        """Состояние шага как словарь массивов на процессоре.
+
+        Сюда входит всё, что шаг читает и пишет, и ни одной настройки:
+        веса, маски рефрактерности и число нейронов — это не состояние, а
+        устройство движка, и восстанавливать их значит собрать другой
+        движок, а не продолжить этот.
+
+        Отдельно про два элемента, которые легко потерять, потому что они
+        не тензоры состояния:
+
+        * ``ptr`` — положение кольца аксональной задержки. Живёт
+          питоновским целым, в CUDA-граф не попадает (графов поэтому 19,
+          по одному на слот), и без него продолжение читает не тот слот:
+          события задержки разъезжаются на шаг.
+        * ``gen`` — состояние генератора пуассоновского входа. Без него
+          продолжение идёт по другому потоку случайных чисел, и
+          побитового совпадения нет со второго же шага.
+        """
+        import numpy as np
+
+        out = {name: getattr(self, name).detach().cpu().numpy().copy()
+               for name in self.STATE_TENSORS}
+        for name in self.MASK_TENSORS:
+            out[name] = getattr(self, name).detach().cpu().numpy().copy()
+        out["ptr"] = np.int64(self.ptr)
+        out["gen"] = self.gen.get_state().cpu().numpy().copy()
+        out["calls"] = np.int64(self.calls)
+        return out
+
+    def restore(self, state, drop=()):
+        """Поставить состояние на место. Возвращает список восстановленного.
+
+        Копируется **на место** (``copy_``), а не присваивается: тензоры
+        состояния адресуются захваченными CUDA-графами, и
+        пересвязывание (``self.v = ...``) оставило бы граф читать старую
+        память — состояние перестало бы двигаться вовсе.
+
+        ``drop`` — имена элементов, которые нарочно НЕ восстанавливаются.
+        Это не удобство, а инструмент проверки полноты: ровно так
+        измеряется, что меняется от потери каждого элемента
+        (`probe/resume_state.py`). Обычный вызов ``drop`` не передаёт.
+        """
+        import numpy as np
+        import torch
+
+        done = []
+        for name in list(self.STATE_TENSORS) + list(self.MASK_TENSORS):
+            if name in drop or name not in state:
+                continue
+            getattr(self, name).copy_(
+                torch.as_tensor(np.asarray(state[name]),
+                                device=self.device,
+                                dtype=getattr(self, name).dtype))
+            done.append(name)
+        if "ptr" not in drop and "ptr" in state:
+            self.ptr = int(state["ptr"]) % self.buf_len
+            done.append("ptr")
+        if "gen" not in drop and "gen" in state:
+            self.gen.set_state(
+                torch.as_tensor(np.asarray(state["gen"], dtype=np.uint8),
+                                dtype=torch.uint8))
+            done.append("gen")
+        return done
 
     def _poisson(self, rates):
         """Пуассоновский вход в мембрану. Единственное место со случайностью.

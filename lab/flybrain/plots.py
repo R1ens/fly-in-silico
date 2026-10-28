@@ -126,6 +126,30 @@ def available(run):
             out.append(Plot(key, title, what, unit,
                             "track.parquet: " + ", ".join(cols)
                             + "; ось времени — t_ms"))
+    if run.has("timeline.npz"):
+        out.append(Plot(
+            "tl_cost", "Вызовов движка LIF за шаг",
+            "сколько раз за шаг управления звался `sim.Engine.step`. Это "
+            "подпись стоимости режима: у просмотра записанного она "
+            "нулевая, у пересчёта — 200 при шаге 20 мс",
+            "шт", "timeline.npz: канал `вызовов_движка`; ось времени — "
+                  "`t_ms` оттуда же",
+            caveat="подпись относится к тому прогону, который записан. "
+                   "Просмотр этой же записи в «Анализе» движок не зовёт "
+                   "вовсе, и собственная его стоимость здесь не нарисована"))
+        out.append(Plot(
+            "tl_probe", "Зонды популяций во времени",
+            "средняя частота нейронов зонда за шаг управления", "Гц",
+            "timeline.npz: `probe_hz` по зондам из `timeline.json`",
+            caveat="в растр и в частоты попали только нейроны зондов: "
+                   "активность остального мозга таймлайн не записывал, и "
+                   "«нет в зондах» — это не «молчал»"))
+        out.append(Plot(
+            "tl_wall", "Шаг по стене",
+            "сколько настенного времени занял шаг управления", "мс",
+            "timeline.npz: канал `по_стене_мс`",
+            caveat="это замер машины, а не свойство модели: ось графика — "
+                   "модельное время, а значение — настенное"))
     if run.kind == "arena" and run.has("probes.json"):
         out.append(Plot(
             "probes", "Популяции: связь с перекосом входа",
@@ -180,6 +204,38 @@ def load(run, key):
             note += "; запись — окно с %.0f мс, не вся сессия" % t0_ms
         base.update(kind="line", x=x, xlabel="время, мс",
                     series=[("спайков в бине", y)], note=note)
+        return base
+
+    if key in ("tl_cost", "tl_wall", "tl_probe"):
+        from . import timeline as TL
+
+        tl = TL.load(run.path)
+        t = tl.t_ms
+        good = np.isfinite(t)
+        if not good.any():
+            return None
+        x = t[good].astype("float64")
+        if key == "tl_probe":
+            if not tl.probes:
+                return None
+            series = [(name, tl.probe_hz[good, i].astype("float64"))
+                      for i, name in enumerate(tl.probe_names)]
+            note = ("зондов %d, нейронов в растре %d"
+                    % (len(tl.probes), len(tl.probe_idx)))
+        else:
+            col = "вызовов_движка" if key == "tl_cost" else "по_стене_мс"
+            if col not in tl.col:
+                return None
+            y = tl.rows[good, tl.col[col]].astype("float64")
+            series = [(col, y)]
+            note = "шагов %d; ожидалось вызовов на шаг: %s" % (
+                int(good.sum()),
+                tl.meta.get("вызовов движка на шаг управления", "—"))
+            if key == "tl_wall":
+                note = "шагов %d, медиана %.1f мс" % (
+                    int(good.sum()), float(np.median(y)) if len(y) else 0.0)
+        base.update(kind="line", x=x, xlabel="модельное время, мс",
+                    series=series, note=note)
         return base
 
     if key in ("regions", "spread"):
