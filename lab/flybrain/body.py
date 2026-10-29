@@ -674,9 +674,7 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         acc = torch.zeros(n, device=device)
         for _ in range(brain_steps):
             acc += engine.step(rates)[0]
-        dl = float(acc[t_ml].sum()) / (len(motor_l) * block_s)
-        dr = float(acc[t_mr].sum()) / (len(motor_r) * block_s)
-        return acc, dl, dr
+        return acc
 
     def step_measure():
         """Один блок управления: мозг + ИЗМЕРЕНИЕ всех зондов.
@@ -684,9 +682,25 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         `readout_*` здесь и остаются измерением: ни одного
         преобразования, только сумма спайков на число нейронов и
         длительность блока.
+
+        Съём с устройства ОДИН на весь шаг управления, а не четыре.
+        Прежде здесь ждали поток CUDA пять раз: `float(acc[t_ml].sum())`,
+        `float(acc[t_mr].sum())`, `readout.read`, `int(acc.sum())` в
+        записи и копия строки растра. Первые четыре сведены в
+        `readout.read_total`: все зонды и общая сумма едут одной
+        передачей, а `dn_l`/`dn_r` берутся из пары `__readout__` — она
+        собрана по ТЕМ ЖЕ селекторам `ql`/`qr`, по которым построены
+        `t_ml`/`t_mr`, так что это то же число, а не близкое. Почему до
+        бита то же — см. `motor.DnReadout.read_total`; сверено
+        `probe/lifperf_ab.py` (пункт 3), замерено там же попарно: 0,4603
+        против 0,3795 мс на спокойной машине (в 1,63 раза) и 2,447
+        против 0,640 мс при фоне втрое (в 3,81 раза). Ожидание тем
+        дороже, чем занятее видеокарта.
         """
-        acc, dl, dr = step_brain()
-        return acc, dl, dr, readout.read(acc, block_s)
+        acc = step_brain()
+        rd, total = readout.read_total(acc, block_s)
+        dl, dr = rd["__readout__"]
+        return acc, dl, dr, rd, total
 
     # --- разогрев: симметричный вход, меряем опору, перекос и шум ---
     li, ri = read_odour(obs)
@@ -734,7 +748,7 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         drive_brain(mean_i, mean_i, 0.0, odour_ref)
         tot = 0.0
         for _ in range(warm):
-            _, dl, dr, rd = step_measure()
+            _, dl, dr, rd, _tot = step_measure()
             tot += (dl + dr) / 2
             # Разогрев идёт ЧЕРЕЗ декодер: перекос и шум считаются для
             # каждого зонда сразу, одним и тем же кодом. Прежняя
@@ -858,7 +872,7 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         k = math.exp(-dt_s / max(cfg.dn_tau_s, 1e-6))
         rl, rr = drive_brain(li, ri, taste, ref_now)
 
-        acc, dl, dr, rd = step_measure()
+        acc, dl, dr, rd, spikes_total = step_measure()
         # Счётчики копятся за весь сеанс, запись — только за окно:
         # иначе частоты (`counts / t_run_s`) считались бы по обрезанной
         # записи и врали бы во столько раз, во сколько окно короче.
@@ -936,7 +950,10 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             "dist": round(dist_mm, 2),
             "grad_cos": round(grad_cos, 4),
             "source": int(nearest),
-            "spikes": int(acc.sum()),
+            # Берётся из той же посылки, что и зонды (`read_total`), а не
+            # отдельным ожиданием потока CUDA. Число то же: это тот же
+            # `acc.sum()`, только снятый один раз вместе со всем прочим.
+            "spikes": spikes_total,
         }
         # Разведённые имена. `readout_*` — ИЗМЕРЕНИЕ: частота зонда в
         # герцах, без единого преобразования. `cmd_*` — ИНЖЕНЕРНАЯ

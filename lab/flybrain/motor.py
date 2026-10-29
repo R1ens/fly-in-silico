@@ -360,12 +360,44 @@ class DnReadout:
 
     def read(self, acc, block_s):
         vals = acc[self._flat].detach().cpu().numpy().astype(np.float64)
+        return self._from_host(vals, block_s)
+
+    def _from_host(self, vals, block_s):
         out = {}
         for name, a, b, c in self._slices:
             nl, nr = self._n[name]
             out[name] = (float(vals[a:b].sum()) / (nl * block_s),
                          float(vals[b:c].sum()) / (nr * block_s))
         return out
+
+    def read_total(self, acc, block_s):
+        """То же, что :meth:`read`, плюс общее число спайков за блок.
+
+        Зачем отдельный метод. Каждое снятие числа с устройства — это
+        ОЖИДАНИЕ: поток CUDA должен догнать процессор. На шаге управления
+        таких ожиданий было пять: два съёма полушарий, зонды, сумма
+        спайков в запись и строка растра. Здесь первые четыре сведены в
+        одно: значения всех зондов и общая сумма едут на хост одной
+        передачей, а полушария берутся из той же посылки — съём
+        `__readout__` считается по тем же селекторам, что и `dn_l`/`dn_r`
+        в `body.run_episode`, так что это не приближение, а то же число.
+
+        Почему то же ДО БИТА. В ``acc`` лежат целые числа спайков. Сумма
+        целых точна и во float32, и во float64 при любом порядке
+        сложения, пока частичные суммы меньше 2^24 = 16 777 216 — а здесь
+        они на порядки ниже. Поэтому сумма на устройстве и сумма в numpy
+        совпадают, а не «почти»; деление дальше идёт в питоновском
+        float64 ровно как прежде. Сверено числами: `probe/lifperf_ab.py`
+        пункт 3 считает оба пути рядом и печатает, совпали ли они.
+
+        Возвращает ``(словарь зондов, целое число спайков за блок)``.
+        """
+        import torch
+
+        both = torch.cat((acc[self._flat], acc.sum().reshape(1)))
+        host = both.detach().cpu().numpy()
+        out = self._from_host(host[:-1].astype(np.float64), block_s)
+        return out, int(host[-1])
 
     def counts(self):
         return {k: (len(v[0]), len(v[1])) for k, v in self._idx.items()}
