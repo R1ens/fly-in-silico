@@ -708,7 +708,12 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     else:
         odour_ref = max((li + ri) / 2.0 * cfg.odour_ref_factor, 1e-9)
     warm = max(5, int(round(3000.0 * cfg.dn_tau_s / cfg.control_ms)))
-    k = math.exp(-dt_s / max(cfg.dn_tau_s, 1e-6))
+    # Постоянной сглаживания здесь больше нет. С этапа 2 фильтр живёт
+    # внутри `motor.Decoder` (`_sm`, `shape.dn_tau_s`), и `k` считался
+    # тут — и перед разогревом, и на каждом шаге цикла — но никуда не
+    # уходил. Это не ускорение (один `math.exp` на шаг управления), а
+    # снятая ловушка: по виду строки читающий решал бы, что τ
+    # применяется здесь.
     mean_i = (li + ri) / 2.0
     stopped = False
     per_probe = {}

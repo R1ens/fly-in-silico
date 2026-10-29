@@ -83,18 +83,31 @@ def patch_classes(coarse=False):
     from flygym_gymnasium.examples.locomotion.turning_controller import (
         HybridTurningController as HTC)
 
+    # Быстрый контроллер — ПОДКЛАСС, и его `step` обёртку на базе не
+    # зовёт. Класс собирается лениво, поэтому его надо собрать тут же,
+    # иначе строка «контроллер: шаг целиком» выйдет пустой, а разложение
+    # — бессмысленным. Поймано замером: первый прогон дал нули.
+    from flybrain import gait as G
+
+    FAST = G.controller_class()
+
     if coarse:
         pairs = [
             (HTC, "step", "контроллер: шаг целиком"),
+            (FAST, "step", "контроллер: шаг целиком"),
             (SingleFlySimulation, "step", "физика: шаг целиком"),
             (SingleFlySimulation, "get_observation",
              "наблюдение ДО шага (контроллер)"),
         ]
         for cls, meth, name in pairs:
-            setattr(cls, meth, timed(name, getattr(cls, meth)))
+            setattr(cls, meth, timed(name, cls.__dict__[meth]))
         return
     pairs = [
         (HTC, "step", "контроллер: шаг целиком"),
+        (FAST, "step", "контроллер: шаг целиком"),
+        (FAST, "_rules_observation", "наблюдение для правил (кэш)"),
+        (FAST, "_phasic", "фазовый множитель (все ноги)"),
+        (FAST, "_joint_angles", "сплайн углов (все ноги)"),
         (HTC, "_retraction_rule_find_leg", "правило втягивания: поиск ноги"),
         (HTC, "_update_persistence_counter", "счётчик удержания"),
         (HTC, "_update_correction_amount", "обновление поправки"),
@@ -109,7 +122,9 @@ def patch_classes(coarse=False):
         (PreprogrammedSteps, "get_adhesion_onoff", "прилипание (на ногу)"),
     ]
     for cls, meth, name in pairs:
-        setattr(cls, meth, timed(name, getattr(cls, meth)))
+        if meth not in cls.__dict__:
+            continue
+        setattr(cls, meth, timed(name, cls.__dict__[meth]))
 
 
 def patch_instance(body, coarse=False):
