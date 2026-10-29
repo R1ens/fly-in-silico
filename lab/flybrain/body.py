@@ -640,16 +640,30 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         return float(oi[ant_l]), float(oi[ant_r])
 
     def drive_brain(left_i, right_i, taste_hz, ref):
-        """Придуманная часть: интенсивность -> частота рецепторов."""
+        """Придуманная часть: интенсивность -> частота рецепторов.
+
+        Частоты ставятся `index_fill_`, а не записью по срезу
+        (`rates[0, idx] = rl`). Разница не в арифметике, а в том, что
+        запись по срезу идёт через `index_put_`: питоновское число
+        сначала становится тензором на хосте и уезжает на устройство
+        отдельной передачей, и эта передача ЖДЁТ. `index_fill_` берёт
+        число скаляром прямо в ядро.
+
+        Значение то же до бита — это тот же float32 в те же позиции, — и
+        это не рассуждение: проба сравнивает `rates` после обеих дорог
+        побайтово (`probe/lifperf_ab.py`, пункт 2). Замерено там же,
+        попарно: три записи стоили 1,2974 мс на шаг управления против
+        0,1944 мс, то есть **в 6,67 раза** (6,22…13,75 по 21 паре).
+        """
         if cfg.swap_antennae:
             left_i, right_i = right_i, left_i
         rl = cfg.orn_max_hz * min(1.0, left_i / ref)
         rr = cfg.orn_max_hz * min(1.0, right_i / ref)
         rates.zero_()
-        rates[0, t_sens["odour_left"]] = rl
-        rates[0, t_sens["odour_right"]] = rr
+        rates.index_fill_(1, t_sens["odour_left"], rl)
+        rates.index_fill_(1, t_sens["odour_right"], rr)
         if taste_hz > 0:
-            rates[0, t_sens["taste"]] = taste_hz
+            rates.index_fill_(1, t_sens["taste"], taste_hz)
         if live is not None:
             # Прямые нейронные стимулы — после сенсорных каналов и после
             # `rates.zero_()`: иначе их стирало бы каждым шагом.

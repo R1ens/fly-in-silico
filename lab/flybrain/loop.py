@@ -288,8 +288,11 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
         drives0 = body.sense(arena, fly)
         mean_orn = (drives0["odour_left"] + drives0["odour_right"]) / 2.0
         rates.zero_()
-        rates[0, sensor_t["odour_left"]] = mean_orn
-        rates[0, sensor_t["odour_right"]] = mean_orn
+        # `index_fill_` вместо записи по срезу: та же величина в те же
+        # позиции, но без передачи питоновского числа на устройство
+        # отдельным ожиданием (см. `body.drive_brain`).
+        rates.index_fill_(1, sensor_t["odour_left"], mean_orn)
+        rates.index_fill_(1, sensor_t["odour_right"], mean_orn)
         bs = block_steps * sim.DT / 1000.0
         k = math.exp(-dt_s / max(body.p.dn_tau_s, 1e-6))
         el = er = None
@@ -353,7 +356,7 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
         for name, t in sensor_t.items():
             r = float(drives[name])
             if r > 0:
-                rates[0, t] = r
+                rates.index_fill_(1, t, r)
 
         acc = torch.zeros(n, dtype=torch.float32, device=device)
         for _ in range(block_steps):
@@ -581,8 +584,8 @@ def lateral_probe(neurons=None, weights=None, device=None, duration_s=10.0,
         left, right = base_hz * (1 + a), base_hz * (1 - a)
         drive[step] = left - right
         rates.zero_()
-        rates[0, tl] = left
-        rates[0, tr] = right
+        rates.index_fill_(1, tl, left)
+        rates.index_fill_(1, tr, right)
 
         acc = torch.zeros(n, device=device)
         for _ in range(block_steps):
