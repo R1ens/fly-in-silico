@@ -48,7 +48,7 @@ OUT = Path(__file__).parent
 DT = 2e-4
 
 
-def build(gait="fast"):
+def build(gait="legacy"):
     from flygym_gymnasium import Fly
     from flygym_gymnasium.arena import OdorArena
     from flygym_gymnasium.preprogrammed import default_leg_sensor_placements
@@ -64,12 +64,30 @@ def build(gait="fast"):
     return G.build(gait=gait, fly=fly, cameras=[], arena=arena, timestep=DT)
 
 
-def episode(every, n_steps, action_of, seed=0):
-    """Прогон, где контроллер считается раз в ``every`` шагов физики."""
+def episode(every, n_steps, action_of, seed=0, compensate=False):
+    """Прогон, где контроллер считается раз в ``every`` шагов физики.
+
+    ``compensate`` — честная версия предложения. Без неё разрежение
+    замедляет и сам генератор ритма: `CPGNetwork.step` интегрирует с
+    собственным `timestep`, и при вызове раз в k шагов фаза идёт в k раз
+    медленнее, то есть походка с 12 Гц падает до 12/k Гц. Это не
+    «реже считать», а «ходить медленнее», и сравнивать такое с эталоном
+    нечестно. При ``compensate`` подгоняются все три собственных времени
+    подсистемы: шаг интегрирования CPG, ставки поправок и срок
+    удержания. Тогда различие — только грубость интегрирования,
+    удержанные целевые углы и реже проверяемые правила.
+    """
     from flygym_gymnasium.simulation import SingleFlySimulation
 
     body = build()
     obs, _ = body.reset(seed=seed)
+    if compensate and every > 1:
+        body.cpg_network.timestep = DT * every
+        body.correction_rates = {
+            k: (v[0] * every, v[1] * every)
+            for k, v in body.correction_rates.items()}
+        body.retraction_persistence_duration /= every
+        body.retraction_persistence_initiation_threshold /= every
     held = None
     track = []
     t0 = time.perf_counter()
@@ -77,9 +95,6 @@ def episode(every, n_steps, action_of, seed=0):
         act = action_of(i)
         if i % every == 0:
             # Полный шаг контроллера: он сам шагнёт физику один раз.
-            # Интегрирование CPG внутри идёт с его собственным
-            # `timestep`, то есть при every>1 фаза отстаёт — это и есть
-            # то самое «реже», которое проверяется.
             obs, _, term, trunc, info = body.step(act)
             held = {"joints": info["joints"], "adhesion": info["adhesion"]}
         else:
@@ -129,12 +144,17 @@ def main():
 
     rep = {"модельное время, с": a.time, "шагов физики": n,
            "шаг физики, с": DT, "раздражители": {}}
+    cases = []
     for name, fn in stimuli.items():
+        for comp in (False, True):
+            cases.append(("%s%s" % (name, ", с подгонкой времён"
+                                    if comp else ", наивно"), fn, comp))
+    for name, fn, comp in cases:
         print("=== %s ===" % name)
         rows = []
         ref = None
         for e in everys:
-            r = episode(e, n, fn)
+            r = episode(e, n, fn, compensate=comp)
             if ref is None:
                 ref = r
             tr, rt = r["_track"], ref["_track"]
