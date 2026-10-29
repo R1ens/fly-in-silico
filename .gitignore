@@ -36,3 +36,14 @@ imgui.ini
 # чтобы не писать в out/ с научными прогонами.
 _out/
 lab/probe/_*_out/
+
+# Отчёты и журналы стенда замера: пересобираются прогоном стенда.
+lab/bench/*.json
+lab/bench/*.log
+lab/bench/gates_codes.txt
+# Дерево-основание для сверки на двух деревьях (motor_equal base).
+lab_base/
+lab_gait/
+lab_mjw/
+lab_lif/
+lab_v2/
