@@ -250,6 +250,45 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
                                  torch.as_tensor(ir, device=device),
                                  len(il), len(ir))
 
+    # --- один съём с устройства на шаг управления ----------------------
+    #
+    # Каждое `float(acc[...])` — это ОЖИДАНИЕ: поток CUDA должен догнать
+    # процессор. Их было три плюс два на каждый зонд, то есть на арене с
+    # зондами больше десятка на шаг управления. Здесь индексы всех
+    # съёмов сцеплены в один вектор, общая сумма приклеена к нему
+    # последним числом, и на шаг управления остаётся ОДНА передача.
+    #
+    # Числа те же до бита, и это не предположение: значения матрицы и
+    # спайки целые, поэтому в `acc` лежат целые числа, а сумма целых
+    # точна и во float32, и во float64 при любом порядке сложения, пока
+    # она меньше 2^24 (`probe/lifperf_mat.py`, пункт 1: максимум суммы
+    # модулей по строке 69 948). Деление дальше идёт в питоновском
+    # float64 ровно как прежде.
+    _take_idx, _take_sl, _at = [], [], 0
+    for _nm, _il, _ir in ([("dn", motor_t["dn_left"], motor_t["dn_right"])]
+                          + [(k, v[0], v[1]) for k, v in probe_t.items()]):
+        _take_idx.append(_il)
+        _take_idx.append(_ir)
+        _take_sl.append((_nm, _at, _at + len(_il),
+                         _at + len(_il) + len(_ir)))
+        _at += len(_il) + len(_ir)
+    _take = (torch.cat(_take_idx) if _take_idx
+             else torch.zeros(0, dtype=torch.int64, device=device))
+
+    def take_all(acc):
+        """Суммы спайков всех съёмов и общая сумма — одной передачей.
+
+        Возвращает ``({имя: (сумма слева, сумма справа)}, всего спайков)``
+        — суммами, без деления: делит вызывающий, своими числами
+        нейронов и своей длительностью блока, ровно как делил прежде.
+        """
+        host = torch.cat((acc[_take], acc.sum().reshape(1))).cpu().numpy()
+        vals = host[:-1].astype(np.float64)
+        out = {}
+        for nm, a, b, c in _take_sl:
+            out[nm] = (float(vals[a:b].sum()), float(vals[b:c].sum()))
+        return out, int(host[-1])
+
     dt_s = config.control_ms / 1000.0
     block_steps = max(1, int(round(config.control_ms / sim.DT)))
     n_steps = int(round(config.duration_s / dt_s))
@@ -288,8 +327,11 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
         drives0 = body.sense(arena, fly)
         mean_orn = (drives0["odour_left"] + drives0["odour_right"]) / 2.0
         rates.zero_()
-        rates[0, sensor_t["odour_left"]] = mean_orn
-        rates[0, sensor_t["odour_right"]] = mean_orn
+        # `index_fill_` вместо записи по срезу: та же величина в те же
+        # позиции, но без передачи питоновского числа на устройство
+        # отдельным ожиданием (см. `body.drive_brain`).
+        rates.index_fill_(1, sensor_t["odour_left"], mean_orn)
+        rates.index_fill_(1, sensor_t["odour_right"], mean_orn)
         bs = block_steps * sim.DT / 1000.0
         k = math.exp(-dt_s / max(body.p.dn_tau_s, 1e-6))
         el = er = None
@@ -298,8 +340,9 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
             acc = torch.zeros(n, device=device)
             for _ in range(block_steps):
                 acc += engine.step(rates)[0]
-            bl = float(acc[motor_t["dn_left"]].sum()) / (len(motor_idx["dn_left"]) * bs)
-            br = float(acc[motor_t["dn_right"]].sum()) / (len(motor_idx["dn_right"]) * bs)
+            _sums, _ = take_all(acc)
+            bl = _sums["dn"][0] / (len(motor_idx["dn_left"]) * bs)
+            br = _sums["dn"][1] / (len(motor_idx["dn_right"]) * bs)
             tot += (bl + br) / 2
             # Mirror the loop's own low-pass, otherwise the sigma measured here
             # is the raw per-block noise and the gain comes out far too high.
@@ -353,7 +396,7 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
         for name, t in sensor_t.items():
             r = float(drives[name])
             if r > 0:
-                rates[0, t] = r
+                rates.index_fill_(1, t, r)
 
         acc = torch.zeros(n, dtype=torch.float32, device=device)
         for _ in range(block_steps):
@@ -366,8 +409,11 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
         counts += acc.to(torch.int64)
 
         block_s = block_steps * sim.DT / 1000.0
-        dn_l = float(acc[motor_t["dn_left"]].sum()) / (len(motor_idx["dn_left"]) * block_s)
-        dn_r = float(acc[motor_t["dn_right"]].sum()) / (len(motor_idx["dn_right"]) * block_s)
+        # Один съём на весь шаг: сюда уже входят и зонды, и общая сумма
+        # спайков, которая прежде стоила отдельного ожидания.
+        sums, spikes_total = take_all(acc)
+        dn_l = sums["dn"][0] / (len(motor_idx["dn_left"]) * block_s)
+        dn_r = sums["dn"][1] / (len(motor_idx["dn_right"]) * block_s)
 
         gx, gy = arena.gradient(fly.x, fly.y)
         gnorm = math.hypot(gx, gy)
@@ -401,11 +447,11 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
             "eaten": int(fly.eaten),
             "bounced": bool(bounced),
             "food_dist": round(arena.nearest_food_distance(fly.x, fly.y), 2),
-            "spikes": int(acc.sum()),
+            "spikes": spikes_total,
         }
         for name, (il, ir, nl, nr) in probe_t.items():
-            rec[f"p_{name}_l"] = round(float(acc[il].sum()) / (nl * block_s), 3)
-            rec[f"p_{name}_r"] = round(float(acc[ir].sum()) / (nr * block_s), 3)
+            rec[f"p_{name}_l"] = round(sums[name][0] / (nl * block_s), 3)
+            rec[f"p_{name}_r"] = round(sums[name][1] / (nr * block_s), 3)
         records.append(rec)
 
         if config.comment and t_ms >= next_comment:
@@ -581,8 +627,8 @@ def lateral_probe(neurons=None, weights=None, device=None, duration_s=10.0,
         left, right = base_hz * (1 + a), base_hz * (1 - a)
         drive[step] = left - right
         rates.zero_()
-        rates[0, tl] = left
-        rates[0, tr] = right
+        rates.index_fill_(1, tl, left)
+        rates.index_fill_(1, tr, right)
 
         acc = torch.zeros(n, device=device)
         for _ in range(block_steps):
