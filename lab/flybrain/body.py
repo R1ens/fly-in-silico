@@ -202,9 +202,13 @@ class BodyConfig:
     # наблюдение целиком: `HybridTurningController.step` зовёт
     # `get_observation` на том же состоянии, которое уже посчитал
     # `post_step` предыдущего шага физики.
+    # `fast_gain` — фазовый множитель поправки считается тем же
+    # выражением, что `scipy.interpolate.interp1d` с линейным ядром, но
+    # без её обвязки: по пяти узлам, шесть раз на шаг физики.
     acc_forward: bool = True
     fast_obs: bool = True
     rule_obs: bool = True
+    fast_gain: bool = True
 
     # --- сеанс песочницы ---
     #
@@ -375,6 +379,100 @@ def _fly_class(fast, fast_obs=False, acc_forward=False):
 
 
 _EMPTY_SENSORDATA = np.empty(0)
+
+
+class _LinearGain:
+    """Линейная интерполяция по пяти узлам — та же, что у scipy, но без
+    её обвязки.
+
+    Откуда она берётся. `HybridTurningController` держит на каждую ногу
+    `interp1d(step_points, increment_vals, kind="linear",
+    fill_value="extrapolate")` — фазовый множитель поправки — и зовёт её
+    по разу на ногу на каждый шаг физики, то есть шесть раз. Узлов там
+    пять, а вызов стоит около 15 мкс: `_prepare_x`, `_asarray_validated`,
+    `searchsorted` по массиву из пяти чисел, широковещательное умножение
+    и `_finish_y` с переформированием.
+
+    Здесь считается ровно то же выражение, что в
+    `scipy.interpolate._interpolate.interp1d._call_linear`:
+
+        y = ((x - x_lo)/(x_hi - x_lo)) * y_hi
+          + ((x_hi - x)/(x_hi - x_lo)) * y_lo
+
+    с тем же выбором отрезка (`searchsorted` слева, затем зажим в
+    `1 … n-1`, как делает сам scipy «чтобы не промахнуться на
+    `x == x[0]`»). Арифметика — обычные числа Python, то есть те же
+    двойной точности IEEE и в том же порядке, поэтому совпадение
+    побитовое, а не близкое. `bisect_left` по списку из пяти чисел
+    отвечает то же, что `np.searchsorted(..., side="left")`.
+
+    Ставится только на тот самый случай: `kind="linear"` плюс
+    `fill_value="extrapolate"`. Это видно по тому, какой `_call` scipy
+    выбрал при сборке (`_call_linear`, а не `_call_linear_np`), и
+    проверяется, а не предполагается — у `np.interp` краевые значения
+    другие.
+    """
+
+    __slots__ = ("xs", "ys", "last")
+
+    def __init__(self, src):
+        self.xs = np.asarray(src.x, dtype=np.float64).reshape(-1).tolist()
+        self.ys = np.asarray(src._y, dtype=np.float64).reshape(-1).tolist()
+        self.last = len(self.xs) - 1
+        if self.last < 1 or len(self.ys) != len(self.xs):
+            raise ValueError("узлов меньше двух или длины не совпали")
+
+    @staticmethod
+    def suitable(src):
+        """Тот ли это случай. `interp1d` с `fill_value="extrapolate"` и
+        `kind="linear"` ставит `_call = _call_linear`; при любом другом
+        наборе там стоит что-то ещё, и подменять нельзя."""
+        try:
+            return (getattr(src, "_kind", None) == "linear"
+                    and getattr(src, "_call", None)
+                    is type(src)._call_linear
+                    and np.asarray(src.x).ndim == 1
+                    and np.asarray(src._y).reshape(-1).size
+                    == np.asarray(src.x).size)
+        except Exception:
+            return False
+
+    def __call__(self, x_new):
+        from bisect import bisect_left
+
+        x = x_new if type(x_new) is float else float(x_new)
+        xs, ys = self.xs, self.ys
+        i = bisect_left(xs, x)
+        if i < 1:
+            i = 1
+        elif i > self.last:
+            i = self.last
+        x_lo = xs[i - 1]
+        x_hi = xs[i]
+        d = x_hi - x_lo
+        return ((x - x_lo) / d) * ys[i] + ((x_hi - x) / d) * ys[i - 1]
+
+
+def _install_fast_gain(sim):
+    """Заменить фазовые множители контроллера на :class:`_LinearGain`.
+
+    Подменяются значения в словаре `sim.phasic_multiplier`, то есть ни
+    одной строки апстрима переписывать не надо. Не подошедшие (если
+    FlyGym когда-нибудь соберёт их иначе) остаются как были.
+    """
+    gains = getattr(sim, "phasic_multiplier", None)
+    if not isinstance(gains, dict):
+        return 0
+    done = 0
+    for leg, src in list(gains.items()):
+        if isinstance(src, _LinearGain) or not _LinearGain.suitable(src):
+            continue
+        try:
+            gains[leg] = _LinearGain(src)
+        except ValueError:
+            continue
+        done += 1
+    return done
 
 
 def _mark_ctrl_only_dirty(physics):
@@ -906,6 +1004,8 @@ def _build_body(cfg: BodyConfig, sources, video_path=None, head_stab=None):
     want_acc = acc_forward and not getattr(cfg, "fast_physics", False)
     if want_acc or bool(getattr(cfg, "fast_obs", True)):
         _install_acc_only_forward(sim.physics, acc_forward=want_acc)
+    if bool(getattr(cfg, "fast_gain", True)):
+        _install_fast_gain(sim)
     return sim, cams
 
 
@@ -1553,6 +1653,8 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                 bool(getattr(cfg, "acc_forward", True)),
             "дешёвое наблюдение": bool(getattr(cfg, "fast_obs", True)),
             "наблюдение правил": bool(getattr(cfg, "rule_obs", True)),
+            "фазовый множитель без scipy":
+                bool(getattr(cfg, "fast_gain", True)),
         },
     }
     accfwd = getattr(getattr(body, "physics", None), "_fb_accfwd", None)

@@ -16,6 +16,10 @@
   стоит шаг без обвязки.
 
     cd D:\\fly-brain\\lab && ..\\.venv\\Scripts\\python.exe probe\\mj_profile.py
+    ..\\.venv\\Scripts\\python.exe probe\\mj_profile.py --быстро
+
+Без ключа мерится ПРЕЖНЯЯ дорога (ручки обвязки в `BodyConfig`
+выключены) — это и есть базовая линия; с ключом `--быстро` — с правками.
 """
 
 import cProfile
@@ -37,10 +41,15 @@ N_PHYS = 100         # шагов физики на шаг управления 
 WARM = 2             # шагов управления на разогрев, в среднее не идут
 
 
+FAST = "--быстро" in sys.argv     # с правками обвязки; без него — прежняя
+
+
 def build():
     from flybrain import body as B
 
-    cfg = B.BodyConfig(duration_s=1.0, control_ms=20.0, seed=0)
+    cfg = B.BodyConfig(duration_s=1.0, control_ms=20.0, seed=0,
+                       acc_forward=FAST, fast_obs=FAST, rule_obs=FAST,
+                       fast_gain=FAST)
     sources = B.DEFAULT_SOURCES
     body, _ = B._build_body(cfg, sources, None, head_stab=None)
     obs, _ = body.reset(seed=cfg.seed)
@@ -233,9 +242,11 @@ def main():
               % (r["своё, мс"], r["с вложенными, мс"], r["вызовов"], r["имя"]))
 
     body.close()
-    (OUT / "mj_profile.json").write_text(
+    rep["правки обвязки включены"] = FAST
+    name = "mj_profile_fast.json" if FAST else "mj_profile.json"
+    (OUT / name).write_text(
         json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
-    print("\nотчёт: probe/mj_profile.json")
+    print("\nотчёт: probe/" + name)
     return 0
 
 

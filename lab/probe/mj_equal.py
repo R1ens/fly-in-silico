@@ -245,6 +245,43 @@ def main():
                                                 cnt["правил"], n))
     sim.close()
 
+    # ------------------------------------- 5. фазовый множитель против scipy
+    # Сравнение не на тех фазах, которые случились, а на густой сетке:
+    # так видно и края отрезков, и узлы, и экстраполяцию за 2π.
+    cfg_ref = B.BodyConfig(duration_s=1.0, seed=0, fast_gain=False)
+    ref, _ = B._build_body(cfg_ref, B.DEFAULT_SOURCES, None, head_stab=None)
+    cfg_fast = B.BodyConfig(duration_s=1.0, seed=0, fast_gain=True)
+    fst, _ = B._build_body(cfg_fast, B.DEFAULT_SOURCES, None, head_stab=None)
+    legs = list(ref.phasic_multiplier)
+    подменено = sum(1 for lg in legs
+                    if isinstance(fst.phasic_multiplier[lg], B._LinearGain))
+    check("фазовый множитель подменён на всех ногах",
+          подменено == len(legs) and len(legs) == 6,
+          "%d из %d" % (подменено, len(legs)))
+    grid = np.concatenate((
+        np.linspace(-0.5, 2 * np.pi + 0.5, 200001),
+        np.asarray(ref.phasic_multiplier[legs[0]].x, float),
+        np.asarray(ref.phasic_multiplier[legs[-1]].x, float)))
+    worst_gain, n_gain = {}, 0
+    for lg in legs:
+        a_fn, b_fn = ref.phasic_multiplier[lg], fst.phasic_multiplier[lg]
+        for x in grid.tolist():
+            va = float(a_fn(x))
+            vb = float(b_fn(x))
+            n_gain += 1
+            if va.hex() != vb.hex():
+                worst_gain[lg] = max(worst_gain.get(lg, 0.0), abs(va - vb))
+    rep["точек фазового множителя сравнено"] = n_gain
+    rep["расхождения фазового множителя"] = worst_gain
+    check("фазовый множитель = scipy, побитово", not worst_gain,
+          "%d точек на %d ног%s" % (n_gain, len(legs),
+                                    "" if not worst_gain
+                                    else ", разошлись: "
+                                    + json.dumps(worst_gain,
+                                                 ensure_ascii=False)))
+    ref.close()
+    fst.close()
+
     (OUT / "mj_equal.json").write_text(
         json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
     print("\nпроверок %d, провалов %d" % (len(rep["проверки"]), len(fails)))
