@@ -42,7 +42,12 @@ WHO = {
     "поза и углы (scipy Rotation)": "`obs['fly'][0]` — `body._pose` и "
                                     "правило втягивания; `last_obs['rot']` "
                                     "— камера видео (YawOnlyCamera)",
-    "силы контактов и прилипание": "правило спотыкания контроллера",
+    "силы контактов: именованная выборка cfrc_ext":
+        "правило спотыкания контроллера (и `last_obs` для видео)",
+    "силы контактов: перебор контактов MuJoCo":
+        "правило спотыкания: поправка на прилипание",
+    "силы контактов: вычет силы прилипания":
+        "правило спотыкания: поправка на прилипание",
     "положения контактов": "только отрисовка контактов в видео "
                            "(`draw_contacts`), выключена",
     "концы ног": "правило втягивания контроллера",
@@ -102,6 +107,8 @@ def timed_observation(fly, sim):
     t = tic()
     contact_forces = physics.named.data.cfrc_ext[
         fly.contact_sensor_placements][:, 3:].copy()
+    add("силы контактов: именованная выборка cfrc_ext", tic() - t)
+    t = tic()
     if fly.enable_adhesion:
         contactid_normal = {}
         fly._active_adhesion = np.zeros(fly.n_legs, dtype=bool)
@@ -118,6 +125,8 @@ def timed_observation(fly, sim):
                 contactid_normal.setdefault(csid, []).append(
                     contact.frame[:3])
                 fly._active_adhesion[id_] = True
+        add("силы контактов: перебор контактов MuJoCo", tic() - t)
+        t = tic()
         for csid, normal in contactid_normal.items():
             aid = fly._adhesion_bodies_with_contact_sensors == csid
             if fly._last_adhesion[aid] > 0:
@@ -125,7 +134,7 @@ def timed_observation(fly, sim):
                     normal = np.mean(normal, axis=0)
                 contact_forces[csid, :] -= fly.adhesion_force * normal
     fly.last_obs["contact_forces"] = contact_forces
-    add("силы контактов и прилипание", tic() - t)
+    add("силы контактов: вычет силы прилипания", tic() - t)
 
     t = tic()
     fly.last_obs["contact_pos"] = (
