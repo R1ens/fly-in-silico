@@ -663,6 +663,31 @@ MuJoCo, калибровка, накопитель сглаживания, ук�
 | `5097bbf` | Защёлка по номеру состояния и условие на `last_obs["contact_pos"]` (разбор переданного из ветки контроллера, §2.5) |
 | этот | `MUJOCO_PERF.md` |
 
+Как переснять всё это:
+
+```
+cd D:\fly-brain\lab
+..\.venv\Scripts\python.exe probe\mj_profile.py              # прежняя дорога
+..\.venv\Scripts\python.exe probe\mj_profile.py --быстро     # с правками
+..\.venv\Scripts\python.exe probe\mj_obs_parts.py
+..\.venv\Scripts\python.exe probe\mj_bench.py                # или --только тело
+..\.venv\Scripts\python.exe probe\mj_equal.py
+..\.venv\Scripts\python.exe probe\body_equal.py
+..\.venv\Scripts\python.exe probe\resume_state.py --part body --tail 150
+```
+
+Две ловушки рабочего дерева git, на которые я наступил, чтобы не
+наступал следующий. Первая: `upstream/` и `cache/` лежат только в
+основном дереве (они в `.gitignore`), и в рабочем дереве `data.py`
+ищет их рядом с собой — то есть любая проба, которой нужен коннектом,
+падает с `FileNotFoundError` на `2025_Completeness_783.csv`. Лечится
+соединениями каталогов:
+`mklink /J <рабочее дерево>\cache D:\fly-brain\cache` и то же для
+`upstream`. Вторая: `probe/motor_equal.py base` ждёт дерево `lab_base`
+рядом с `lab`; оно разворачивается
+`git archive <базовый коммит> lab | tar -x -C lab_base --strip-components=1`
+и в историю не кладётся.
+
 Тронут один файл научного кода — `lab/flybrain/body.py`. Ни `RunSpec`, ни
 командная строка не менялись: четыре новых поля живут только в
 `BodyConfig`, как уже живут там `fast_physics` и `grad_ref`, и в
