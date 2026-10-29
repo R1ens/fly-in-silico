@@ -43,3 +43,7 @@ lab/bench/*.log
 lab/bench/gates_codes.txt
 # Дерево-основание для сверки на двух деревьях (motor_equal base).
 lab_base/
+lab_gait/
+lab_mjw/
+lab_lif/
+lab_v2/
