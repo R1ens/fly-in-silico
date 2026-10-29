@@ -183,10 +183,8 @@ def main():
     print("куски наблюдения, мкс на вызов:")
     for k, v in parts.items():
         print("  %-52s %8.1f" % (k, v))
-    print("\nсовпадение значений:", json.dumps(rep["значения совпали"],
-                                               ensure_ascii=False))
-    s = sum(v for k, v in parts.items()
-            if k[0] in "12345678" and "a " not in k and not k[1].isalpha())
+    print("\nсовпадение значений: "
+          + json.dumps(rep["значения совпали"], ensure_ascii=False))
     sim.close()
     (OUT / "mj_obs_parts.json").write_text(
         json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")

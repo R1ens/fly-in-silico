@@ -44,6 +44,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from bisect import bisect_left as _bisect_left
 from dataclasses import dataclass, asdict, field, fields
 from pathlib import Path
 
@@ -438,11 +439,9 @@ class _LinearGain:
             return False
 
     def __call__(self, x_new):
-        from bisect import bisect_left
-
         x = x_new if type(x_new) is float else float(x_new)
         xs, ys = self.xs, self.ys
-        i = bisect_left(xs, x)
+        i = _bisect_left(xs, x)
         if i < 1:
             i = 1
         elif i > self.last:
@@ -617,6 +616,7 @@ def _fast_obs_mixin():
         # `_sim_class` на время `HybridTurningController.step`, снимает
         # первое же чтение наблюдения — то самое, повторное.
         _fb_rule_stage = False
+        _fb_rule_epoch = -2
         # Запомненные контактные силы и номер состояния, на котором они
         # посчитаны. `-1` — «ещё ничего не считали».
         _fb_cf = None
@@ -798,9 +798,15 @@ def _fast_obs_mixin():
                 # Съём для правил походки: он повторный и ему нужны
                 # четыре поля из семи. Отметка одноразовая — следующее
                 # чтение в этом же шаге (из `post_step`) получит полное
-                # наблюдение, то, которое уезжает наружу.
+                # наблюдение, то, которое уезжает наружу. И вторая
+                # защёлка: номер состояния должен быть тем же, что при
+                # постановке отметки. После `physics.step` он другой,
+                # поэтому `post_step` сокращённого наблюдения не
+                # получит ни при каком порядке вызовов.
                 self._fb_rule_stage = False
-                return self.rule_observation(sim)
+                st = getattr(sim.physics, "_fb_accfwd", None)
+                if st is not None and st["эпоха"] == self._fb_rule_epoch:
+                    return self.rule_observation(sim)
             physics = sim.physics
             if not self._fb_ready:
                 self._fb_prepare(physics)
@@ -839,8 +845,19 @@ def _fast_obs_mixin():
 
             contact_forces = self._fb_contact_forces(physics)
             self.last_obs["contact_forces"] = contact_forces
-            self.last_obs["contact_pos"] = \
-                physics.data.xpos[self._fb_body_ids].copy().T
+            # `last_obs["contact_pos"]` читает РОВНО один потребитель —
+            # `Camera._draw_contacts`, и только при `draw_contacts`. В
+            # апстриме условие даже написано, но закомментировано
+            # (`fly.py`: «if draw contacts same last contact forces and
+            # positions»). Здесь оно восстановлено и спрашивается у
+            # настоящих камер, а не задано числом: если рисование
+            # контактов включат, положения снова будут считаться.
+            # `last_obs["rot"]`/`["pos"]` так НЕ закрыты: их читает
+            # `Camera._update_camera` на каждом кадре.
+            if any(getattr(c, "draw_contacts", False)
+                   for c in getattr(sim, "cameras", ())):
+                self.last_obs["contact_pos"] = \
+                    physics.data.xpos[self._fb_body_ids].copy().T
 
             ee_pos = self._fb_sd_read("ee").reshape((self.n_legs, 3))
             orientation_vec = self._fb_sd_read("body4")
@@ -936,9 +953,29 @@ def _sim_class(rule_obs):
 
         def step(self, action):
             fly = self.fly
-            if not hasattr(fly, "rule_observation"):
+            if not hasattr(fly, "rule_observation") \
+                    or getattr(fly, "enable_vision", False):
+                # Со зрением сокращать нельзя. `Fly.get_observation`
+                # зовёт `_update_vision(sim)`, а тот ведёт
+                # `_last_vision_update_time` — то есть у повторного съёма
+                # есть последствие, и выбросить его значит изменить
+                # расписание обновления зрения. В этой сборке зрение
+                # выключено, но проверяется это, а не предполагается.
+                return super().step(action)
+            # Отметка привязывается к НОМЕРУ СОСТОЯНИЯ, а не только к
+            # дынамическому отрезку `step`. Причина названа, а не
+            # придумана: съём правил стоит в апстриме ПЕРЕД
+            # `physics.step()`, а `post_step` — после, и после шага номер
+            # состояния уже другой. Поэтому сокращённое наблюдение не
+            # может достаться `post_step`, даже если порядок вызовов в
+            # апстриме (или в чьей-нибудь замене `step`) изменится и
+            # съёма правил не случится вовсе. Публичное наблюдение так
+            # защищено устройством, а не тем, что мы угадали порядок.
+            st = getattr(self.physics, "_fb_accfwd", None)
+            if st is None:
                 return super().step(action)
             fly._fb_rule_stage = True
+            fly._fb_rule_epoch = st["эпоха"]
             try:
                 return super().step(action)
             finally:

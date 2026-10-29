@@ -80,6 +80,12 @@ def data_arrays(d):
 
 
 
+def physics_xpos(fly, sim):
+    """`last_obs["contact_pos"]` по прежней, именованной дороге."""
+    return np.ascontiguousarray(
+        sim.physics.named.data.xpos[fly.contact_sensor_placements].copy().T)
+
+
 def main():
     import mujoco
     from flygym_gymnasium import Fly as PlainFly
@@ -174,14 +180,40 @@ def main():
     sim, _ = B._build_body(cfg, B.DEFAULT_SOURCES, None, head_stab=None)
     sim.reset(seed=0)
     fly = sim.fly
-    bad_obs, bad_rule = {}, {}
+    bad_obs, bad_rule, bad_last = {}, {}, {}
     n_cmp = 0
     for k in range(N_STEPS):
         sim.step(action)
         fast = fly.get_observation(sim)
+        last_fast = {kk: (None if vv is None else np.array(vv, copy=True))
+                     for kk, vv in fly.last_obs.items()}
         plain = PlainFly.get_observation(fly, sim)
+        last_plain = {kk: (None if vv is None else np.array(vv, copy=True))
+                      for kk, vv in fly.last_obs.items()}
         rule = fly.rule_observation(sim)
         n_cmp += 1
+        # `last_obs` — не часть наблюдения, но его читают камеры, и
+        # сверять его надо отдельно. `rot` и `pos` нужны камере на каждом
+        # кадре, `contact_forces` и `contact_pos` — только рисованию
+        # контактов, и `contact_pos` дешёвая дорога нарочно не обновляет,
+        # когда его никто не рисует.
+        for kk in ("rot", "pos", "contact_forces"):
+            a_, b_ = last_fast.get(kk), last_plain.get(kk)
+            if a_ is None or b_ is None or a_.shape != b_.shape \
+                    or a_.dtype != b_.dtype or a_.tobytes() != b_.tobytes():
+                bad_last[kk] = bad_last.get(kk, 0) + 1
+        want_pos = any(getattr(c, "draw_contacts", False)
+                       for c in getattr(sim, "cameras", ()))
+        got_pos = np.asarray(last_plain.get("contact_pos"))
+        mine = physics_xpos(fly, sim)
+        if got_pos.shape != mine.shape or got_pos.tobytes() != mine.tobytes():
+            bad_last["contact_pos: формула"] = \
+                bad_last.get("contact_pos: формула", 0) + 1
+        if want_pos:
+            a_ = np.asarray(last_fast.get("contact_pos"))
+            if a_.shape != got_pos.shape or a_.tobytes() != got_pos.tobytes():
+                bad_last["contact_pos: при рисовании"] = \
+                    bad_last.get("contact_pos: при рисовании", 0) + 1
         for key in plain:
             fa = np.ascontiguousarray(fast[key])
             pl = np.ascontiguousarray(plain[key])
@@ -210,6 +242,14 @@ def main():
     if bad_rule:
         rep["разошлись поля правил"] = bad_rule
         print("     разошлись:", bad_rule)
+    rep["разошлись поля last_obs"] = bad_last
+    check("last_obs: rot, pos и contact_forces = прежним, побайтово; "
+          "contact_pos по той же формуле", not bad_last,
+          "%d шагов, камер с рисованием контактов: %d"
+          % (n_cmp, sum(1 for c in getattr(sim, "cameras", ())
+                        if getattr(c, "draw_contacts", False))))
+    if bad_last:
+        print("     разошлись:", bad_last)
     rep["шагов сравнено (наблюдения)"] = n_cmp
     sim.close()
 
