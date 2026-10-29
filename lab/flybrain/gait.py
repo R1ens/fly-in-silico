@@ -83,14 +83,26 @@ def _base():
 
 
 def build(**kwargs):
-    """Собрать контроллер: ``gait="fast"`` — здешний, иначе стоковый."""
+    """Собрать контроллер: ``gait="fast"`` — здешний, иначе стоковый.
+
+    ``base`` — чем заменить стоковый ``HybridTurningController``
+    на дороге ``legacy``. Затем, чтобы собирать контроллер
+    было одно место: `body.py` даёт сюда свой подкласс с
+    сокращённым наблюдением для правил. На дороге ``fast``
+    ``base`` не принимается вовсе: здешний шаг не зовёт
+    ``super().get_observation()``, и сокращать там нечего —
+    подсунутая база молча ничего бы не делала.
+    """
     gait = kwargs.pop("gait", "fast")
     reuse_obs = kwargs.pop("reuse_obs", True)
+    base = kwargs.pop("base", None)
     if gait == "legacy":
-        return _base()(**kwargs)
+        return (base or _base())(**kwargs)
     if gait != "fast":
         raise ValueError("gait должен быть 'fast' или 'legacy', а не %r"
                          % (gait,))
+    if base is not None:
+        raise ValueError("base применим только к gait='legacy'")
     return controller_class()(reuse_obs=reuse_obs, **kwargs)
 
 
