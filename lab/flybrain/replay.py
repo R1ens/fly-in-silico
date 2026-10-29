@@ -646,6 +646,14 @@ def restore_body(state, controller, engine, drop=(), allow_incomplete=False):
         done = engine.restore(state.arrays.get("engine") or {}, drop=want)
     engine.calls = 0
 
+    # Быстрый контроллер походки (`flybrain.gait`) переиспользует
+    # наблюдение прошлого шага — оно относится к состоянию ДО этой
+    # установки, и после `mj_setState` его надо забыть. Молча оставить
+    # нельзя: продолжение считало бы первое правило по чужой позе.
+    inval = getattr(controller, "invalidate_observation", None)
+    if inval is not None:
+        inval()
+
     mj = state.arrays.get("mujoco") or {}
     if "mujoco" not in want and "mj_state" in mj:
         phys = controller.physics

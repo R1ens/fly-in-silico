@@ -613,6 +613,14 @@ class BodyLive:
             self.start = dict(self.apply(self.initial, initial=True))
         self.start.setdefault("sources", self._read_sources())
         self.start.setdefault("odour_ref", getattr(cfg, "odour_ref", None))
+        # Исходные условия двигают маркеры источника прямо в `mjData`, мимо
+        # биндинга dm_control, то есть не помечая состояние грязным.
+        # Быстрый контроллер походки (`flybrain.gait`) переиспользует
+        # наблюдение прошлого шага, и после правки состояния его надо
+        # забыть, а не полагаться на то, что правка «вроде бы не про ноги».
+        inval = getattr(body, "invalidate_observation", None)
+        if inval is not None:
+            inval()
 
     def _marker_rows(self):
         """Строки `mocap_pos` и геометрия маркеров — по имени, не по счёту.
@@ -1135,3 +1143,10 @@ class BodyLive:
         ar._odor_source_repeated = np.repeat(rep, ar.num_sensors, axis=2)
         pk = ar.peak_odor_intensity[:, :, np.newaxis]
         ar._peak_intensity_repeated = np.repeat(pk, ar.num_sensors, axis=2)
+        # Маркеры и кэши арены правлены мимо биндинга dm_control, то есть
+        # состояние не помечено грязным. Наблюдение прошлого шага,
+        # которое держит быстрый контроллер походки (`flybrain.gait`),
+        # после этого не переиспользуется.
+        inval = getattr(self.body, "invalidate_observation", None)
+        if inval is not None:
+            inval()
