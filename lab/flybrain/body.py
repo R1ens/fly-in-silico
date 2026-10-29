@@ -179,6 +179,33 @@ class BodyConfig:
     # пока равенство не доказано на этой модели: см. `_fly_class`.
     fast_physics: bool = False
 
+    # --- съём обвязки вокруг шага MuJoCo ---
+    #
+    # Три правки, и у каждой своя ручка — не чтобы выбирать режим, а
+    # чтобы у каждой был ВСТРЕЧНЫЙ ЗАМЕР в одном процессе. Все три
+    # сохраняют значения побитово (разбор — в `MUJOCO_PERF.md`), поэтому
+    # по умолчанию включены; выключенные дают прежнюю дорогу шаг в шаг.
+    #
+    # `acc_forward` — повторный расчёт прямой динамики считается только с
+    # ступени ускорений (`mj_forwardSkip`), потому что позиционную и
+    # скоростную ступени на том же состоянии уже посчитал `mj_step1` в
+    # конце `Physics.step`. Это НЕ `fast_physics`: пересчёт не
+    # пропускается, у него убран заведомо повторный кусок.
+    #
+    # `fast_obs` — наблюдение читает `data.sensordata`, `cfrc_ext` и
+    # `xpos` по целым индексам вместо именованной индексации dm_control,
+    # а поправка на прилипание считается без питоновского цикла по
+    # контактам.
+    #
+    # `rule_obs` — правила походки (втягивание и спотыкание) получают
+    # только те четыре поля наблюдения, которые читают, а не всё
+    # наблюдение целиком: `HybridTurningController.step` зовёт
+    # `get_observation` на том же состоянии, которое уже посчитал
+    # `post_step` предыдущего шага физики.
+    acc_forward: bool = True
+    fast_obs: bool = True
+    rule_obs: bool = True
+
     # --- сеанс песочницы ---
     #
     # `duration_s <= 0` — сеанс без заранее заданного конца: его
@@ -258,8 +285,14 @@ class EmbodiedRun:
         return out
 
 
-def _fly_class(fast):
+def _fly_class(fast, fast_obs=False, acc_forward=False):
     """Муха FlyGym, при `fast` — без лишнего пересчёта прямой динамики.
+
+    ``fast_obs`` — наблюдение считается дешёвой дорогой (значения те же,
+    см. :func:`_fast_obs_mixin`). ``acc_forward`` — `pre_step` отмечает,
+    что написан только `ctrl`, чтобы пересчёт пошёл со ступени ускорений
+    (см. :func:`_install_acc_only_forward`). При включённом `fast`
+    отметка не нужна: пересчёта там не будет вовсе.
 
     Откуда берётся лишний пересчёт. `Fly.pre_step` пишет управляющие
     сигналы через `physics.bind(...).ctrl`, а dm_control считает `ctrl`
@@ -294,24 +327,526 @@ def _fly_class(fast):
     выключенным, а включённый помечает прогон оговоркой в `timing`, чтобы
     такой эпизод нельзя было сравнить с эталонным молча.
     """
+    from flygym_gymnasium import Fly as _Fly
+
+    Fly = _fast_obs_mixin() if fast_obs else _Fly
+
+    if fast:
+        class _FlyNoReforward(Fly):
+            """То же, но без пересчёта ради снятия флага."""
+
+            def pre_step(self, action, sim):
+                was = sim.physics.is_dirty
+                super().pre_step(action, sim)
+                if not was:
+                    # Мы написали только `ctrl`. Ничего производного от
+                    # него до следующего `mj_step` не читается, а
+                    # `mj_step` всё пересчитает сам.
+                    sim.physics._dirty = False
+
+        return _FlyNoReforward
+
+    if acc_forward:
+        class _FlyAccForward(Fly):
+            """То же, но с отметкой «написан только `ctrl`»."""
+
+            def pre_step(self, action, sim):
+                was = sim.physics.is_dirty
+                super().pre_step(action, sim)
+                if not was and sim.physics.is_dirty:
+                    _mark_ctrl_only_dirty(sim.physics)
+
+        return _FlyAccForward
+
+    return Fly
+
+
+# ------------------------------------------------------------------ обвязка
+#
+# Три правки ниже снимают обвязку вокруг шага MuJoCo, не трогая ни одного
+# числа. Основание у всех трёх одно и то же: `HybridTurningController`
+# зовёт на один шаг физики `mj_step2` + `mj_step1` + `mj_forward` и ДВА
+# полных наблюдения, и часть этой работы доказуемо повторная.
+#
+# Замер обвязки (`probe/mj_profile.py`, та же модель): шаг физики стоит
+# 2,7–3,1 мс, из них в самом MuJoCo — 1,20 мс
+# (`mj_step2` + `mj_step1` + `mj_forward`), остальное — Python и
+# dm_control.
+
+
+_EMPTY_SENSORDATA = np.empty(0)
+
+
+def _mark_ctrl_only_dirty(physics):
+    """Отметить, что с прошлой синхронизации написан только ``ctrl``.
+
+    Зовётся из `pre_step` нашей мухи сразу после записи управляющих
+    сигналов. `ctrl` влияет только на ступень УСКОРЕНИЙ прямой динамики
+    (`mj_fwdActuation`), поэтому позиционная и скоростная ступени
+    остаются верными — и именно это даёт право считать пересчёт с
+    середины.
+    """
+    st = getattr(physics, "_fb_accfwd", None)
+    if st is not None:
+        st["ctrl_only"] = True
+
+
+def _install_acc_only_forward(physics, acc_forward=True):
+    """Повторный расчёт прямой динамики — только со ступени ускорений.
+
+    Что тут происходит на самом деле. `Fly.pre_step` пишет `ctrl` через
+    биндинг dm_control, тот помечает состояние «грязным», и первое же
+    чтение наблюдений в `post_step` зовёт `physics.forward()`, то есть
+    полный `mj_forward`. Но `Physics.step` в dm_control работает в
+    «legacy» режиме и заканчивается `mj_step1` — а `mj_step1` это ровно
+    `mj_fwdPosition` + `mj_sensorPos` + `mj_energyPos` + `mj_fwdVelocity`
+    + `mj_sensorVel` + `mj_energyVel` на том же `qpos`/`qvel`. Значит
+    полный `mj_forward` пересчитывает две первые ступени второй раз,
+    включая самое дорогое — обнаружение столкновений (`mj_collision`) и
+    сборку ограничений.
+
+    `mj_forwardSkip(m, d, mjSTAGE_VEL, 0)` — это тот же `mj_forward` без
+    двух первых ступеней: это документированная ручка MuJoCo ровно для
+    такого случая. Ступень ускорений (`mj_fwdActuation`,
+    `mj_fwdAcceleration`, `mj_fwdConstraint`, `mj_sensorAcc`) считается
+    полностью, то есть ни один из 179 сенсоров не остаётся устаревшим.
+
+    **Чем это отличается от отклонённого `fast_physics`.** Тот
+    пропускал пересчёт целиком, и сенсоры ступени ускорений (силы,
+    моменты, `cfrc_ext`) оставались с прошлого шага — траектория
+    разъехалась уже на втором шаге управления (`SPEED.md` §3). Здесь
+    ступень ускорений считается, а выброшено только то, что `mj_step1`
+    уже посчитал на этом же состоянии. Значения совпадают побитово.
+
+    Замер на той же модели: `mj_forward` 552 мкс,
+    `mj_forwardSkip(STAGE_VEL)` 200 мкс.
+
+    Условия, при которых дешёвая дорога разрешена, проверяются по двум
+    отметкам, а не по вере:
+
+    * `stepped` — с прошлой синхронизации был `Physics.step`, то есть
+      `mj_step1` посчитал позиционную и скоростную ступени на нынешнем
+      состоянии;
+    * `ctrl_only` — с тех пор написан только `ctrl` (отметку ставит
+      `pre_step`).
+
+    Обе отметки одноразовые: `forward` их съедает. Поэтому любое второе
+    чтение, любое продолжение из снимка (`replay.restore_body` пишет
+    `qpos`) и любой сброс получают полный `mj_forward`.
+
+    Заодно здесь живёт **номер состояния** (`эпоха`): он растёт на каждом
+    `Physics.step` и на каждом `forward`, то есть на каждом месте, где
+    MuJoCo пересчитывает что-нибудь производное. По нему наблюдение
+    узнаёт, что состояние не менялось, и не считает одно и то же дважды
+    (см. `_fb_contact_forces`). Если ``acc_forward`` выключен, номер всё
+    равно ведётся: он нужен и без дешёвого пересчёта.
+    """
+    import mujoco
+
+    if getattr(physics, "_fb_accfwd", None) is not None:
+        return physics._fb_accfwd
+    if acc_forward and not getattr(physics, "legacy_step", True):
+        # Без «legacy» шага `mj_step1` в конце не зовётся, и позиционная
+        # ступень после шага НЕ свежая. Тогда дешёвой дороги нет.
+        acc_forward = False
+
+    cls = type(physics)
+    full_forward, full_step = cls.forward, cls.step
+    stage_vel = int(mujoco.mjtStage.mjSTAGE_VEL)
+    st = {"stepped": False, "ctrl_only": False, "дешёвых": 0, "полных": 0,
+          "эпоха": 0, "со ступени ускорений": bool(acc_forward)}
+
+    def step(nstep=1):
+        st["stepped"] = False
+        st["эпоха"] += 1
+        full_step(physics, nstep)
+        st["stepped"] = True
+
+    def forward():
+        st["эпоха"] += 1
+        if acc_forward and st["stepped"] and st["ctrl_only"]:
+            st["stepped"] = st["ctrl_only"] = False
+            st["дешёвых"] += 1
+            with physics.check_invalid_state():
+                mujoco.mj_forwardSkip(physics.model.ptr, physics.data.ptr,
+                                      stage_vel, 0)
+            physics._dirty = False
+            return
+        st["stepped"] = st["ctrl_only"] = False
+        st["полных"] += 1
+        full_forward(physics)
+
+    # Подмена на экземпляре, а не на классе: dm_control зовёт
+    # `self._physics.forward()`, то есть обычным поиском атрибута, и
+    # другие объекты `Physics` в процессе остаются нетронутыми.
+    physics.step = step
+    physics.forward = forward
+    physics._fb_accfwd = st
+    return st
+
+
+def _fast_obs_mixin():
+    """Наблюдение без именованной индексации и без цикла по контактам.
+
+    Значения те же до бита — меняется только дорога к ним:
+
+    * `physics.bind(датчики).sensordata` на каждом чтении зовёт
+      `Binding.__getattr__`, тот синхронизирует вид с подложкой
+      (`_synchronize_from_backing_array`). Индекс в `data.sensordata`
+      при этом один и тот же; берём его один раз у самого dm_control и
+      дальше читаем подложку напрямую. Индекс взят у dm_control нарочно:
+      так он не может разъехаться с тем, что читал биндинг;
+    * `physics.named.data.cfrc_ext[список имён]` разбирает 36 строковых
+      имён на каждом чтении (`convert_key_item`, 29 мкс на вызов против
+      2,7 мкс по целым идентификаторам тел);
+    * поправка на прилипание шла питоновским циклом по контактам с двумя
+      `np.where` на контакт — 117 мкс на наблюдение, то есть почти треть
+      его. Считается то же самое numpy'ем, с сохранением ПОРЯДКА
+      добавления нормалей (от него зависит `np.mean`, то есть последние
+      биты) и порядка первого появления датчика.
+
+    Пересчёт прямой динамики по «грязному» флагу делается явно в начале:
+    в прежней дороге его звало первое же чтение через биндинг, здесь
+    биндингов нет, и забыть про него нельзя.
+    """
     from flygym_gymnasium import Fly
+    from scipy.spatial.transform import Rotation as R
 
-    if not fast:
-        return Fly
+    class _FastObsFly(Fly):
 
-    class _FlyNoReforward(Fly):
-        """То же, но без пересчёта ради снятия флага."""
+        _fb_ready = False
+        # Одноразовая отметка «идёт съём для правил походки». Ставит её
+        # `_sim_class` на время `HybridTurningController.step`, снимает
+        # первое же чтение наблюдения — то самое, повторное.
+        _fb_rule_stage = False
+        # Запомненные контактные силы и номер состояния, на котором они
+        # посчитаны. `-1` — «ещё ничего не считали».
+        _fb_cf = None
+        _fb_cf_active = None
+        _fb_cf_epoch = -1
 
-        def pre_step(self, action, sim):
-            was = sim.physics.is_dirty
-            super().pre_step(action, sim)
-            if not was:
-                # Мы написали только `ctrl`. Ничего производного от него
-                # до следующего `mj_step` не читается, а `mj_step` всё
-                # пересчитает сам.
-                sim.physics._dirty = False
+        def post_init(self, sim):
+            super().post_init(sim)
+            self._fb_prepare(sim.physics)
 
-    return _FlyNoReforward
+        def _fb_prepare(self, physics):
+            model = physics.model
+
+            def sensor_index(elements):
+                b = physics.bind(elements)
+                if not callable(getattr(b, "_get_cached_array_and_index",
+                                        None)):
+                    # Пустая группа датчиков (в этой модели такова
+                    # `_non_actuated_joint_sensors`): dm_control отдаёт
+                    # на неё `_EmptyBinding`, а та на любое поле —
+                    # пустой массив. Отвечаем тем же.
+                    return None
+                return b._get_cached_array_and_index("sensordata")
+
+            self._fb_sd = {}
+            names = ["act", "nonact", "ee", "ant"]
+            groups = [self._actuated_joint_sensors,
+                      self._non_actuated_joint_sensors,
+                      self._end_effector_sensors,
+                      self._antennae_sensors]
+            for i in range(7):
+                names.append("body%d" % i)
+                groups.append(self._body_sensors[i])
+            for nm, grp in zip(names, groups):
+                if grp is None:
+                    self._fb_sd[nm] = None
+                    continue
+                self._fb_sd[nm] = sensor_index(grp)
+
+            ids = np.array([model.name2id(nm, "body")
+                            for nm in self.contact_sensor_placements])
+            if ids.size and int(ids.min()) < 0:
+                raise RuntimeError(
+                    "не нашлось тела для контактного датчика: "
+                    + ", ".join(nm for nm, i in
+                                zip(self.contact_sensor_placements, ids)
+                                if i < 0))
+            self._fb_body_ids = ids
+
+            # Прилипание: геом -> место привода. Строим только если
+            # идентификаторы геомов и датчиков различны — иначе
+            # `np.where(...)[0]` в прежнем коде давал бы больше одного
+            # попадания, и numpy'ем это пришлось бы считать иначе.
+            gid = np.asarray(getattr(self, "_adhesion_actuator_geom_id", []))
+            csid = np.asarray(
+                getattr(self, "_adhesion_bodies_with_contact_sensors", []))
+            self._fb_geom_slot = None
+            if (self.enable_adhesion and gid.size
+                    and len(set(gid.tolist())) == gid.size
+                    and len(set(csid.tolist())) == csid.size):
+                slot = np.full(int(model.ngeom), -1, dtype=np.int64)
+                slot[gid] = np.arange(gid.size)
+                self._fb_geom_slot = slot
+                self._fb_csid = csid.astype(np.int64)
+            self._fb_ready = True
+
+        # ---------------------------------------------------- куски
+        def _fb_sd_read(self, key):
+            got = self._fb_sd[key]
+            if got is None:
+                return _EMPTY_SENSORDATA
+            arr, idx = got
+            return arr[idx]
+
+        def _fb_contact_forces(self, physics, use_cache=False):
+            """`cfrc_ext` строк контактных датчиков плюс поправка на
+            прилипание. Один в один то, что считает `Fly.get_observation`.
+
+            На один шаг физики наблюдение снимается дважды — правилами
+            походки перед шагом и `post_step` после него, — и съём
+            правил приходится ровно на то состояние, которое уже
+            посчитал `post_step` предыдущего шага. Поэтому результат
+            запоминается по номеру состояния (`эпоха` из
+            :func:`_install_acc_only_forward`), который растёт на каждом
+            `Physics.step` и на каждом `forward`, то есть на каждом
+            месте, где MuJoCo пересчитывает производные величины.
+
+            **Из запомненного читает только съём правил**
+            (``use_cache=True``), а полное наблюдение всегда считает
+            заново и запомненное обновляет. Это не осторожность ради
+            осторожности, а закрытая дыра: `replay.restore_body` зовёт
+            `mujoco.mj_forward` НАПРЯМУЮ, минуя `Physics.forward`, то
+            есть номер состояния не растёт, хотя состояние другое. Если
+            бы из запомненного читал кто угодно, продолжение из снимка
+            получило бы контактные силы с прошлого состояния. А так
+            после продолжения первым идёт полное наблюдение (`body.py`
+            зовёт его сразу после `restore_body`), оно и обновляет
+            запомненное; съём правил приходит уже после него.
+
+            Отдаётся копия: `get_observation` кладёт этот массив в
+            `last_obs`, и отдавать два раза один объект не стоит.
+            """
+            data = physics.data
+            st = getattr(physics, "_fb_accfwd", None)
+            ep = None if st is None else st["эпоха"]
+            if use_cache and ep is not None and self._fb_cf_epoch == ep:
+                self._active_adhesion = self._fb_cf_active
+                return self._fb_cf.copy()
+            contact_forces = data.cfrc_ext[self._fb_body_ids][:, 3:].copy()
+            if not self.enable_adhesion:
+                return contact_forces
+            slot = self._fb_geom_slot
+            if slot is None:
+                return self._fb_contact_forces_loop(physics, contact_forces)
+            active = np.zeros(self.n_legs, dtype=bool)
+            ncon = int(data.ncon)
+            if ncon:
+                con = data.ptr.contact
+                ok = np.asarray(con.exclude[:ncon]) == 0
+                s1 = slot[np.asarray(con.geom1[:ncon])]
+                s2 = slot[np.asarray(con.geom2[:ncon])]
+                m1 = ok & (s1 >= 0)
+                m2 = ok & (s2 >= 0)
+                if m1.any():
+                    active[s1[m1]] = True
+                if m2.any():
+                    active[s2[m2]] = True
+                hit = np.unique(np.concatenate((s1[m1], s2[m2])))
+                if hit.size:
+                    frames = np.asarray(con.frame[:ncon])
+                    for sl in hit.tolist():
+                        if not (self._last_adhesion[sl] > 0):
+                            continue
+                        # Строки нормалей — в порядке возрастания номера
+                        # контакта, то есть ровно в том, в каком их
+                        # добавлял прежний цикл: один геом не может быть
+                        # и `geom1`, и `geom2` одного контакта. От
+                        # порядка зависит `np.mean`, поэтому он и важен.
+                        # Порядок самих мест (`hit`) не важен: каждое
+                        # пишет свою строку `contact_forces`.
+                        sel = (m1 & (s1 == sl)) | (m2 & (s2 == sl))
+                        rows = frames[sel, :3]
+                        normal = rows[0] if len(rows) == 1 else \
+                            np.add.reduce(rows, axis=0) / len(rows)
+                        contact_forces[int(self._fb_csid[sl]), :] -= \
+                            self.adhesion_force * normal
+            self._active_adhesion = active
+            if ep is not None:
+                self._fb_cf, self._fb_cf_epoch = contact_forces, ep
+                self._fb_cf_active = active
+                return contact_forces.copy()
+            return contact_forces
+
+        def _fb_contact_forces_loop(self, physics, contact_forces):
+            """Прежняя дорога: цикл по контактам. Остаётся на случай
+            неуникальных геомов прилипания — чтобы поведение не зависело
+            от того, угадали мы структуру модели или нет."""
+            contactid_normal = {}
+            self._active_adhesion = np.zeros(self.n_legs, dtype=bool)
+            for contact in physics.data.contact:
+                for gid in (contact.geom1, contact.geom2):
+                    id_ = np.where(self._adhesion_actuator_geom_id == gid)
+                    if len(id_[0]) > 0 and contact.exclude == 0:
+                        cs = self._adhesion_bodies_with_contact_sensors[id_][0]
+                        contactid_normal.setdefault(cs, []).append(
+                            contact.frame[:3])
+                        self._active_adhesion[id_] = True
+            for cs, normal in contactid_normal.items():
+                mask = self._adhesion_bodies_with_contact_sensors == cs
+                if self._last_adhesion[mask] > 0:
+                    if len(np.shape(normal)) > 1:
+                        normal = np.mean(normal, axis=0)
+                    contact_forces[cs, :] -= self.adhesion_force * normal
+            return contact_forces
+
+        # ---------------------------------------------------- наблюдения
+        def get_observation(self, sim):
+            if self._fb_rule_stage:
+                # Съём для правил походки: он повторный и ему нужны
+                # четыре поля из семи. Отметка одноразовая — следующее
+                # чтение в этом же шаге (из `post_step`) получит полное
+                # наблюдение, то, которое уезжает наружу.
+                self._fb_rule_stage = False
+                return self.rule_observation(sim)
+            physics = sim.physics
+            if not self._fb_ready:
+                self._fb_prepare(physics)
+            if physics.is_dirty:
+                # Прежде это делало первое чтение через биндинг.
+                physics.forward()
+
+            joint_obs = np.zeros((3, len(self.monitored_joints)))
+            a = self._fb_sd_read("act")
+            na = self._fb_sd_read("nonact")
+            n_act = len(self.actuated_joints)
+            # Прежний цикл ставил столбец `i` равным `a[3i:3i+3]` — то
+            # есть перекладывал 126 чисел по три, 42 раза на Python. Это
+            # ровно транспонирование, и делается одним движением.
+            if a.size == 3 * n_act:
+                joint_obs[:, :n_act] = a.reshape(n_act, 3).T
+            else:
+                for i in range(n_act):
+                    joint_obs[:3, i] = a[i * 3: i * 3 + 3]
+            for i in range(len(self.monitored_joints) - n_act):
+                base_idx = i * 5
+                joint_torques = np.linalg.norm(na[base_idx + 1: base_idx + 5])
+                joint_obs[:3, n_act + i] = [
+                    *na[base_idx: base_idx + 2], joint_torques]
+            joint_obs[2, :] *= 1e-9
+            joint_obs = joint_obs[:, self._monitored_joint_order]
+
+            cart_pos = self._fb_sd_read("body0")
+            cart_vel = self._fb_sd_read("body1")
+            quat = self._fb_sd_read("body2")
+            ang_pos = R.from_quat(quat[[1, 2, 3, 0]]).as_euler("ZYX")
+            ang_vel = self._fb_sd_read("body3")
+            fly_pos = np.array([cart_pos, cart_vel, ang_pos, ang_vel])
+            self.last_obs["rot"] = ang_pos
+            self.last_obs["pos"] = cart_pos
+
+            contact_forces = self._fb_contact_forces(physics)
+            self.last_obs["contact_forces"] = contact_forces
+            self.last_obs["contact_pos"] = \
+                physics.data.xpos[self._fb_body_ids].copy().T
+
+            ee_pos = self._fb_sd_read("ee").reshape((self.n_legs, 3))
+            orientation_vec = self._fb_sd_read("body4")
+            cardinal_vectors = [orientation_vec,
+                                self._fb_sd_read("body5"),
+                                self._fb_sd_read("body6")]
+            obs = {
+                "joints": joint_obs.astype(np.float32),
+                "fly": fly_pos.astype(np.float32),
+                "contact_forces": contact_forces.astype(np.float32),
+                "end_effectors": ee_pos.astype(np.float32),
+                "fly_orientation": orientation_vec.astype(np.float32),
+                "cardinal_vectors": np.array(cardinal_vectors).astype(
+                    np.float32),
+            }
+            if self.enable_olfaction:
+                antennae_pos = self._fb_sd_read("ant")
+                obs["odor_intensity"] = sim.arena.get_olfaction(
+                    antennae_pos.reshape(4, 3)).astype(np.float32)
+            if self.enable_vision:
+                self._update_vision(sim)
+                obs["vision"] = self._curr_visual_input
+            return obs
+
+        def rule_observation(self, sim):
+            """Только то, что читают правила походки.
+
+            `HybridTurningController.step` берёт полное наблюдение, а
+            пользуется из него четырьмя величинами:
+            `_retraction_rule_find_leg` читает `obs["fly"][0][2]` и
+            `obs["end_effectors"][:, 2]`, `_stumbling_rule_check_condition`
+            — `obs["contact_forces"]` и `obs["fly_orientation"]`. Всё
+            остальное (42 суставных датчика, скорости, углы Эйлера через
+            scipy, кардинальные векторы, обоняние, `xpos` контактных тел)
+            считается и выбрасывается.
+
+            Значения те же до бита: приведение к `float32` поэлементное,
+            поэтому `obs["fly"][0][2]` не зависит от остальных строк, и
+            строку `cart_pos` можно отдать одну.
+
+            Побочные записи прежнего наблюдения (`last_obs`,
+            `_active_adhesion`) здесь либо делаются (`_active_adhesion` —
+            внутри поправки на прилипание), либо уже стоят с тем же
+            значением: `post_step` предыдущего шага физики посчитал их
+            на ЭТОМ же состоянии модели.
+            """
+            physics = sim.physics
+            if not self._fb_ready:
+                self._fb_prepare(physics)
+            if physics.is_dirty:
+                physics.forward()
+            contact_forces = self._fb_contact_forces(physics, use_cache=True)
+            return {
+                "fly": np.asarray(self._fb_sd_read("body0"),
+                                  dtype=np.float64).reshape(1, 3)
+                .astype(np.float32),
+                "end_effectors": self._fb_sd_read("ee")
+                .reshape((self.n_legs, 3)).astype(np.float32),
+                "contact_forces": contact_forces.astype(np.float32),
+                "fly_orientation": self._fb_sd_read("body4")
+                .astype(np.float32),
+            }
+
+    return _FastObsFly
+
+
+def _sim_class(rule_obs):
+    """Контроллер походки FlyGym; при ``rule_obs`` — с сокращённым
+    наблюдением для правил.
+
+    Почему отметкой, а не переопределением метода. `get_observation`
+    зовётся в `HybridTurningController.step` как
+    `super().get_observation()`, то есть явно у РОДИТЕЛЯ
+    (`SingleFlySimulation`) — переопределение в подклассе обойдено
+    `super()` и не сработает (проверено замером: правка не давала ничего,
+    пока стояла подклассом). Переписывать же весь `step` ради одной
+    строки значит держать копию шестидесяти строк апстрима.
+
+    Поэтому отметка ставится на время `step` и снимается первым же
+    чтением наблюдения — тем самым повторным. Второе чтение в этом же
+    шаге, из `post_step`, получает полное наблюдение, и именно оно
+    уезжает наружу. Границы ровные: за пределами `step` отметки нет,
+    поэтому `body.py` со своими `fly.get_observation(body)` (после
+    живых условий и после продолжения из снимка) и `reset` всегда
+    получают полное наблюдение.
+    """
+    from flygym_gymnasium.examples.locomotion import HybridTurningController
+
+    if not rule_obs:
+        return HybridTurningController
+
+    class _RuleObsController(HybridTurningController):
+
+        def step(self, action):
+            fly = self.fly
+            if not hasattr(fly, "rule_observation"):
+                return super().step(action)
+            fly._fb_rule_stage = True
+            try:
+                return super().step(action)
+            finally:
+                fly._fb_rule_stage = False
+
+    return _RuleObsController
 
 
 def _build_body(cfg: BodyConfig, sources, video_path=None, head_stab=None):
@@ -326,9 +861,12 @@ def _build_body(cfg: BodyConfig, sources, video_path=None, head_stab=None):
     from flygym_gymnasium import YawOnlyCamera
     from flygym_gymnasium.arena import OdorArena
     from flygym_gymnasium.preprogrammed import default_leg_sensor_placements
-    from flygym_gymnasium.examples.locomotion import HybridTurningController
 
-    Fly = _fly_class(getattr(cfg, "fast_physics", False))
+    acc_forward = bool(getattr(cfg, "acc_forward", True))
+    Fly = _fly_class(getattr(cfg, "fast_physics", False),
+                     fast_obs=bool(getattr(cfg, "fast_obs", True)),
+                     acc_forward=acc_forward)
+    HybridTurningController = _sim_class(bool(getattr(cfg, "rule_obs", True)))
 
     arena = OdorArena(
         odor_source=sources,
@@ -361,6 +899,13 @@ def _build_body(cfg: BodyConfig, sources, video_path=None, head_stab=None):
         )]
     sim = HybridTurningController(fly=fly, cameras=cams, arena=arena,
                                   timestep=cfg.physics_dt)
+    # Крючки на `Physics.step`/`forward` ставятся, если нужна хотя бы
+    # одна из двух вещей: дешёвый пересчёт или номер состояния, по
+    # которому наблюдение не считает контактные силы дважды. При
+    # `fast_physics` пересчёта нет вовсе, и дешёвой дороги тоже.
+    want_acc = acc_forward and not getattr(cfg, "fast_physics", False)
+    if want_acc or bool(getattr(cfg, "fast_obs", True)):
+        _install_acc_only_forward(sim.physics, acc_forward=want_acc)
     return sim, cams
 
 
@@ -997,7 +1542,25 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         "steps_done": int(n_steps),
         "steps_requested": int(requested_steps),
         "duration_s": round(dur_s, 6),
+        # Какими дорогами считалась обвязка MuJoCo. Оговорки здесь не
+        # нужны: все три правки численно равнозначны прежней дороге
+        # (`probe/mj_equal.py` — побитово, `probe/body_equal.py` — на
+        # эпизоде). Но по сохранённому прогону должно быть видно, как он
+        # считался, — как это уже сделано для `speed` и `graphs` в
+        # `sim.run`.
+        "обвязка": {
+            "пересчёт со ступени ускорений":
+                bool(getattr(cfg, "acc_forward", True)),
+            "дешёвое наблюдение": bool(getattr(cfg, "fast_obs", True)),
+            "наблюдение правил": bool(getattr(cfg, "rule_obs", True)),
+        },
     }
+    accfwd = getattr(getattr(body, "physics", None), "_fb_accfwd", None)
+    if accfwd is not None:
+        timing["обвязка"]["пересчётов прямой динамики"] = {
+            "дешёвых": int(accfwd["дешёвых"]),
+            "полных": int(accfwd["полных"]),
+        }
     if endless:
         timing["steps_requested"] = None   # предела не было
         timing.setdefault("оговорки", []).append(
