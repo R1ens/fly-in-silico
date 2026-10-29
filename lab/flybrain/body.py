@@ -179,6 +179,22 @@ class BodyConfig:
     # пока равенство не доказано на этой модели: см. `_fly_class`.
     fast_physics: bool = False
 
+    # Какой контроллер походки крутит ноги.
+    #
+    # * `"fast"` — вендоренная копия шага из `flybrain.gait`: те же числа,
+    #   но правила, фазовый множитель и кусочный полином считаются на все
+    #   шесть ног сразу, а наблюдение прошлого шага не читается заново.
+    #   Значение по умолчанию: равенство проверено отпечатками эпизода
+    #   (`probe/body_equal.py`), арифметикой по частям
+    #   (`probe/gait_equal.py`) и продолжением из снимка
+    #   (`probe/resume_state.py --part body`).
+    # * `"legacy"` — `HybridTurningController` из пакета, как было. Нужен
+    #   встречному замеру и остаётся дорогой назад.
+    #
+    # Ускорение — не приближение: ни одна частота обновления не понижена
+    # и ни один шаг не пропущен, см. заголовок `flybrain/gait.py`.
+    gait: str = "fast"
+
     # --- сеанс песочницы ---
     #
     # `duration_s <= 0` — сеанс без заранее заданного конца: его
@@ -326,7 +342,8 @@ def _build_body(cfg: BodyConfig, sources, video_path=None, head_stab=None):
     from flygym_gymnasium import YawOnlyCamera
     from flygym_gymnasium.arena import OdorArena
     from flygym_gymnasium.preprogrammed import default_leg_sensor_placements
-    from flygym_gymnasium.examples.locomotion import HybridTurningController
+
+    from . import gait as G
 
     Fly = _fly_class(getattr(cfg, "fast_physics", False))
 
@@ -359,8 +376,14 @@ def _build_body(cfg: BodyConfig, sources, video_path=None, head_stab=None):
             fps=cfg.fps,
             output_path=str(video_path),
         )]
-    sim = HybridTurningController(fly=fly, cameras=cams, arena=arena,
-                                  timestep=cfg.physics_dt)
+    # Повторное чтение наблюдения выключается только при открытом окне
+    # MuJoCo: пассивное окно умеет двигать состояние мышью мимо
+    # `dm_control`, то есть не помечая его грязным, и тогда наблюдение
+    # прошлого шага уже не то же самое. В счётных прогонах окна нет.
+    sim = G.build(gait=getattr(cfg, "gait", "fast"),
+                  reuse_obs=not getattr(cfg, "view", False),
+                  fly=fly, cameras=cams, arena=arena,
+                  timestep=cfg.physics_dt)
     return sim, cams
 
 
