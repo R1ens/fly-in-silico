@@ -406,10 +406,20 @@ def main():
             "шагов": len(recs),
             # Отпечатки. Без них проверки «инертно до бита» падали с
             # KeyError — поймано прогоном. `траектория` — только x, y,
-            # theta; `всё по шагам` — все двенадцать столбцов записи.
-            "траектория": fp(table[:, :3]),
-            "всё по шагам": fp(table),
-            "активность": fp(run.counts),
+            # theta; `всё по шагам` — все столбцы записи. Таблица
+            # собирается здесь же из `кол`, а не берётся готовой: в этой
+            # пробе её нет, и ссылка на неё была моей ошибкой, тоже
+            # поймана прогоном.
+            "траектория": fp(np.array(
+                [кол(c) for c in ("x", "y", "theta")], dtype=np.float64)),
+            "всё по шагам": fp(np.array(
+                [кол(c) for c in
+                 ("x", "y", "theta", "odour_l", "odour_r", "dn_l", "dn_r",
+                  "amp_l", "amp_r", "dist", "grad_cos", "spikes")],
+                dtype=np.float64)),
+            "активность": fp(
+                run.counts.cpu().numpy() if hasattr(run.counts, "cpu")
+                else np.asarray(run.counts)),
             "частоты, Гц": {k: round(float(np.mean(v)), 4)
                             for k, v in hz.items()},
             # Спайки СЧЁТОМ, а не только частотой: у зондов по два
