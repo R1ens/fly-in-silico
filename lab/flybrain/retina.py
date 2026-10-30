@@ -244,13 +244,20 @@ class Map:
     толщина_листа: float
     доля_дисперсии: tuple
     сверх_места: int = 0
+    # Имя версии подгонки: `своя` — прежняя, у каждой популяции своя
+    # плоскость и нормировка; `общая` — одна на все три популяции глаза.
+    # Умолчание прежнее нарочно: все сохранённые прогоны посчитаны им, и
+    # у них этого поля в файле нет вовсе. Стоит последним, потому что
+    # поля со значением по умолчанию не могут идти перед полями без
+    # него — поймано сборкой.
+    fit: str = "своя"
 
     def fingerprint(self) -> str:
         """Отпечаток привязки: по нему прогон опознаётся однозначно."""
         h = hashlib.sha256()
         for part in (self.side.encode(), self.kind.encode(),
                      self.mode.encode(), self.assign.encode(),
-                     repr(self.align).encode(),
+                     self.fit.encode(), repr(self.align).encode(),
                      b"1" if self.shuffled else b"0",
                      np.ascontiguousarray(self.neurons, dtype=np.int64)
                      .tobytes(),
@@ -265,6 +272,7 @@ class Map:
         return {
             "сторона": self.side, "тип": self.kind,
             "способ": self.mode, "назначение": self.assign,
+            "подгонка": self.fit,
             "совмещение": list(self.align),
             "перемешано": bool(self.shuffled),
             "нейронов сверх места": int(self.сверх_места),
@@ -287,8 +295,64 @@ class Map:
         }
 
 
+# Имена версий подгонки. В прогон уезжает имя, а не признак: по
+# сохранённому файлу должно быть видно, какая привязка считала.
+FIT_OWN = "своя"          # прежняя: своя плоскость и нормировка у каждой
+FIT_JOINT = "общая"       # совместная: одна на все три популяции глаза
+FITS = (FIT_OWN, FIT_JOINT)
+
+
+def _joint_frame(neurons, side, data=None):
+    """Одна плоскость и одна нормировка на ВСЕ фоторецепторы глаза.
+
+    Считается по объединённому облаку R1-6, R7 и R8 одной стороны.
+    Возвращает всё, что нужно, чтобы привести любую из популяций в те же
+    безразмерные координаты: центр в трёхмерии, две главные оси, третью
+    ось (для измеримой толщины листа), центр и масштаб в плоскости.
+
+    Масштаб берётся по ОБЪЕДИНЁННОМУ облаку, а не по каждой популяции:
+    в этом и смысл — у трёх популяций одного глаза преобразование одно,
+    поэтому их взаимное положение сохраняется.
+    """
+    from . import data as D
+
+    src = neurons if data is None else data
+    части = []
+    for k in PR_TYPES:
+        idx = D.select(src, "type=%s+side:%s" % (k, side))
+        if not len(idx):
+            raise ValueError("пустая популяция %s на стороне %s" % (k, side))
+        части.append(neurons.iloc[idx][["x_um", "y_um", "z_um"]]
+                     .to_numpy(float))
+    все = np.concatenate(части)
+    c3 = все.mean(0)
+    _, s3, vt = np.linalg.svd(все - c3, full_matrices=False)
+    uv = (все - c3) @ vt[:2].T
+    c2 = uv.mean(0)
+    uv = uv - c2
+    sd = uv.std(0)
+    r = float(np.sqrt((uv ** 2).sum(1).mean()))
+    return {"центр": c3, "оси": vt[:2], "третья": vt[2],
+            "центр в плоскости": c2, "отклонения": sd,
+            "радиус": r, "доли дисперсии": (s3 ** 2 / (s3 ** 2).sum()),
+            "нейронов в облаке": int(len(все))}
+
+
+def _joint_apply(xyz, рама, mode):
+    """Привести облако популяции в ОБЩИЕ безразмерные координаты."""
+    c = np.asarray(xyz, dtype=float) - рама["центр"]
+    uv = c @ рама["оси"].T - рама["центр в плоскости"]
+    w = c @ рама["третья"]
+    if mode == "whiten":
+        return uv / np.maximum(рама["отклонения"], 1e-12), w
+    if mode == "rigid":
+        return uv / max(рама["радиус"], 1e-12), w
+    raise ValueError("неизвестный способ совмещения: %r" % (mode,))
+
+
 def build(neurons, side, kind, mode="whiten", assign="capacity",
-          align=ALIGN_DEFAULT, shuffle=False, seed=0, data=None):
+          align=ALIGN_DEFAULT, shuffle=False, seed=0, data=None,
+          fit=FIT_OWN, рама=None):
     """Построить привязку для одной популяции одного глаза.
 
     ``shuffle`` даёт встречный замер: назначение перемешивается так, что
@@ -307,8 +371,21 @@ def build(neurons, side, kind, mode="whiten", assign="capacity",
         raise ValueError("пустая популяция %s на стороне %s"
                          % (kind, side))
     xyz = neurons.iloc[idx][["x_um", "y_um", "z_um"]].to_numpy(float)
-    uv, w, var = plane(xyz)
-    me = _align(_fit(uv, mode), align)
+    if fit == FIT_JOINT:
+        # Общая рама считается ОДИН раз на глаз и передаётся сюда: иначе
+        # три вызова `build` посчитали бы её трижды по одному и тому же
+        # облаку — те же числа втрое дороже.
+        if рама is None:
+            рама = _joint_frame(neurons, side, data=data)
+        uv, w = _joint_apply(xyz, рама, mode)
+        var = рама["доли дисперсии"]
+        me = _align(uv, align)
+    elif fit == FIT_OWN:
+        uv, w, var = plane(xyz)
+        me = _align(_fit(uv, mode), align)
+    else:
+        raise ValueError("неизвестная подгонка: %r; есть %s"
+                         % (fit, ", ".join(FITS)))
 
     om = ommatidia()
     op = _fit(om["pos"] - om["pos"].mean(0), mode)
@@ -333,7 +410,7 @@ def build(neurons, side, kind, mode="whiten", assign="capacity",
             np.bincount(who, minlength=len(op)).astype(np.int64), counts)
 
     return Map(side=side, kind=kind, mode=mode, assign=assign,
-               align=tuple(align),
+               fit=fit, align=tuple(align),
                shuffled=bool(shuffle), neurons=idx.astype(np.int64),
                omma=who, counts=counts,
                толщина_листа=float(np.std(w)),
@@ -343,12 +420,23 @@ def build(neurons, side, kind, mode="whiten", assign="capacity",
 
 def build_all(neurons, mode="whiten", assign="capacity",
               align=ALIGN_DEFAULT, shuffle=False, seed=0,
-              sides=("left", "right"), kinds=None):
-    """Привязки для всех типов фоторецепторов обоих глаз."""
+              sides=("left", "right"), kinds=None, fit=FIT_OWN):
+    """Привязки для всех типов фоторецепторов обоих глаз.
+
+    При совместной подгонке общая рама считается ОДИН раз на сторону и
+    передаётся во все её популяции: это те же числа, но втрое дешевле, и
+    главное — одна и та же рама у всех трёх, иначе смысл совместности
+    терялся бы на округлении.
+    """
     kinds = tuple(kinds or PR_TYPES)
-    return {(s, k): build(neurons, s, k, mode=mode, assign=assign,
-                          align=align, shuffle=shuffle, seed=seed)
-            for s in sides for k in kinds}
+    out = {}
+    for s in sides:
+        рама = _joint_frame(neurons, s) if fit == FIT_JOINT else None
+        for k in kinds:
+            out[(s, k)] = build(neurons, s, k, mode=mode, assign=assign,
+                                align=align, shuffle=shuffle, seed=seed,
+                                fit=fit, рама=рама)
+    return out
 
 
 def fingerprint_all(maps) -> str:

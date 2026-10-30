@@ -207,6 +207,7 @@ def _spec_from_args(args, kind):
             vision_eyes=getattr(args, "vision_eyes", "both"),
             vision_mode=getattr(args, "vision_mode", "whiten"),
             vision_assign=getattr(args, "vision_assign", "capacity"),
+            vision_fit=getattr(args, "vision_fit", "своя"),
             vision_shuffle=bool(getattr(args, "vision_shuffle", False)),
             vision_light=getattr(args, "vision_light", 1.0),
             vision_contrast=getattr(args, "vision_contrast", 1.0),
@@ -1038,6 +1039,16 @@ def build_parser():
     s.add_argument("--vision-assign", default="capacity",
                    choices=("capacity", "nearest"),
                    help="назначение нейрона омматидию")
+    s.add_argument("--vision-fit", default="своя",
+                   choices=("своя", "общая"),
+                   help="версия подгонки привязки. «своя» — "
+                        "историческая, у каждой популяции своя "
+                        "плоскость и нормировка (умолчание: на ней "
+                        "посчитаны все сохранённые прогоны). «общая» — "
+                        "совместная, одна на все три популяции глаза; "
+                        "внешний свидетель, опровергший историческую, "
+                        "её пропускает (164 пары из 430 в одном "
+                        "омматидии против 1 у перетасованной)")
     s.add_argument("--vision-shuffle", action="store_true",
                    help="ВСТРЕЧНЫЙ ЗАМЕР: перемешать привязку с "
                         "сохранением числа нейронов на омматидий — "

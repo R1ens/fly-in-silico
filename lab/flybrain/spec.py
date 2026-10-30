@@ -152,6 +152,10 @@ class BodySpec:
     vision_eyes: str = "both"
     vision_mode: str = "whiten"
     vision_assign: str = "capacity"
+    # Версия подгонки привязки: `своя` историческая (умолчание,
+    # на ней посчитаны все сохранённые прогоны) или `общая`
+    # совместная, которую внешний свидетель пропускает.
+    vision_fit: str = "своя"
     vision_shuffle: bool = False
     vision_light: float = 1.0
     vision_contrast: float = 1.0
@@ -395,6 +399,7 @@ class RunSpec:
             vision_eyes=b.vision_eyes,
             vision_mode=b.vision_mode,
             vision_assign=b.vision_assign,
+            vision_fit=b.vision_fit,
             vision_shuffle=b.vision_shuffle,
             vision_light=b.vision_light,
             vision_contrast=b.vision_contrast,

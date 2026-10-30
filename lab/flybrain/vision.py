@@ -221,7 +221,7 @@ class RetinaAdapter:
 
     def __init__(self, mode="whiten", assign="capacity", align=None,
                  shuffle=False, seed=0, channel="max", max_hz=150.0,
-                 ref=0.5, eyes="both"):
+                 ref=0.5, eyes="both", fit=None):
         from . import retina as R
 
         if channel not in CHANNELS:
@@ -236,6 +236,11 @@ class RetinaAdapter:
         if assign not in R.ASSIGNS:
             raise ValueError("неизвестный способ назначения %r; есть: %s"
                              % (assign, ", ".join(R.ASSIGNS)))
+        fit = R.FIT_OWN if fit is None else str(fit)
+        if fit not in R.FITS:
+            raise ValueError("неизвестная подгонка %r; есть: %s"
+                             % (fit, ", ".join(R.FITS)))
+        self.fit = fit
         self.mode = str(mode)
         self.assign = str(assign)
         self.align = tuple(align or R.ALIGN_DEFAULT)
@@ -260,6 +265,7 @@ class RetinaAdapter:
 
         sides = ("left", "right") if self.eyes == "both" else (self.eyes,)
         self.maps = R.build_all(neurons, mode=self.mode, assign=self.assign,
+                                fit=self.fit,
                                 align=self.align, shuffle=self.shuffle,
                                 seed=self.seed, sides=sides)
         self._n_omma = len(R.ommatidia()["pos"])
@@ -357,7 +363,18 @@ class RetinaAdapter:
         return {
             "переходник": self.name,
             "версия переходника": self.version,
-            "версия привязки": self.binding,
+            "подгонка": self.fit,
+            "версия привязки": (
+                self.binding if self.fit == "своя" else
+                "совместная v2: ОДНА плоскость и ОДНА нормировка на все "
+                "три популяции глаза, назначение по-прежнему своё у "
+                "каждой с её анатомической ёмкостью. Внешний свидетель, "
+                "опровергший историческую, эту ПРОПУСКАЕТ: R7 и R8 одной "
+                "колонки ложатся в один омматидий 164 раза из 430 "
+                "(38,1 %) против 1 из 430 у перетасованной, медианное "
+                "расстояние 1,005 шага решётки против 11,435. Это НЕ "
+                "ретинотопия мухи: 164 из 430, а не 430, и типичный "
+                "промах — в соседний омматидий"),
             "чем будет исправлено": "совместной подгонкой R1-6, R7 и R8 "
                                     "вместо независимой. Она придёт "
                                     "ОТДЕЛЬНЫМ именем переходника, а не "
