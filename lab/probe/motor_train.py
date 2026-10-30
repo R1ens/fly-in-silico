@@ -49,6 +49,12 @@ import numpy as np  # noqa: E402
 from probe.motor_check import CONTROL_MS, Rig, TAU_S  # noqa: E402
 
 OUT = Path(__file__).parent
+# Куда писать веса. По умолчанию — прежнее имя, чтобы вызов без
+# аргументов делал то же, что делал. `--out` появился затем, что
+# `motor_decoder_v1.npz` лежит в истории как ПРИМЕР негодного файла
+# (в нём нет `meta_norm`, см. `MOTOR.md` §4а), и затирать его
+# переобучением значит потерять тот самый артефакт, на котором показан
+# отказ. Переобученные веса кладутся рядом, под своим именем.
 WEIGHTS = OUT / "motor_decoder_v1.npz"
 
 # Расписание накачки. Два периода, чтобы веса не выучили один-единственный
@@ -115,11 +121,19 @@ def r2(y, yhat):
     return 1.0 - ss / tot if tot > 0 else float("nan")
 
 
-def main():
+def main(argv=None):
     import torch
 
     from flybrain import data as D
 
+    argv = list(sys.argv[1:] if argv is None else argv)
+    global WEIGHTS
+    report = OUT / "motor_train.json"
+    if "--out" in argv:
+        WEIGHTS = Path(argv[argv.index("--out") + 1])
+        if not WEIGHTS.is_absolute():
+            WEIGHTS = OUT / WEIGHTS
+        report = WEIGHTS.with_name(WEIGHTS.stem + ".json")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     neurons = D.load_neurons()
     weights = D.load_weights(device=device)
@@ -177,7 +191,7 @@ def main():
 
     sha = hashlib.sha256(WEIGHTS.read_bytes()).hexdigest()
     print("\n  файл весов: %s\n  sha256: %s" % (WEIGHTS, sha))
-    (OUT / "motor_train.json").write_text(json.dumps({
+    report.write_text(json.dumps({
         "зонды": order,
         "веса": [round(float(v), 6) for v in w],
         "смещение": round(b, 6),
