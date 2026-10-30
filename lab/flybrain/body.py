@@ -1613,6 +1613,13 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         rates.index_fill_(1, t_sens["odour_right"], rr)
         if taste_hz > 0:
             rates.index_fill_(1, t_sens["taste"], taste_hz)
+        # Сводка подачи сбрасывается ПЕРЕД попыткой, а не после удачной.
+        # Иначе она остаётся с прошлого шага, и запись шага сообщает
+        # частоту, которой на этом шаге никто не подавал: проба
+        # `probe/vision_live_app.py` поймала ровно это — после
+        # выключения подачи в записи стояло 117,985 Гц. Поле, которое
+        # врёт, хуже отсутствующего поля.
+        vis_seen["подача"] = None
         if vis is not None and frame is not None \
                 and bool(getattr(cfg, "vision_feed", True)):
             # Потолок и насыщение перечитываются из настройки на каждом
@@ -1997,9 +2004,15 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             rec["vis_lag_ms"] = (None if vis_t_ms is None
                                  else round(rec["t_ms"] - vis_t_ms, 4))
             rec["vis_n"] = int(vis_n)
-            fed = vis_seen.get("подача") or {}
-            rec["vis_hz"] = round(float(fed.get("средняя, Гц", 0.0)), 3)
-            rec["vis_sat"] = round(float(fed.get("в потолке, доля", 0.0)), 4)
+            # Кадр глаза рисуется и при выключенной подаче, поэтому
+            # отметки времени выше пишутся всегда, а частоты — только
+            # когда подача была. Ноль здесь означал бы «подали нулевую
+            # частоту», а не «не подавали»; отсутствие ключа таймлайн
+            # честно читает как «значения в записи шага не было».
+            fed = vis_seen.get("подача")
+            if fed is not None:
+                rec["vis_hz"] = round(float(fed["средняя, Гц"]), 3)
+                rec["vis_sat"] = round(float(fed["в потолке, доля"]), 4)
         records.append(rec)
         row_cpu = None
         if on_step is not None or tape is not None:

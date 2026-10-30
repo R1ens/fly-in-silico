@@ -130,8 +130,41 @@ def main():
         print("\n2. прогон 1: подготовка и кадры")
         lifecycle = []
 
+        def finished(job=None):
+            """Прогон закончился — по тому, что окно действительно отдаёт.
+
+            Ждать `app.st.run.phase in ("done", "fail")` НЕЛЬЗЯ, и это
+            замер, а не вкус: `Done` несёт сводку в себе, поэтому
+            полусекундное ожидание сводки в `desk/app.py` не
+            срабатывает, и законченный прогон переезжает в
+            `app.st.last` с `run.reset()` НА ТОМ ЖЕ КАДРЕ. Фаза `done`
+            живёт меньше одного кадра, и три пункта этой пробы (4, 6 и
+            7) висели на ожидании, которого не могло случиться, по
+            своему сроку каждый.
+
+            Чинится проба, а не окно. Поведение окна правильное:
+            «идущий прогон» и «последний прогон» — разные вещи, и
+            показывать их врозь было решением, а не недосмотром.
+            Задержать окно в фазе `done` ради удобства наблюдателя
+            значит испортить продукт под пробу.
+
+            ``job`` — номер задачи, которой ждём. Без него старая
+            запись в `app.st.last` от прошлого прогона сошла бы за
+            конец нынешнего, и пункт 6 «прошёл» бы, не дождавшись
+            ничего.
+            """
+            last = app.st.last
+            if last is None or last.phase not in ("done", "fail"):
+                return False
+            return job is None or last.job_id == job
+
         def mark(tag):
             r = app.st.run
+            # У законченного прогона фаза и путь лежат в `app.st.last`:
+            # сам `run` к этому моменту уже сброшен в «готов к запуску».
+            last = app.st.last
+            if r.phase == "idle" and last is not None:
+                r = last
             rec = {"метка": tag, "фаза": r.phase, "этап": r.stage,
                    "задача": r.job_id, "t_sim": round(r.t_sim, 3),
                    "t_wall": round(r.t_wall, 1), "прогресс": round(r.progress, 3),
@@ -325,8 +358,7 @@ def main():
         app.cancel_run()
         pump(0.3)
         mark("сразу после «стоп»")
-        dt = wait(lambda: app.st.run.phase in ("done", "fail"), 180,
-                  "конца после отмены")
+        dt = wait(lambda: finished(job1), 180, "конца после отмены")
         rep["отмена из фазы run, с"] = None if dt is None else round(dt, 1)
         print("   конец через %s с после «стоп»" % rep["отмена из фазы run, с"])
         done1 = mark("конец прогона 1")
@@ -372,10 +404,11 @@ def main():
         sh.shot(OUT / "bodyfinal_prep2.png")
 
         print("\n6. отмена из фазы prep")
+        job2 = app.st.run.job_id
         t_c2 = time.perf_counter()
         app.cancel_run()
         pump(0.3)
-        dt2 = wait(lambda: app.st.run.phase in ("done", "fail"), 300,
+        dt2 = wait(lambda: finished(job2), 300,
                    "конца после отмены из prep")
         rep["отмена из фазы prep, с"] = None if dt2 is None else round(dt2, 1)
         print("   конец через %s с после «стоп» в подготовке"
@@ -390,12 +423,44 @@ def main():
         rep["отказ"] = {"задача принята": jid is not None, "спека": bad}
         pump(0.5)
         t_f = time.perf_counter()
-        wait(lambda: app.st.run.phase == "fail" or not ses.alive, 180,
-             "отказа")
+        # Ждём ОТКАЗА СЕАНСА, а не фазы окна, и это не уступка.
+        #
+        # Эта задача послана прямо работнику (`ses.submit`), минуя пуск
+        # из окна (`app.start_run`). Машина фаз в `desk/app.py` ведёт
+        # только тот прогон, который окно пускало само: при простое она
+        # выходит сразу («Из сеанса брать нечего: его поля всё ещё
+        # помнят прошлый прогон»), и заводить фазу `fail` для задачи,
+        # которой окно не пускало, значило бы утверждать, что пускало.
+        #
+        # Отказ при этом НЕ пропадает, и это замеряется ниже: он
+        # приходит в `ses.error` и уходит в журнал окна строкой
+        # «ошибка: …», работник остаётся жив. Ровно это окно и обязано
+        # показать про чужую задачу.
+        # Ждём ИМЕННО этот отказ, а не «какую-нибудь ошибку»: `ses.error`
+        # мог остаться с прошлого прогона, и условие «ошибка не пуста»
+        # выполнялось сразу — пункт печатал «ждали 0,0 с» и не дожидался
+        # ничего.
+        BAD = "НЕТ-ТАКОЙ-ПОПУЛЯЦИИ"
+
+        def refused():
+            if not ses.alive:
+                return True
+            if BAD in str(ses.error or ""):
+                return True
+            return any(BAD in t for _ts, lv, t in app.st.log
+                       if lv == "error")
+
+        wait(refused, 180, "отказа")
+        pump(0.5)        # дать журналу окна разобрать почту до конца
+        last = app.st.last
+        errs = [t for _ts, lv, t in app.st.log if lv == "error"]
         rep["отказ"].update({
             "ждали, с": round(time.perf_counter() - t_f, 1),
-            "фаза окна": app.st.run.phase,
-            "этап окна": app.st.run.stage,
+            "ошибка дошла до журнала окна": any(BAD in t for t in errs),
+            "строк об ошибке в журнале окна": len(errs),
+            "фаза последнего ПУЩЕННОГО ОКНОМ прогона":
+                None if last is None else last.phase,
+            "этап окна": None if last is None else last.stage,
             "состояние сеанса": ses.state,
             "ошибка сеанса": (str(ses.error)[:300] if ses.error else None),
             "работник жив": bool(ses.alive),
@@ -405,8 +470,16 @@ def main():
             if k != "спека":
                 print("   %-30s %s" % (k, v))
         pump(1.0)
-        rep["отказ"]["фаза окна через секунду"] = app.st.run.phase
+        rep["отказ"]["идущий прогон через секунду"] = app.st.run.phase
         rep["отказ"]["работник жив через секунду"] = bool(ses.alive)
+        rep["отказ"]["что из этого следует"] = (
+            "отказ чужой задачи окно показывает журналом и держит "
+            "работника живым; фазы `fail` у него нет, потому что окно "
+            "этой задачи не пускало. Пущенная окном задача фазу "
+            "получает — это пункты 4 и 6 выше."
+            if ses.alive and errs else
+            "ОТКАЗ ПОТЕРЯН: ни строки в журнале окна, либо работник не "
+            "выжил — это дыра, а не особенность")
         sh.shot(OUT / "bodyfinal_fail.png")
         rep["жизненный цикл"] = lifecycle
     finally:
