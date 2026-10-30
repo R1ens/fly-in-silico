@@ -382,6 +382,14 @@ class BodyConfig:
     vision_bridge: str | None = None
     vision_bridge_boundary: str = "T4/T5"
     vision_bridge_gain: float = 200.0
+    # Потолок подачи переходника. Объявленное правило `min(hz, потолок)`,
+    # и доля упёршихся уезжает в прогон — как у фоторецепторов. Нужен
+    # потому, что значение коррелятора растёт с угловым размером
+    # предмета: при усилении 20 000 на эпизоде 0,8 с пик остаётся под
+    # пределом, а на 1,4 с доходит до 13 320 Гц, то есть выше
+    # `sim.MAX_RATE_HZ`, и один и тот же переходник то работал бы, то
+    # отказывал — в зависимости от того, докуда подошёл предмет.
+    vision_bridge_max_hz: float = 1000.0
     vision_bridge_delay_ms: float = 30.0
     # Два встречных замера переходника. `shuffle` — те же числа другим
     # адресатам (суммарный вход побитово тот же, разрушена только
@@ -1439,6 +1447,8 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                                     "T4/T5")),
                 усиление_hz=float(getattr(cfg, "vision_bridge_gain",
                                           200.0)),
+                потолок_hz=float(getattr(cfg, "vision_bridge_max_hz",
+                                         1000.0)),
                 задержка_мс=float(getattr(cfg, "vision_bridge_delay_ms",
                                           30.0)),
                 кадр_мс=float(cfg.control_ms),
@@ -2177,6 +2187,7 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             if bridged is not None:
                 rec["vbr_hz"] = round(float(bridged["средняя, Гц"]), 4)
                 rec["vbr_max_hz"] = round(float(bridged["наибольшая, Гц"]), 2)
+                rec["vbr_sat"] = round(float(bridged["в потолке, доля"]), 5)
                 rec["vbr_loom"] = round(
                     float(sum(bridged["нависание"].values())), 6)
         records.append(rec)

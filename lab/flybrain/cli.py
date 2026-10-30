@@ -214,6 +214,8 @@ def _spec_from_args(args, kind):
             vision_bridge_boundary=getattr(
                 args, "vision_bridge_boundary", "T4/T5"),
             vision_bridge_gain=getattr(args, "vision_bridge_gain", 200.0),
+            vision_bridge_max_hz=getattr(
+                args, "vision_bridge_max_hz", 1000.0),
             vision_bridge_delay_ms=getattr(
                 args, "vision_bridge_delay_ms", 30.0),
             vision_bridge_shuffle=bool(getattr(
@@ -1060,6 +1062,11 @@ def build_parser():
                         "принадлежат никаким синапсам — они поданы")
     s.add_argument("--vision-bridge-gain", type=float, default=200.0,
                    help="усиление подачи переходника, Гц")
+    s.add_argument("--vision-bridge-max-hz", type=float, default=1000.0,
+                   help="потолок подачи переходника, Гц. Объявленное "
+                        "правило min(hz, потолок); выше 10 000 Гц "
+                        "пуассоновский вход перестаёт быть "
+                        "пуассоновским (sim.MAX_RATE_HZ)")
     s.add_argument("--vision-bridge-delay-ms", type=float, default=30.0,
                    help="плечо задержки коррелятора, мс")
     s.add_argument("--vision-bridge-shuffle", action="store_true",

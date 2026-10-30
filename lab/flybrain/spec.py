@@ -163,6 +163,7 @@ class BodySpec:
     vision_bridge: str | None = None
     vision_bridge_boundary: str = "T4/T5"
     vision_bridge_gain: float = 200.0
+    vision_bridge_max_hz: float = 1000.0
     vision_bridge_delay_ms: float = 30.0
     vision_bridge_shuffle: bool = False
     vision_bridge_subtypes_shuffle: bool = False
@@ -393,6 +394,7 @@ class RunSpec:
             vision_bridge=b.vision_bridge,
             vision_bridge_boundary=b.vision_bridge_boundary,
             vision_bridge_gain=b.vision_bridge_gain,
+            vision_bridge_max_hz=b.vision_bridge_max_hz,
             vision_bridge_delay_ms=b.vision_bridge_delay_ms,
             vision_bridge_shuffle=b.vision_bridge_shuffle,
             vision_bridge_subtypes_shuffle=b.vision_bridge_subtypes_shuffle,
