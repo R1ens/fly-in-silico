@@ -552,6 +552,20 @@ class Engine:
 
         Арифметика не меняется ни на операцию — это те же ядра в том же
         порядке. Равенство проверяется `probe/lif_equal.py`.
+
+        **Если захват сорвётся, состояние вернётся на место.** Захват
+        может не дойти до девятнадцатого графа: под занятой картой не
+        хватит памяти, или карту тронут из другой нити (torch
+        захватывает в режиме ``capture_error_mode="global"``, и такой
+        вызов рвёт захват). Прогрев перед захватом — настоящие три шага,
+        поэтому при срыве без возврата движок молча оставался бы уехавшим
+        вперёд. Замерено (`probe/kernel_fault.py --part срыв`): при срыве
+        на седьмом графе число спайков за 30 шагов оставалось тем же,
+        2048, а отпечаток состояния становился `b156cb46eec6eaf8` вместо
+        `198729b7dbb0b927` — то есть расхождение было невидимым по
+        счётчику спайков. Теперь при срыве состояние возвращается тем же
+        `copy_`, `ptr` ставится назад, а пул и буфер входа отпускаются;
+        исключение при этом поднимается дальше, тихого отката здесь нет.
         """
         if not enable:
             self._graphs = None
@@ -583,19 +597,43 @@ class Engine:
         self.ptr = start_ptr
 
         graphs = []
-        for slot in range(self.buf_len):
-            self.ptr = slot
-            g = torch.cuda.CUDAGraph()
-            # Один пул на все графы: иначе временные тензоры шага
-            # размножатся на девятнадцать.
-            if self._pool is None:
-                with torch.cuda.graph(g):
-                    self._core(self._vstim)
-                self._pool = g.pool()
-            else:
-                with torch.cuda.graph(g, pool=self._pool):
-                    self._core(self._vstim)
-            graphs.append(g)
+        try:
+            for slot in range(self.buf_len):
+                self.ptr = slot
+                g = torch.cuda.CUDAGraph()
+                # Один пул на все графы: иначе временные тензоры шага
+                # размножатся на девятнадцать.
+                if self._pool is None:
+                    with torch.cuda.graph(g):
+                        self._core(self._vstim)
+                    self._pool = g.pool()
+                else:
+                    with torch.cuda.graph(g, pool=self._pool):
+                        self._core(self._vstim)
+                graphs.append(g)
+        except BaseException:
+            # Захват может сорваться НЕ на первом графе: не хватило
+            # памяти под занятой картой, или кто-то тронул карту из
+            # другой нити (torch захватывает в режиме
+            # `capture_error_mode="global"`, и тогда это рвёт захват).
+            # Тогда состояние обязано вернуться на место так же, как при
+            # удачном захвате. Иначе движок МОЛЧА уезжает вперёд на три
+            # шага прогрева: замерено (`probe/kernel_fault.py --part
+            # срыв`) — при срыве на седьмом графе число спайков за 30
+            # шагов остаётся тем же, 2048, а отпечаток состояния
+            # становится `b156cb46eec6eaf8` вместо `198729b7dbb0b927`.
+            # Такое расхождение не поймал бы ни один шлюз равенства,
+            # потому что ловится оно только на пути отказа.
+            self.ptr = start_ptr
+            for name, value in saved.items():
+                getattr(self, name).copy_(value)
+            # Графов нет ни одного живого, поэтому и ручка пула, и буфер
+            # входа уходят: следующая попытка обязана начинать заново, а
+            # не с половины прошлой.
+            self._vstim = None
+            self._pool = None
+            self._graphs = None
+            raise
         self.ptr = start_ptr
         for name, value in saved.items():
             getattr(self, name).copy_(value)
