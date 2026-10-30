@@ -24,8 +24,8 @@ import numpy as np
 
 from . import layout as L
 from . import widgets as W
-from .state import (BODY_VIEWS, PHASES, SANDBOX_Z, VISION, WORKSPACES,
-                    AppState)
+from .state import (BODY_VIEWS, PHASES, SANDBOX_OBJECTS, SANDBOX_Z, VISION,
+                    WORKSPACES, AppState)
 from .tokens import C, R, S, T
 
 __all__ = ["App", "run"]
@@ -63,6 +63,10 @@ class App:
         # неё не попадёт.
         self.series = None
         self._cancel_asked = False
+        # Последняя ошибка работника, уже показанная в простое. Нужна,
+        # чтобы сказать о ней один раз, а не по строке на кадр: `s.error`
+        # держится до следующего прогона. См. `sync`.
+        self._idle_error = ""
 
     # ------------------------------------------------------------- приём
 
@@ -110,6 +114,29 @@ class App:
             # прошлые числа за состояние окна.
             while s.log:
                 st.note(s.log.pop(0))
+            # Кроме одного: ОШИБКИ РАБОТНИКА. Прежде эта ветка сливала
+            # журнал и уходила, а `s.error` не смотрела вовсе — и отказ,
+            # пришедший когда окно уже вернулось в простой, пропадал
+            # целиком, даже из журнала. Поймано `probe/bodyfinal_live.py`
+            # пунктом 7: работник отказал с внятным сообщением
+            # («нет популяции …»), сеанс встал в `error`, а в журнале
+            # окна осталось НОЛЬ строк об этом.
+            #
+            # Фазу `fail` здесь заводить нельзя — окно этой задачи не
+            # пускало, и утверждать обратное значит врать про
+            # собственное состояние. А сказать обязано: отказ, которого
+            # никто не видит, отказом не является.
+            #
+            # Строка пишется один раз на сообщение: `s.error` держится
+            # до следующего прогона, и без этой памяти журнал заполнялся
+            # бы ею по строке на кадр.
+            err = str(s.error or "")
+            if err and err != getattr(self, "_idle_error", ""):
+                self._idle_error = err
+                st.note("работник отказал по задаче, которую это окно не "
+                        "пускало: " + err, "error")
+            elif not err:
+                self._idle_error = ""
             return
 
         if phase != r.phase:
@@ -448,20 +475,43 @@ class App:
         сделанных на ходу.
         """
         sb = self.st.sb
+        # Зрение решается ЗДЕСЬ, до запуска, и на ходу не включается:
+        # глаза либо есть в модели MuJoCo, либо нет, и слоты зрительных
+        # объектов тоже создаются до компиляции. На ходу меняются
+        # подача, усиление, контраст, свет и сами объекты.
+        #
+        # Слоты объектов просятся ТОЛЬКО при включённом зрении: без
+        # глаз объект в сцене есть, но увидеть его нечем, а шесть
+        # лишних геометрий сеанс оплатит. Сеанс без зрения обязан идти
+        # ровно как прежде.
+        live = {"sources": sb.payload()}
+        body = {
+            "readout": str(sb.readout or "ALPN"),
+            "control_ms": 20.0,
+            "keep_s": float(sb.keep_s),
+            "odour_ref": float(sb.odour_ref),
+            "sources": [[s.x, s.y, SANDBOX_Z] for s in sb.slots],
+        }
+        if sb.vision:
+            body.update({
+                "vision": True,
+                "vision_hz": float(sb.vision_hz),
+                "vision_max_hz": float(sb.vision_max_hz),
+                "vision_contrast": float(sb.vision_contrast),
+                "vision_light": float(sb.vision_light),
+                "vis_objects": SANDBOX_OBJECTS,
+            })
+            # Исходные условия объектов: применяются до разогрева и в
+            # сохранённом прогоне стоят отдельно от правок на ходу.
+            live["objects"] = sb.obj_payload()
+        body["live_initial"] = live
         return {
             "kind": "body",
             "t": float(sb.t_run),
             "seed": int(sb.seed),
             "bin_ms": 10.0,
             "open_report": False,
-            "body": {
-                "readout": str(sb.readout or "ALPN"),
-                "control_ms": 20.0,
-                "keep_s": float(sb.keep_s),
-                "odour_ref": float(sb.odour_ref),
-                "sources": [[s.x, s.y, SANDBOX_Z] for s in sb.slots],
-                "live_initial": {"sources": sb.payload()},
-            },
+            "body": body,
         }
 
     def run_ready(self):

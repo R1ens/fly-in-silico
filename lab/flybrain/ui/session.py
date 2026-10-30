@@ -106,6 +106,42 @@ class Session:
         self.proc.start()
 
     def close(self):
+        """Отпустить работника и ВСЁ, что держит этот процесс.
+
+        Три вещи, и две из них здесь прежде не делались.
+
+        **Нить-кормилица очереди команд.** `mp.Queue` заводит её на
+        первом `put`, и `multiprocessing` при выходе процесса ждёт её
+        без срока. Та же ловушка, что разобрана в `ipc.Channel.close`
+        (там процесс стенда провисел шесть минут, а
+        `probe/bodyfinal_timing.py` — семнадцать часов): остаток в
+        трубе не даёт нити кончиться. Команды — последнее, что эта
+        очередь несёт, и после `Shutdown` они никому не нужны, поэтому
+        кормилицу отпускаем явно.
+
+        **Очереди кадров и событий.** `Channel.close()` отпускает
+        кормилицу КАДРОВ всегда, а событий — по просьбе. Здесь просьба
+        уместна: читатель этих событий — само окно, и оно закрывается.
+
+        **Разделяемая память кольца.** `ring.close()` отпускает
+        отображение, но имя остаётся в системе до `unlink()`. Без него
+        каждый сеанс оставляет блок на 15,8 МБ (восемь слотов
+        960×720×3 плюс заголовок), и за долгую смену окна их
+        накапливаются десятки.
+
+        Кольцо создаёт РАБОТНИК (`worker.Worker.boot`), а окно
+        присоединяется к нему по описателю из `Hello`, то есть
+        владельцем здесь оказывается не этот процесс. Отвязывать всё
+        равно надо, и именно здесь: работник к этому моменту уже
+        дожат (`join`, при упорстве `terminate`) и отвязать за собой
+        ничего не успеет, а имя останется. На Windows `unlink` у
+        `shared_memory` и так ничего не делает — сегмент уходит, когда
+        закрыт последний описатель, — поэтому вызов безвреден; на
+        POSIX он снимает имя, которое больше некому держать.
+
+        Каждый шаг в своём `try`: закрытие не должно падать на том, что
+        уже закрыто, иначе следующие шаги не исполнятся вовсе.
+        """
         if self.proc is not None and self.proc.is_alive():
             try:
                 self.cmd.put(ipc.Shutdown())
@@ -114,9 +150,28 @@ class Session:
                 pass
             if self.proc.is_alive():
                 self.proc.terminate()
+        cmd = getattr(self, "cmd", None)
+        if cmd is not None:
+            for name in ("cancel_join_thread", "close"):
+                fn = getattr(cmd, name, None)
+                if fn is None:
+                    continue
+                try:
+                    fn()
+                except Exception:                              # noqa: BLE001
+                    pass
+        if self.chan is not None:
+            try:
+                self.chan.close(drop_events=True)
+            except Exception:                                  # noqa: BLE001
+                pass
         if self.ring is not None:
             try:
                 self.ring.close()
+            except Exception:                                  # noqa: BLE001
+                pass
+            try:
+                self.ring.unlink()
             except Exception:                                  # noqa: BLE001
                 pass
 

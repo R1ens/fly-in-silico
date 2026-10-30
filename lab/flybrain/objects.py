@@ -253,3 +253,206 @@ class Pool:
                  "радиус, мм": s.radius,
                  "цвет": [round(v, 3) for v in s.rgba],
                  "правок": len(s.история)} for s in self.slots]
+
+
+# --------------------------------------------------- заданные траектории
+
+# Пределы отрезка траектории. Те же, что у живой ручки `objects` в
+# `live.BODY_KNOBS` (`_body_object`), и это не совпадение: заданная
+# траектория и правка из окна обязаны принимать одно и то же, иначе
+# «подвинуть мышью» и «записать в спеку» значили бы разное.
+XY_LIM = 150.0          # мм, половина пола OdorArena 300×300
+Z_LIM = (0.0, 60.0)     # мм: ниже пола не видно, выше поля зрения нет
+R_LIM = (0.05, 20.0)    # мм
+
+
+def _leg(tag, d):
+    """Один отрезок траектории: проверка целиком до всякой записи."""
+    known = {"slot", "t0_ms", "t1_ms", "from", "to", "radius", "grey", "on"}
+    extra = set(d) - known
+    if extra:
+        raise ValueError("%s: лишние поля %s; есть %s"
+                         % (tag, ", ".join(sorted(extra)),
+                            ", ".join(sorted(known))))
+
+    def num(name, v, lo, hi):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("%s.%s: нужно число, пришло %r"
+                             % (tag, name, v)) from None
+        if not (lo <= v <= hi):
+            raise ValueError("%s.%s: %g вне предела %g…%g"
+                             % (tag, name, v, lo, hi))
+        return v
+
+    def point(name, v):
+        if not isinstance(v, (list, tuple)) or len(v) != 3:
+            raise ValueError("%s.%s: нужны три числа (x, y, z), пришло %r"
+                             % (tag, name, v))
+        return (num(name + "[0]", v[0], -XY_LIM, XY_LIM),
+                num(name + "[1]", v[1], -XY_LIM, XY_LIM),
+                num(name + "[2]", v[2], *Z_LIM))
+
+    on = d.get("on", True)
+    if not isinstance(on, bool):
+        raise ValueError("%s.on: нужно да или нет, пришло %r" % (tag, on))
+    if "from" not in d:
+        raise ValueError("%s: нет поля from — откуда объект идёт" % tag)
+    a = point("from", d["from"])
+    # Неподвижный объект — это отрезок, у которого `to` не задано: так
+    # «стоит» и «едет» описываются одним и тем же полем, а не двумя
+    # разными ветками, которые могут разойтись.
+    b = point("to", d["to"]) if d.get("to") is not None else a
+    t0 = num("t0_ms", d.get("t0_ms", 0.0), 0.0, 1e9)
+    t1 = num("t1_ms", d.get("t1_ms", t0), 0.0, 1e9)
+    if t1 < t0:
+        raise ValueError("%s: t1_ms %g раньше t0_ms %g" % (tag, t1, t0))
+    return {"slot": int(num("slot", d.get("slot", 0), 0, POOL - 1)),
+            "t0_ms": t0, "t1_ms": t1, "from": a, "to": b,
+            "radius": num("radius", d.get("radius", RADIUS), *R_LIM),
+            "grey": num("grey", d.get("grey", RGBA[0]), 0.0, 1.0),
+            "on": on}
+
+
+class Track:
+    """Заданная траектория объектов: воспроизводимая и сохранённая.
+
+    Зачем она нужна, когда есть живая ручка `objects`. Живая ручка — это
+    **человек мышью**, и повторить такой сеанс нельзя: правки легли в
+    журнал с модельным временем, но заново их никто не наберёт. Трек,
+    наоборот, целиком лежит в спеке прогона: тот же файл даёт то же
+    движение объекта до миллисекунды модельного времени.
+
+    Правило одно и объявлено: между ``t0_ms`` и ``t1_ms`` положение
+    линейно по МОДЕЛЬНОМУ времени, до ``t0_ms`` объект убран, после
+    ``t1_ms`` стоит в конечной точке. Применяется на границе шага
+    управления — там же, где живые правки, и по той же причине: внутри
+    шага состояние модели не целостно.
+
+    Нависание отсюда получается само, геометрией: отрезок «издалека по
+    курсу к мухе» даёт угловой размер 2·arctan(r/d), и предсказание
+    сходится с замером по сетчатке с корреляцией 0,9990
+    (`probe/objects.py`). Тёмное и светлое нависание — это один и тот же
+    отрезок с ``grey`` 0,1 и 0,9; ничего кроме цвета в них не
+    различается, и поэтому их можно сравнивать.
+    """
+
+    def __init__(self, legs):
+        if not isinstance(legs, (list, tuple)):
+            raise ValueError("траектория: нужен список отрезков, пришло %r"
+                             % type(legs).__name__)
+        self.legs = [_leg("траектория[%d]" % i,
+                          d if isinstance(d, dict) else {})
+                     for i, d in enumerate(legs)]
+        if not self.legs:
+            raise ValueError("траектория: ни одного отрезка")
+        self.slots_used = sorted({w["slot"] for w in self.legs})
+        self._last = {}
+
+    def need_slots(self):
+        """Сколько слотов пула обязано быть в модели."""
+        return max(self.slots_used) + 1
+
+    def at(self, t_ms):
+        """Чего трек хочет от каждого слота на это модельное время."""
+        want = {}
+        for w in self.legs:
+            if t_ms < w["t0_ms"]:
+                continue
+            span = w["t1_ms"] - w["t0_ms"]
+            u = 1.0 if span <= 0 else min(
+                1.0, (float(t_ms) - w["t0_ms"]) / span)
+            a, b = np.asarray(w["from"]), np.asarray(w["to"])
+            pos = tuple(float(v) for v in (a + (b - a) * u))
+            g = w["grey"]
+            # Позже заданный отрезок перекрывает прежний: так один слот
+            # можно провести по ломаной, перечислив звенья по порядку.
+            want[w["slot"]] = {"on": w["on"], "pos": pos,
+                               "radius": w["radius"],
+                               "rgba": (g, g, g, 1.0)}
+        return want
+
+    def apply(self, pool, t_ms, cmd="трек"):
+        """Поставить слоты по треку. Возвращает номера тронутых слотов.
+
+        Правка в модель идёт ТОЛЬКО когда заказанное изменилось: иначе
+        журнал слота распухал бы одинаковыми записями по одной на шаг
+        управления, а `Pool._push` переписывал бы всю модель впустую.
+        """
+        touched = []
+        for i, w in self.at(t_ms).items():
+            if i >= len(pool.slots):
+                raise ValueError(
+                    "трек просит слот %d, а в пуле их %d: число слотов "
+                    "задаётся при сборке модели (`objects.inject`), на "
+                    "ходу тела в MuJoCo не добавляются"
+                    % (i, len(pool.slots)))
+            key = (w["on"], tuple(round(v, 6) for v in w["pos"]),
+                   round(w["radius"], 6), tuple(round(v, 6)
+                                                for v in w["rgba"]))
+            if self._last.get(i) == key:
+                continue
+            self._last[i] = key
+            pool.set(i, on=w["on"], pos=w["pos"], radius=w["radius"],
+                     rgba=w["rgba"], t_ms=t_ms, cmd=cmd)
+            touched.append(i)
+        return touched
+
+    def state(self):
+        """Трек для записи прогона: ровно то, что было задано."""
+        return [{"слот": w["slot"],
+                 "с, мс": w["t0_ms"], "по, мс": w["t1_ms"],
+                 "из, мм": [round(v, 3) for v in w["from"]],
+                 "в, мм": [round(v, 3) for v in w["to"]],
+                 "радиус, мм": w["radius"], "серость": w["grey"],
+                 "включён": w["on"],
+                 "неподвижен": w["from"] == w["to"]} for w in self.legs]
+
+
+# Готовые треки. Это не украшение: нависание, движение и неподвижность
+# должны задаваться ОДНИМ способом, иначе каждый опыт пересобирает
+# геометрию заново и сравнивать их нельзя.
+#
+# Числа взяты из опубликованного зрительного таксиса NeuroMechFly (шар
+# радиусом 1 мм) и из замеров нависания в `probe/objects.py`: муха
+# стоит около (0; 0), объект идёт по курсу +x с 30 мм до 3 мм за
+# секунду модельного времени — это 27 мм/с, и угловой размер за это
+# время растёт с 3,8° до 38,9°.
+PRESETS = {
+    "loom_dark": [
+        {"slot": 0, "t0_ms": 0.0, "t1_ms": 1000.0,
+         "from": (30.0, 0.0, 1.5), "to": (3.0, 0.0, 1.5),
+         "radius": 1.0, "grey": 0.1},
+    ],
+    "loom_light": [
+        {"slot": 0, "t0_ms": 0.0, "t1_ms": 1000.0,
+         "from": (30.0, 0.0, 1.5), "to": (3.0, 0.0, 1.5),
+         "radius": 1.0, "grey": 0.9},
+    ],
+    "sweep": [
+        # Движущийся объект, который НЕ нависает: идёт поперёк курса на
+        # постоянном удалении, то есть угловой размер держится, а место
+        # в поле зрения едет. Нужен затем, чтобы отличить ответ на
+        # движение от ответа на расширение.
+        {"slot": 0, "t0_ms": 0.0, "t1_ms": 1000.0,
+         "from": (10.0, -10.0, 1.5), "to": (10.0, 10.0, 1.5),
+         "radius": 1.0, "grey": 0.1},
+    ],
+    "still": [
+        # Неподвижный объект: встречный замер к обоим движущимся. Стоит
+        # там, где нависающий оказывается на середине пути.
+        {"slot": 0, "t0_ms": 0.0, "t1_ms": 0.0,
+         "from": (16.5, 0.0, 1.5), "to": None,
+         "radius": 1.0, "grey": 0.1},
+    ],
+}
+
+
+def preset(name):
+    """Готовый трек по имени. Неизвестное имя — отказ со списком."""
+    name = str(name)
+    if name not in PRESETS:
+        raise ValueError("неизвестный трек %r; есть: %s"
+                         % (name, ", ".join(sorted(PRESETS))))
+    return [dict(d) for d in PRESETS[name]]

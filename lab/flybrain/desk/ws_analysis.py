@@ -604,6 +604,99 @@ def _broken(app, ctx, s, content, run):
         s.take(h, sc.px(S.xs))
 
 
+def _vision_block(app, ctx, s, content, run):
+    """Происхождение зрения прогона: чем считалось и что это значит.
+
+    Отсутствие блока — это «зрение было выключено»: так посчитаны все
+    прежние прогоны, и ключа `timing["зрение"]` у них нет вовсе.
+    Рисовать для них «зрение: нет» значило бы заводить строку, которой
+    в данных не было.
+
+    Что здесь ОБЯЗАНО быть видно, и это требование, а не украшение:
+    какой переходник считал, какой привязкой, с каким отпечатком, и
+    что привязка инженерная и провалила внешнюю проверку. Последнее
+    приходит не отсюда, а из оговорок прогона — они выше и жёлтым; тут
+    стоит короткая строка с тем же итогом, чтобы не пришлось сличать
+    два места.
+    """
+    vis = run.vision
+    if not isinstance(vis, dict):
+        return
+    sc, f = app.sh.sc, app.sh.fonts
+    pr = vis.get("привязка") or {}
+
+    def num(v):
+        # Прочерк, а не «None»: отсутствующее число должно выглядеть
+        # отсутствующим, иначе читающий примет его за значение.
+        return "—" if v is None else _num(v)
+
+    W.section(ctx, s, "Зрение", wid="ana/vis",
+              right=str(pr.get("отпечаток набора") or ""),
+              info="Справа — отпечаток набора привязок "
+                   "(`retina.fingerprint_all`): по нему прогон "
+                   "опознаётся однозначно, и два прогона с разным "
+                   "отпечатком считались разной привязкой. Частота "
+                   "обновления показана и заказанной, и ИЗМЕРЕННОЙ по "
+                   "отметкам FlyGym: они обязаны совпадать, и если не "
+                   "совпали — верить надо измеренной.")
+    rows = [
+        ("переходник", "%s v%s" % (pr.get("переходник", "?"),
+                                   pr.get("версия переходника", "?")), ""),
+        # Версия самой привязки, а не кода переходника: прежняя
+        # привязка сохраняется как историческая, исправленная придёт
+        # отдельным именем, и по прогону обязано быть видно, какая
+        # считала.
+        ("версия привязки", str(pr.get("версия привязки") or "—"), ""),
+        ("глаза", str(pr.get("глаза", "?")), ""),
+        ("фоторецепторов", str(pr.get("фоторецепторов всего", "?")), "шт"),
+        ("обновление: заказано",
+         num(vis.get("частота обновления заказана, Гц")), "Гц"),
+        ("обновление: измерено",
+         num(vis.get("частота обновления измерена, Гц")), "Гц"),
+        ("обновлений за сеанс",
+         num(vis.get("обновлений кадра за сеанс")), "шт"),
+        ("привязка", "%s / %s" % (pr.get("способ") or
+                                  (pr.get("правило") or ["", "", ""])[2],
+                                  pr.get("назначение") or ""), ""),
+        ("перемешана (встречный замер)",
+         "да" if pr.get("перемешано (встречный замер)") else "нет", ""),
+        ("контраст кадра", num(vis.get("контраст")), "×"),
+    ]
+    light = vis.get("свет сцены") or {}
+    if light.get("множитель") is not None:
+        rows.append(("свет сцены", num(light.get("множитель")), "×"))
+    for title, val, unit in rows:
+        if not s.fits(sc.px(S.row)):
+            return
+        W.kv(ctx, s.take(sc.px(S.row)), title, val, unit)
+    # Итог внешней проверки — одной строкой и красным. Это не оговорка
+    # про картинку, а то, чем привязка является.
+    ext = (pr.get("внешняя проверка") or {}).get("итог")
+    if ext and s.fits(f.micro.gh * 2):
+        h = W.label(ctx, L.Rect(content.x, s.area.y, content.w, s.area.h),
+                    "внешняя проверка: " + str(ext), role="micro",
+                    color=C.danger, wrapped=True)
+        s.take(h, sc.px(S.xs))
+    what = pr.get("что каналы обеспечивают")
+    if what and s.fits(f.micro.gh * 2):
+        h = W.label(ctx, L.Rect(content.x, s.area.y, content.w, s.area.h),
+                    str(what), role="micro", color=C.warn, wrapped=True)
+        s.take(h, sc.px(S.xs))
+    track = vis.get("траектория") or []
+    if track and s.fits(f.micro.gh * 2):
+        W.label(ctx, s.take(f.small.gh + sc.px(2)),
+                "Траектория объектов", role="small", color=C.dim)
+        for w in track:
+            if not s.fits(f.micro.gh):
+                break
+            W.label(ctx, s.take(f.micro.gh + sc.px(2)),
+                    "слот %s: %s → %s мм, r %s, серость %s, %s…%s мс"
+                    % (w.get("слот"), w.get("из, мм"), w.get("в, мм"),
+                       w.get("радиус, мм"), w.get("серость"),
+                       w.get("с, мс"), w.get("по, мс")),
+                    role="micro", color=C.faint)
+
+
 def _population_of(run, d):
     out = []
     ep = d.get("episode.json") or d.get("embodied.json") or {}
@@ -1622,6 +1715,7 @@ def _tab_science(app, ctx, r, run):
                                     s.area.h), "— " + line, role="micro",
                         color=C.warn, wrapped=True)
             s.take(h, sc.px(S.xs))
+    _vision_block(app, ctx, s, content, run)
     _broken(app, ctx, s, content, run)
     for p in PL.available(run):
         if not p.caveat or not s.fits(f.micro.gh * 2):

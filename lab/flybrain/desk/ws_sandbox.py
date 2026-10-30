@@ -31,8 +31,15 @@
 реальном времени» здесь нет, потому что это неправда — у тела в MuJoCo
 отношение около 0,06.
 
-Чего в первой итерации нет нарочно: испуга, бегства и зрения. Контур
-здесь один — обонятельный, и он замкнут по-настоящему.
+**Зрение здесь есть, и ограничение его не прячется.** Кадр обоих
+сложных глаз — настоящее наблюдение сцены MuJoCo — подаётся в 10 582
+фоторецептора коннектома, свет и контраст регулируются, объекты
+размещаются и двигаются руками. Но замкнут по-настоящему по-прежнему
+ОДИН контур — обонятельный: ранняя зрительная активность измерена
+(L1, L2, L3, Tm1), а глубокая зависящая от стимула передача нет
+(T4, T5, LPLC2, LC4, DNp01 — ровно 0,000 Гц). Поэтому поведение мухи на
+зрение не опирается, и сценарной анимации побега здесь нет и не будет:
+нарисовать её значило бы показать то, чего не считается.
 """
 
 import math
@@ -216,6 +223,19 @@ def answers(app):
                     sb.stim_bad = False
                 if "orn_max_hz" in rec.values:
                     sb.applied_orn_hz = float(rec.values["orn_max_hz"])
+                # Подтверждённое зрительное состояние — от работника, а
+                # не от собственного замысла: пока они расходятся,
+                # панель показывает именно расхождение.
+                if "objects" in rec.values:
+                    sb.applied_objects = list(rec.values["objects"])
+                if "vision_feed" in rec.values:
+                    sb.applied_feed = bool(rec.values["vision_feed"])
+                if "vision_max_hz" in rec.values:
+                    sb.applied_vis_hz = float(rec.values["vision_max_hz"])
+                if "vision_contrast" in rec.values:
+                    sb.applied_contrast = float(rec.values["vision_contrast"])
+                if "vision_light" in rec.values:
+                    sb.applied_light = float(rec.values["vision_light"])
                 if "lesion" in rec.values:
                     sb.applied_lesions = list(rec.values["lesion"])
                     sb.les_note = ""
@@ -344,6 +364,199 @@ def _send(app, what, payload=None, action="set", fields=()):
 def _send_slots(app, what):
     return _send(app, what, {"sources": app.st.sb.payload()},
                  fields=("sources",))
+
+
+def _send_objects(app, what):
+    return _send(app, what, {"objects": app.st.sb.obj_payload()},
+                 fields=("objects",))
+
+
+VISION_HELP = (
+    "Кадр ОБОИХ сложных глаз — настоящее наблюдение сцены MuJoCo, 721 "
+    "омматидий на глаз — подаётся в 10 582 фоторецептора коннектома. "
+    "Включается ДО запуска и на ходу не включается: глаза создаются при "
+    "сборке модели, как и слоты объектов. На ходу меняются подача, "
+    "частота рецепторов, контраст, свет и сами объекты. "
+    "Цена замерена попарно: шаг со зрением при 100 Гц в 1,16 раза "
+    "дороже, при 250 Гц в 1,36, при 500 Гц в 1,66; сама привязка с "
+    "подачей — 0,850 мс, то есть 0,17 % шага физики. "
+    "ОГРАНИЧЕНИЕ НЕ ПРЯЧЕТСЯ. Ранняя зрительная активность измерена "
+    "(L1 12,04 Гц, L2 12,64, L3 2,27, Tm1 2,05 против 0,000 при "
+    "выключенном зрении), а глубокая зависящая от стимула передача НЕТ: "
+    "T4, T5, LPLC2, LC4 и DNp01 дают ровно 0,000 Гц. Поведение мухи на "
+    "зрение не опирается. Привязка омматидиев инженерная и опровергнута "
+    "внешним свидетелем: R7 и R8 одной зрительной колонки обязаны лечь "
+    "в один омматидий, а ложатся в 0 парах из 430 против 2 из 430 у "
+    "перемешанной. Обеспеченное свойство каналов одно — соседство "
+    "внутри одной популяции, и ретинотопией это не является.")
+
+OBJ_HELP = (
+    "Слотов два, и это предел сеанса: объект — тело MJCF, оно "
+    "создаётся при сборке модели и на ходу не добавляется, а каждая "
+    "лишняя геометрия меняет порядок растеризации кадра глаза. "
+    "Серость задаёт тёмный или светлый раздражитель: 0,1 — почти "
+    "чёрный, 0,9 — почти белый, и отличаются такие два опыта ровно "
+    "цветом. Нависание получается само, геометрией: угловой размер "
+    "равен 2·arctan(r/d), и предсказание сходится с замером по "
+    "сетчатке с корреляцией 0,9990. Выключенный слот уезжает на 5 мм "
+    "под пол и становится прозрачным — так сцена без объектов "
+    "неотличима от сцены без пула.")
+
+
+def _vision_panel(app, ctx, s, content, live):          # noqa: C901
+    """Зрение сеанса: что ставится до запуска, а что на ходу.
+
+    Разделение здесь не оформительское. `vision` и частота обновления
+    зашиты в модель при сборке — их рейка отключается, как только сеанс
+    пошёл. Подача, частота рецепторов, контраст, свет и объекты —
+    живые, и у каждой правки свой номер команды, своё подтверждение по
+    модельному времени и своя запись в журнале.
+    """
+    sc, f = app.sh.sc, app.sh.fonts
+    sb = app.st.sb
+    W.section(ctx, s, "Зрение", wid="sb/vis", info=VISION_HELP,
+              right=("оба глаза" if sb.vision else "выключено"))
+    sb.vision = W.toggle(ctx, "sb/vison", s.take(sc.px(S.row)), sb.vision,
+                         "подавать кадр глаз в сеть", enabled=not live,
+                         tip="ставится до запуска: глаза создаются при "
+                             "сборке модели MuJoCo")
+    if not sb.vision:
+        if s.fits(f.micro.gh * 2):
+            h = W.label(ctx, L.Rect(content.x, s.area.y, content.w,
+                                    s.area.h),
+                        "сеанс пойдёт без зрения — ровно как все "
+                        "сохранённые прогоны", role="micro", color=C.faint,
+                        wrapped=True)
+            s.take(h, sc.px(S.xs))
+        return
+    sb.vision_hz = W.numeric(ctx, "sb/vishz", s.take(sc.px(S.control)),
+                             sb.vision_hz, 1.0, 1000.0, 10.0, "Гц",
+                             label="обновление", enabled=not live,
+                             fmt="{:.0f}",
+                             tip="рабочая точка 100 Гц выбрана по замеру "
+                                 "цены шага, а не выведена из биологии; "
+                                 "быстрые переходные процессы смотрят "
+                                 "выше")
+    was = sb.vision_feed
+    sb.vision_feed = W.toggle(ctx, "sb/visfeed", s.take(sc.px(S.row)),
+                              sb.vision_feed, "подача включена",
+                              enabled=live,
+                              tip="выключить подачу, не выключая глаз: "
+                                  "кадр продолжит рисоваться, а в сеть "
+                                  "не пойдёт. Сеанс после этого не "
+                                  "сравним с эталонным, и в прогоне "
+                                  "будет оговорка")
+    if sb.vision_feed != was and live:
+        sb.applied_feed = sb.vision_feed
+        _send(app, "подача зрения %s" % ("включена" if sb.vision_feed
+                                         else "выключена"),
+              {"vision_feed": bool(sb.vision_feed)},
+              fields=("vision_feed",))
+    sb.vision_max_hz = W.slider(ctx, "sb/vismax", s.take(sc.px(40)),
+                                sb.vision_max_hz, 0.0, 400.0,
+                                "частота фоторецепторов", "Гц",
+                                fmt="{:.0f}", enabled=live,
+                                tip="сколько герц дают фоторецепторы при "
+                                    "насыщении")
+    if (_settled(ctx) and live
+            and abs(sb.vision_max_hz - sb.applied_vis_hz) > 1e-9):
+        sb.applied_vis_hz = sb.vision_max_hz
+        _send(app, "частота фоторецепторов %s Гц"
+                   % _fmt(sb.vision_max_hz, 0),
+              {"vision_max_hz": float(sb.vision_max_hz)},
+              fields=("vision_max_hz",))
+    sb.vision_contrast = W.slider(ctx, "sb/viscon", s.take(sc.px(40)),
+                                  sb.vision_contrast, 0.0, 4.0,
+                                  "контраст кадра", "×", fmt="{:.2f}",
+                                  enabled=live,
+                                  tip="clip(0,5 + (I − 0,5)·k): "
+                                      "объявленное преобразование "
+                                      "кадра, а не свойство сцены. При "
+                                      "1 не исполняется вовсе")
+    if (_settled(ctx) and live
+            and abs(sb.vision_contrast - sb.applied_contrast) > 1e-9):
+        sb.applied_contrast = sb.vision_contrast
+        _send(app, "контраст кадра %s" % _fmt(sb.vision_contrast, 2),
+              {"vision_contrast": float(sb.vision_contrast)},
+              fields=("vision_contrast",))
+    sb.vision_light = W.slider(ctx, "sb/vislight", s.take(sc.px(40)),
+                               sb.vision_light, 0.0, 4.0, "свет сцены",
+                               "×", fmt="{:.2f}", enabled=live,
+                               tip="множитель к ambient и diffuse "
+                                   "НАСТОЯЩИХ источников MuJoCo арены: "
+                                   "меняется сам рендер кадра глаза")
+    if (_settled(ctx) and live
+            and abs(sb.vision_light - sb.applied_light) > 1e-9):
+        sb.applied_light = sb.vision_light
+        _send(app, "свет сцены %s" % _fmt(sb.vision_light, 2),
+              {"vision_light": float(sb.vision_light)},
+              fields=("vision_light",))
+
+    # --- зрительные объекты ---
+    W.section(ctx, s, "Зрительные объекты", wid="sb/obj", info=OBJ_HELP,
+              right="слотов %d" % len(sb.objects))
+    for i, o in enumerate(sb.objects):
+        if not s.fits(sc.px(S.row) + sc.px(S.control) * 2):
+            break
+        head = s.take(sc.px(S.row))
+        was_on = o.on
+        o.on = W.toggle(ctx, "sb/oon%d" % i, head, o.on,
+                        "объект %d" % (i + 1), enabled=live,
+                        tip="выключенный уезжает под пол и становится "
+                            "прозрачным")
+        if o.on != was_on:
+            _send_objects(app, "объект %d %s"
+                               % (i + 1, "включён" if o.on else "выключен"))
+        row = s.take(sc.px(S.control))
+        half = row.cols(2, gap=sc.px(S.sm))
+        nx = W.numeric(ctx, "sb/ox%d" % i, half[0], o.x, -150.0, 150.0,
+                       1.0, "мм", label="x", enabled=live)
+        ny = W.numeric(ctx, "sb/oy%d" % i, half[1], o.y, -150.0, 150.0,
+                       1.0, "мм", label="y", enabled=live)
+        row = s.take(sc.px(S.control))
+        half = row.cols(2, gap=sc.px(S.sm))
+        nz = W.numeric(ctx, "sb/oz%d" % i, half[0], o.z, 0.0, 60.0,
+                       0.5, "мм", label="z", enabled=live)
+        nr = W.numeric(ctx, "sb/or%d" % i, half[1], o.radius, 0.05, 20.0,
+                       0.25, "мм", label="радиус", enabled=live)
+        ng = W.slider(ctx, "sb/og%d" % i, s.take(sc.px(40)), o.grey,
+                      0.0, 1.0, "серость", "", fmt="{:.2f}", enabled=live,
+                      tip="0,1 — тёмный раздражитель, 0,9 — светлый")
+        changed = (abs(nx - o.x) > 1e-9 or abs(ny - o.y) > 1e-9
+                   or abs(nz - o.z) > 1e-9 or abs(nr - o.radius) > 1e-9
+                   or abs(ng - o.grey) > 1e-9)
+        o.x, o.y, o.z, o.radius, o.grey = nx, ny, nz, nr, ng
+        if changed and _settled(ctx):
+            _send_objects(app, "объект %d: (%s, %s, %s) мм, r %s, "
+                               "серость %s"
+                               % (i + 1, _fmt(nx, 1), _fmt(ny, 1),
+                                  _fmt(nz, 1), _fmt(nr, 2), _fmt(ng, 2)))
+        # Угловой размер — замер, а не украшение: это та величина, по
+        # которой нависание отличается от простого движения. Считается
+        # от положения мухи этого кадра, и если его нет — не считается
+        # вовсе.
+        ex = (app.ses.extra or {}) if app.ses is not None else {}
+        fx, fy = ex.get("x"), ex.get("y")
+        if o.on and fx is not None and fy is not None and s.fits(f.micro.gh):
+            d = math.sqrt((nx - float(fx)) ** 2 + (ny - float(fy)) ** 2
+                          + nz ** 2)
+            ang = (180.0 if d <= nr
+                   else math.degrees(2.0 * math.atan(nr / d)))
+            W.label(ctx, s.take(f.micro.gh + sc.px(2)),
+                    "в %s мм от мухи, угловой размер %s°"
+                    % (_fmt(d, 1), _fmt(ang, 2)),
+                    role="micro", color=C.faint)
+        if sb.applied_objects and i < len(sb.applied_objects):
+            a = sb.applied_objects[i]
+            diff = (abs(float(a["x"]) - o.x) > 1e-3
+                    or abs(float(a["y"]) - o.y) > 1e-3
+                    or bool(a["on"]) != o.on)
+            if diff and s.fits(f.micro.gh):
+                W.label(ctx, s.take(f.micro.gh + sc.px(2)),
+                        "в модели: (%s, %s) мм, %s; ваша правка ещё не "
+                        "применена" % (_fmt(a["x"], 1), _fmt(a["y"], 1),
+                                       "включён" if a["on"] else "выключен"),
+                        role="micro", color=C.warn)
 
 
 def _settled(ctx):
@@ -747,6 +960,8 @@ def inspector(app, ctx, r):                                   # noqa: C901
                         "в модели: (%s, %s) мм; ваша правка ещё не "
                         "применена" % (_fmt(a["x"], 1), _fmt(a["y"], 1)),
                         role="micro", color=C.warn)
+
+    _vision_panel(app, ctx, s, content, live)
 
     # --- прямой стимул ---
     W.section(ctx, s, "Прямой стимул", wid="sb/stim", info=STIM_HELP)
