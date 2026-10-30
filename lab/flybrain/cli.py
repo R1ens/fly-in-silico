@@ -34,6 +34,60 @@ def _slug(text, limit=48):
     return s[:limit] or "run"
 
 
+def _vision_presets():
+    """Имена зрительных пресетов — для подсказки argparse.
+
+    Берутся у `spec`, а не перечисляются здесь: два списка на одно
+    множество неизбежно расходятся, и расходиться они будут в
+    подсказке, то есть незаметно.
+    """
+    from . import spec as S
+
+    return tuple(sorted(S.VISION_PRESETS))
+
+
+def _object_presets():
+    from . import objects as O
+
+    return tuple(sorted(O.PRESETS))
+
+
+# Подсказка собирается на построении парсера, то есть при каждом вызове
+# `fly`. Оба импорта дешёвые: `spec` и `objects` не тянут ни MuJoCo, ни
+# torch.
+S_VISION_PRESETS = _vision_presets()
+
+
+def _track_from_args(args):
+    """Траектория объектов из `--track`: имя пресета или файл json.
+
+    Разворачивается ЗДЕСЬ, в список отрезков: в `spec.json` прогона
+    должно лежать то, что считалось, а не имя, у которого завтра другой
+    смысл. Отказ громкий — молча посчитать эпизод без объекта хуже, чем
+    не посчитать его вовсе.
+    """
+    from . import objects as O
+
+    raw = getattr(args, "vis_track", None)
+    if not raw:
+        return None
+    if str(raw) in O.PRESETS:
+        return O.preset(str(raw))
+    p = Path(str(raw))
+    if not p.exists():
+        raise SystemExit(
+            "траектория %r — ни имя пресета, ни существующий файл. "
+            "Пресеты: %s" % (raw, ", ".join(sorted(O.PRESETS))))
+    try:
+        legs = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit("траектория %s не читается: %s" % (p, exc))
+    # Проверяется здесь же, до всякой сборки тела: отказ на двадцатой
+    # секунде сборки MuJoCo стоит дороже, чем на нулевой.
+    O.Track(legs)
+    return legs
+
+
 def cmd_fetch_annotations(args):
     import urllib.request
 
@@ -143,7 +197,29 @@ def _spec_from_args(args, kind):
             head_stab=bool(getattr(args, "head_stab", False)),
             neck_kp=getattr(args, "neck_kp", None),
             probes=not getattr(args, "no_probes", False),
-            spmv=getattr(args, "spmv", None))
+            spmv=getattr(args, "spmv", None),
+            vision=bool(getattr(args, "vision", False)),
+            vision_hz=getattr(args, "vision_hz", 100.0),
+            vision_adapter=getattr(args, "vision_adapter", "retina"),
+            vision_max_hz=getattr(args, "vision_max_hz", 150.0),
+            vision_ref=getattr(args, "vision_ref", 0.5),
+            vision_channel=getattr(args, "vision_channel", "max"),
+            vision_eyes=getattr(args, "vision_eyes", "both"),
+            vision_mode=getattr(args, "vision_mode", "whiten"),
+            vision_assign=getattr(args, "vision_assign", "capacity"),
+            vision_shuffle=bool(getattr(args, "vision_shuffle", False)),
+            vision_light=getattr(args, "vision_light", 1.0),
+            vision_contrast=getattr(args, "vision_contrast", 1.0),
+            vis_objects=int(getattr(args, "vis_objects", 0) or 0),
+            vis_track=_track_from_args(args))
+        # Пресет накладывается ПОВЕРХ флагов и в самом конце, а не
+        # вместо них: иначе `--vision-preset loom-dark --vision-hz 250`
+        # молча считался бы на сотне. Поля, которых пресет не называет,
+        # остаются как заданы флагами.
+        preset = getattr(args, "vision_preset", None)
+        if preset:
+            for k, v in S.vision_preset(preset).items():
+                setattr(sp.body, k, v)
     elif kind == "lateral":
         sp.lateral = S.LateralSpec(base_hz=args.base, depth=args.depth,
                                    period_s=args.period, top=args.top)
@@ -913,6 +989,59 @@ def build_parser():
                         "умолчанию 500, опубликованное значение)")
     s.add_argument("--no-probes", action="store_true",
                    help="не писать readout_* прямых зондов в запись")
+    # --- зрение ---
+    #
+    # Зрение ВЫКЛЮЧЕНО по умолчанию: прежний опыт, пересчитанный новой
+    # сборкой, обязан совпасть с сохранённым. Включается явно — флагом
+    # или готовым пресетом.
+    s.add_argument("--vision", action="store_true",
+                   help="подать кадр обоих сложных глаз в фоторецепторы "
+                        "коннектома (по умолчанию выключено)")
+    s.add_argument("--vision-preset", default=None,
+                   help="готовый зрительный опыт: " + ", ".join(
+                       sorted(S_VISION_PRESETS)) + ". Ставит сразу все "
+                        "условия, включая зрение и объект в сцене")
+    s.add_argument("--vision-hz", type=float, default=100.0,
+                   help="частота обновления зрения, Гц. РАБОЧАЯ ТОЧКА, а "
+                        "не биологическая постоянная: 100 Гц выбраны по "
+                        "замеру цены шага")
+    s.add_argument("--vision-adapter", default="retina",
+                   help="зрительный переходник по имени "
+                        "(flybrain.vision.ADAPTERS)")
+    s.add_argument("--vision-max-hz", type=float, default=150.0,
+                   help="частота фоторецепторов при насыщении, Гц")
+    s.add_argument("--vision-ref", type=float, default=0.5,
+                   help="яркость кадра, считающаяся насыщением")
+    s.add_argument("--vision-channel", default="max",
+                   choices=("max", "pale", "yellow"),
+                   help="что делать с двумя каналами фоторецептора")
+    s.add_argument("--vision-eyes", default="both",
+                   choices=("both", "left", "right"),
+                   help="оба глаза или один (один — контроль)")
+    s.add_argument("--vision-mode", default="whiten",
+                   choices=("whiten", "rigid"),
+                   help="совмещение облаков в привязке омматидиев")
+    s.add_argument("--vision-assign", default="capacity",
+                   choices=("capacity", "nearest"),
+                   help="назначение нейрона омматидию")
+    s.add_argument("--vision-shuffle", action="store_true",
+                   help="ВСТРЕЧНЫЙ ЗАМЕР: перемешать привязку с "
+                        "сохранением числа нейронов на омматидий — "
+                        "суммарный вход тот же до последнего разряда")
+    s.add_argument("--vision-light", type=float, default=1.0,
+                   help="множитель к свету арены (настоящие источники "
+                        "MuJoCo: меняется сам кадр глаза)")
+    s.add_argument("--vision-contrast", type=float, default=1.0,
+                   help="контраст кадра: clip(0,5 + (I − 0,5)·k). "
+                        "Объявленное преобразование кадра, не свойство "
+                        "сцены")
+    s.add_argument("--objects", type=int, default=0, dest="vis_objects",
+                   help="сколько слотов зрительных объектов вписать в "
+                        "сцену (тела MuJoCo создаются до компиляции)")
+    s.add_argument("--track", default=None, dest="vis_track",
+                   help="готовая траектория объекта: " + ", ".join(
+                       sorted(_object_presets())) + "; или путь к json "
+                        "со списком отрезков")
     s.add_argument("--device", default=None)
     s.add_argument("--out", default=None)
     s.add_argument("--no-open", action="store_true")

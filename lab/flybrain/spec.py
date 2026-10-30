@@ -22,7 +22,7 @@ import numpy as np
 
 __all__ = ["VERSION", "KINDS", "StimTerm", "StimSpec", "ArenaSpec", "BodySpec",
            "LateralSpec", "VerifySpec", "AgentSpec", "RunSpec", "DEMOS",
-           "GOALS", "from_dict"]
+           "GOALS", "VISION_PRESETS", "vision_preset", "from_dict"]
 
 VERSION = 1
 
@@ -133,6 +133,30 @@ class BodySpec:
     # требует `nvcc` на машине и отказывает громко, а не молча.
     spmv: str = None
     probes: bool = True
+
+    # --- зрение (`flybrain.vision`, `flybrain.retina`, `objects`) ---
+    #
+    # Умолчания повторяют `body.BodyConfig` слово в слово, и главное из
+    # них — `vision = False`. Прежний опыт, открытый новой сборкой,
+    # обязан считаться без зрения: все 28 сохранённых прогонов посчитаны
+    # так, и ключа `vision` в их `spec.json` нет вовсе.
+    #
+    # Пресеты со ВКЛЮЧЁННЫМ зрением объявлены отдельно и явно:
+    # :data:`VISION_PRESETS`.
+    vision: bool = False
+    vision_hz: float = 100.0
+    vision_adapter: str = "retina"
+    vision_max_hz: float = 150.0
+    vision_ref: float = 0.5
+    vision_channel: str = "max"
+    vision_eyes: str = "both"
+    vision_mode: str = "whiten"
+    vision_assign: str = "capacity"
+    vision_shuffle: bool = False
+    vision_light: float = 1.0
+    vision_contrast: float = 1.0
+    vis_objects: int = 0
+    vis_track: list = None
 
 
 @dataclass
@@ -340,6 +364,23 @@ class RunSpec:
             neck_kp=b.neck_kp,
             probes=b.probes,
             spmv=b.spmv,
+            # Зрение. Переносится полем в поле, без единого выражения:
+            # всякая арифметика здесь означала бы, что окно и командная
+            # строка собирают разное.
+            vision=b.vision,
+            vision_hz=b.vision_hz,
+            vision_adapter=b.vision_adapter,
+            vision_max_hz=b.vision_max_hz,
+            vision_ref=b.vision_ref,
+            vision_channel=b.vision_channel,
+            vision_eyes=b.vision_eyes,
+            vision_mode=b.vision_mode,
+            vision_assign=b.vision_assign,
+            vision_shuffle=b.vision_shuffle,
+            vision_light=b.vision_light,
+            vision_contrast=b.vision_contrast,
+            vis_objects=b.vis_objects,
+            vis_track=b.vis_track,
         )
 
     # ------------------------------------------------------------- хранение
@@ -513,6 +554,84 @@ DEMOS = [
           "движение: та самая пара нейронов из апстримного эксперимента",
           "type=DNp09", 100.0, 1.0),
 ]
+
+
+# --------------------------------------------- пресеты со зрением
+#
+# Историческое умолчание — зрение ВЫКЛЮЧЕНО, и прежние опыты от этого не
+# отступают ни на бит. Опыты со зрением поэтому объявлены **явно и
+# отдельно**: не галочкой «как обычно, только с глазами», а готовым
+# набором условий, у которого есть встречный замер.
+#
+# Четыре опыта попарно: тёмное нависание против светлого (отличие ровно
+# одно — серость объекта), движение поперёк курса против неподвижного
+# объекта (отличие ровно одно — едет или стоит). Пятый — встречный
+# замер к любому утверждению про пространственную структуру:
+# перемешанная привязка, у которой суммарный вход тот же до последнего
+# разряда.
+#
+# Каждый пресет — это фрагмент блока `body`, а не целая спека: его
+# накладывают на выбранную длительность, зерно и съём, и поэтому один и
+# тот же пресет годится и командной строке, и окну.
+VISION_PRESETS = {
+    "loom-dark": {
+        "что": "тёмный нависающий объект: шар 1 мм, серость 0,1, "
+               "с 30 мм до 3 мм по курсу за 1 с модельного времени",
+        "body": {"vision": True, "vis_objects": 1,
+                 "vis_track": "loom_dark"},
+    },
+    "loom-light": {
+        "что": "светлый нависающий объект: тот же отрезок, серость 0,9. "
+               "Встречный замер к тёмному — отличается ровно цветом",
+        "body": {"vision": True, "vis_objects": 1,
+                 "vis_track": "loom_light"},
+    },
+    "sweep": {
+        "что": "объект идёт ПОПЕРЁК курса на постоянном удалении: "
+               "угловой размер держится, место в поле зрения едет. "
+               "Отличает ответ на движение от ответа на расширение",
+        "body": {"vision": True, "vis_objects": 1, "vis_track": "sweep"},
+    },
+    "still": {
+        "что": "неподвижный объект там, где нависающий оказывается на "
+               "середине пути. Встречный замер к обоим движущимся",
+        "body": {"vision": True, "vis_objects": 1, "vis_track": "still"},
+    },
+    "loom-dark-shuffled": {
+        "что": "тот же тёмный нависающий объект на ПЕРЕМЕШАННОЙ "
+               "привязке: число нейронов на омматидий сохранено, то "
+               "есть суммарный вход тот же до последнего разряда, а "
+               "пространственная структура разрушена. Главный "
+               "встречный замер",
+        "body": {"vision": True, "vision_shuffle": True, "vis_objects": 1,
+                 "vis_track": "loom_dark"},
+    },
+    "bare": {
+        "что": "зрение включено, объектов в сцене нет: муха видит одну "
+               "арену. Опора, на которой измеряется вклад объекта",
+        "body": {"vision": True},
+    },
+}
+
+
+def vision_preset(name):
+    """Фрагмент блока `body` по имени пресета, с развёрнутым треком.
+
+    Имя трека (`vis_track: "loom_dark"`) разворачивается здесь, в
+    настоящий список отрезков: в спеке прогона должно лежать то, что
+    считалось, а не ссылка на имя, которое завтра поменяет смысл.
+    """
+    from . import objects as O
+
+    name = str(name)
+    if name not in VISION_PRESETS:
+        raise ValueError("неизвестный зрительный пресет %r; есть: %s"
+                         % (name, ", ".join(sorted(VISION_PRESETS))))
+    body = dict(VISION_PRESETS[name]["body"])
+    track = body.get("vis_track")
+    if isinstance(track, str):
+        body["vis_track"] = O.preset(track)
+    return body
 
 
 # Готовые цели для агента. Это не украшение: свободный ввод цели пока

@@ -11,16 +11,22 @@
 на экране остаётся последний снятый кадр, и панель говорит об этом
 прямо.
 
-Про зрение честно вдвойне. Кадр камеры и сигнал омматидиев существуют,
-а входа в оптические доли нет: 96 495 нейронов оптических долей молчат.
-Поэтому вкладка «Зрение» разложена по источникам и показывает разрыв
-схемой — перечёркнутой связью, а не стрелкой, которой нет.
+Про зрение честно вдвойне, и честность эта переехала. Прежде входа в
+оптические доли не было вовсе, и вкладка «Зрение» говорила ровно это.
+Теперь вход есть (`BodyConfig.vision`, по умолчанию выключен), и обрыв
+стоит ДАЛЬШЕ — там, где он измерен: ранние зрительные нейроны (L1, L2,
+L3, Tm1) отвечают, а детекторы движения и нависания (T4, T5, LPLC2,
+LC4, DNp01) дают ровно 0,000 Гц. Вкладка показывает это схемой с
+перечёркнутой связью и говорит отдельно, чем является сама привязка
+омматидиев: она инженерная и опровергнута внешним свидетелем по
+взаимному совмещению двух популяций.
 
 Длинные пояснения живут в подсказках на значке «i», а не абзацами в
 рейке: панель управления не должна быть стеной текста.
 """
 
 from . import layout as L
+from . import state as ST
 from . import widgets as W
 from .state import BODY_VIEWS, VISION
 from .tokens import C, R, S
@@ -335,21 +341,49 @@ def _track(app, ctx, r):
 # Схема зрения: что откуда берётся и где обрыв. Рисуется явно, потому
 # что иначе разрыв приходится описывать словами, а словам верят хуже,
 # чем перечёркнутой связи.
+#
+# Звеньев теперь четыре, а не три, и обрыв переехал. Прежняя схема
+# ставила крест между омматидиями и оптическими долями — это было верно,
+# пока входа не существовало. Теперь вход есть, и крест стоит там, где
+# обрыв ИЗМЕРЕН: между ранними зрительными нейронами (L1, L2, L3, Tm1 —
+# отвечают) и детекторами движения и нависания (T4, T5, LPLC2, LC4,
+# DNp01 — ровно 0,000 Гц).
+#
+# Второй элемент кортежа — ключ строки в `state.VISION`, третий — есть
+# ли связь ПОСЛЕ этого звена.
 VISION_CHAIN = (("Камера глаза", "camera", True),
                 ("Омматидии, 721×2", "retina", True),
-                ("Оптические доли", "lobes", False))
+                ("Фоторецепторы, 10 582", "wired", True),
+                ("L1, L2, L3, Tm1", "early", False),
+                ("T4, T5, LPLC2, DNp01", "deep", False))
 
 
-def _vision_diagram(ctx, r):
+def _vision_diagram(ctx, r, on=None):
+    """Схема цепочки. ``on`` — включено ли зрение в этом прогоне.
+
+    При выключенном зрении перечёркнуты ВСЕ связи после омматидиев: не
+    потому, что пути нет, а потому, что этот прогон его не считал. Это
+    разные вещи, и подпись у креста поэтому тоже разная.
+    """
     dl, sc, f = ctx.dl, ctx.sc, ctx.f
     at = f.small
     bh = at.gh + sc.px(S.sm) + sc.px(2)
     gap = sc.px(18)
-    total = bh * 3 + gap * 2
+    n = len(VISION_CHAIN)
+    total = bh * n + gap * (n - 1)
     if r.h < total or r.w < sc.px(120):
         return 0
     y = r.y
-    for i, (title, _key, ok) in enumerate(VISION_CHAIN):
+    for i, (title, _key, link_ok) in enumerate(VISION_CHAIN):
+        # Само звено «есть», если до него связь дошла. Первые два есть
+        # всегда: кадр и омматидии считает FlyGym независимо от того,
+        # подаём мы их в сеть или нет.
+        if i <= 1:
+            ok = True
+        elif on is False:
+            ok = False
+        else:
+            ok = all(w[2] for w in VISION_CHAIN[:i])
         col = C.ok if ok else C.danger
         dl.rect(r.x, y, r.x1, y + bh, C.raised if ok else C.panel, 1.0,
                 sc.px(R.control))
@@ -359,9 +393,13 @@ def _vision_diagram(ctx, r):
                 col, 1.0, 1.0)
         dl.text(at, title, r.x + sc.px(S.md), y + (bh - at.gh) // 2,
                 C.ink if ok else C.dim, max_px=r.w - sc.px(S.lg))
-        if i < 2:
+        if i < n - 1:
             ax, y0, y1 = r.cx, y + bh, y + bh + gap
-            if i == 0:
+            # Связь после этого звена: либо есть, либо перечёркнута, и
+            # у креста своя подпись — «входа нет» и «зрение выключено»
+            # это разные вещи.
+            live = link_ok and (on is not False or i == 0)
+            if live:
                 dl.rect(ax - sc.hair(), y0 + sc.px(3), ax + sc.hair(),
                         y1 - sc.px(3), C.ok, 1.0, 0.0)
                 dl.seg(ax - sc.px(4), y1 - sc.px(7), ax, y1 - sc.px(3),
@@ -380,51 +418,83 @@ def _vision_diagram(ctx, r):
                 d = sc.px(5)
                 dl.seg(ax - d, m - d, ax + d, m + d, C.danger, 1.8)
                 dl.seg(ax + d, m - d, ax - d, m + d, C.danger, 1.8)
+                why = ("зрение выключено" if on is False
+                       else ("не проходит" if i >= 2 else "входа нет"))
                 W.label(ctx, L.Rect(ax + sc.px(S.md), m - f.micro.gh // 2,
                                     r.x1 - ax - sc.px(S.md), f.micro.gh),
-                        "входа нет", role="micro", color=C.danger)
+                        why, role="micro", color=C.danger)
         y += bh + gap
     return total
 
 
+def _vision_state(app):
+    """Включено ли зрение в том прогоне, который сейчас на экране.
+
+    Спрашивается у самого прогона, а не у рейки настройки: окно обязано
+    говорить про ТОТ эпизод, чьи кадры показывает. `None` — неизвестно
+    (простой, либо прогон без такого признака), и тогда схема рисуется
+    без утверждений о выключенности.
+    """
+    ses = app.ses
+    vis = (ses.extra or {}).get("vis_hz") if ses is not None else None
+    if vis is not None:
+        return True, None
+    sb = getattr(app.st, "sb", None)
+    if ses is not None and getattr(ses, "busy", False) and sb is not None:
+        return bool(sb.vision), None
+    return None, None
+
+
 def _vision(app, ctx, r):
-    """Четыре разные вещи, которые нельзя смешивать."""
+    """Шесть разных вещей, которые нельзя смешивать."""
     sc, f = app.sh.sc, app.sh.fonts
     content, token = W.scroll(ctx, "body/vision", r)
     s = L.Stack(L.Rect(content.x, content.y, content.w, 1 << 16),
                 gap=sc.px(S.sm))
+    on, prov = _vision_state(app)
+    rows = ST.vision_rows(on=on, provenance=prov)
 
     W.section(ctx, s, "Путь сигнала", first=True,
-              info="Схема показывает разрыв буквально: до омматидиев всё "
-                   "настоящее, дальше связи нет.")
-    used = _vision_diagram(ctx, s.area)
+              info="Схема показывает обрыв буквально и ровно там, где он "
+                   "ИЗМЕРЕН: кадр и омматидии настоящие, вход в "
+                   "фоторецепторы есть, ранние зрительные нейроны "
+                   "отвечают, а детекторы движения и нависания дают "
+                   "ровно 0,000 Гц. Перечёркнутая связь — это замер, а "
+                   "не оформление.")
+    used = _vision_diagram(ctx, s.area, on=on)
     if used:
         s.take(used, sc.px(S.md))
 
-    W.section(ctx, s, "Источники данных")
-    for key in ("camera", "retina"):
-        _vision_row(app, ctx, s, key)
+    W.section(ctx, s, "Что есть")
+    for key in ("camera", "retina", "wired", "early"):
+        _vision_row(app, ctx, s, key, rows)
 
-    W.section(ctx, s, "Чего нет")
-    for key in ("wired", "lobes"):
-        _vision_row(app, ctx, s, key)
+    W.section(ctx, s, "Чего нет и чем является то, что есть")
+    for key in ("deep", "binding"):
+        _vision_row(app, ctx, s, key, rows)
 
     W.section(ctx, s, "Ограничение")
     h = W.label(ctx, s.area,
-                "В этом окне нет ни картинки глаза, ни потока сигнала в "
-                "доли: рисовать их значило бы показывать то, чего не "
-                "считается.", role="small", color=C.warn, wrapped=True)
+                "Картинки глаза в этом окне нет: работник отдаёт кадр "
+                "камеры сцены, а не кадр омматидиев, и рисовать второй "
+                "из первого значило бы показывать не то, что "
+                "считается. Числа поданных частот и отметки времени "
+                "обновления кадра — в «Анализе», видом «Таймлайн».",
+                role="small", color=C.warn, wrapped=True)
     s.take(h)
     W.scroll_done(ctx, "body/vision", r, s.used, token)
 
 
-def _vision_row(app, ctx, s, key):
+def _vision_row(app, ctx, s, key, rows=None):
     sc = app.sh.sc
-    title, state, text = VISION[key]
+    title, state, text = (rows or VISION)[key]
     if not s.fits(sc.px(S.row)):
         return
     row = s.take(sc.px(S.row))
-    ok = state == "есть"
+    # «есть» и «измерена» — это да; «выключена», «НЕ установлена» и
+    # «ИНЖЕНЕРНАЯ, опровергнута» — нет. Выводится по списку, а не по
+    # вхождению подстроки: подстрока однажды совпала бы не с тем.
+    ok = state in ("есть", "измерена")
     W.status(ctx, row, "done" if ok else "fail", title)
     W.label(ctx, row, state, role="small", align="right",
             color=C.ok if ok else C.danger)

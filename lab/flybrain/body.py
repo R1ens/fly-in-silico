@@ -262,6 +262,94 @@ class BodyConfig:
 
     view_every: int = 1  # обновлять окно раз в столько шагов управления
 
+    # ------------------------------------------------------ зрение
+    #
+    # ВСЁ ЗРЕНИЕ ВЫКЛЮЧЕНО ПО УМОЛЧАНИЮ, и это не осторожность, а
+    # требование сравнимости: все 28 сохранённых прогонов посчитаны без
+    # зрения, и прежний опыт, открытый новой сборкой, обязан считаться
+    # ровно как раньше. При `vision=False` ни одна строка ниже не
+    # исполняется: тело собирается без `enable_vision`, переходник не
+    # строится, пул объектов не вписывается. Побитовое равенство с
+    # прежним эпизодом проверяется `probe/vision_product.py`, пункт 1.
+    #
+    # Содержательная часть живёт не здесь: `vision_adapter` выбирает
+    # переходник ПО ИМЕНИ (`flybrain.vision.ADAPTERS`), и настоящая
+    # ретинотопия или физиологическая динамика раннего зрения встают на
+    # место, не меняя ни одного из полей ниже.
+    vision: bool = False
+
+    # Подаётся ли кадр в сеть ПРЯМО СЕЙЧАС. Отдельно от `vision`, и
+    # разница существенная: `vision` решается при сборке тела (глаза
+    # либо есть в модели, либо нет, и добавить их на ходу нельзя), а это
+    # — живая ручка песочницы, выключающая и включающую ПОДАЧУ, пока
+    # глаза продолжают рисовать кадр. В спеке её нет нарочно: опыт
+    # запускают с зрением или без, а не «с глазами, но молча».
+    vision_feed: bool = True
+
+    # Частота обновления зрения, Гц. **Рабочая точка, а не
+    # биологическая постоянная**: 100 Гц выбраны по замеру цены
+    # (без зрения 497,5 мс на шаг; 50 Гц ×1,11, 100 Гц ×1,16,
+    # 250 Гц ×1,36, 500 Гц ×1,66 — `RESEARCH.md` §6). Более высокие
+    # частоты нужны быстрым переходным процессам, и ставятся этим же
+    # полем. FlyGym округляет её до целого числа герц.
+    vision_hz: float = 100.0
+
+    # Имя зрительного переходника. `"retina"` — инженерная привязка
+    # омматидиев (`flybrain/retina.py`), единственная в этой сборке.
+    vision_adapter: str = "retina"
+
+    # Потолок частоты фоторецепторов и яркость, считающаяся насыщением.
+    # Правило придумано и объявлено ровно одно:
+    # `hz = vision_max_hz · min(1, яркость / vision_ref)`. Ни одного
+    # нейрона оно не выделяет; то же самое сделано у обоняния
+    # (`orn_max_hz`, `odour_ref`).
+    vision_max_hz: float = 150.0
+    vision_ref: float = 0.5
+
+    # Что делать с двумя каналами фоторецептора кадра NeuroMechFly:
+    # `"max"` (как делает и официальная интеграция — хроматика при этом
+    # теряется), `"pale"`, `"yellow"`.
+    vision_channel: str = "max"
+
+    # Какие глаза подаются: `"both"` — ОБА сложных глаза, значение по
+    # умолчанию. Односторонняя подача есть контроль на двусторонний
+    # путь, а не рабочая точка.
+    vision_eyes: str = "both"
+
+    # Привязка: совмещение, назначение и ВСТРЕЧНЫЙ ЗАМЕР.
+    # `vision_shuffle` перемешивает назначение, сохраняя число нейронов
+    # на омматидий: суммарный вход тот же до последнего разряда,
+    # разрушена только пространственная структура. Без такого прогона
+    # ни одно утверждение про пространственное зрение не стоит ничего.
+    vision_mode: str = "whiten"
+    vision_assign: str = "capacity"
+    vision_shuffle: bool = False
+
+    # Свет сцены: множитель к `light_ambient` и `light_diffuse`
+    # НАСТОЯЩИХ источников MuJoCo (`light_top`, `light_bottom` арены
+    # FlyGym). Меняется сам рендер кадра глаза, а не его пересчёт.
+    vision_light: float = 1.0
+
+    # Контраст: ОБЪЯВЛЕННОЕ преобразование кадра вокруг середины шкалы,
+    # `I' = clip(0,5 + (I − 0,5)·k, 0, 1)`. Это не свойство сцены, и так
+    # написано в происхождении прогона. При k = 1 преобразование не
+    # исполняется вовсе, и частоты совпадают с `retina.rates` до бита.
+    vision_contrast: float = 1.0
+
+    # --- зрительные объекты в сцене (`flybrain.objects`) ---
+    #
+    # Сколько слотов пула вписать в арену ДО компиляции модели: MuJoCo
+    # не добавляет тела в собранную модель, поэтому «появление» объекта
+    # — это включение свободного слота. 0 — пула нет вовсе, и сцена
+    # неотличима от прежней.
+    vis_objects: int = 0
+    # Заданная траектория объектов (`objects.Track`): список отрезков
+    # «слот, с какого по какое модельное время, из какой точки в
+    # какую, радиус, серость». Этим задаются и движущиеся, и
+    # неподвижные объекты, и тёмное и светлое нависание. `None` — трека
+    # нет, объектами правит только человек из «Песочницы».
+    vis_track: list | None = None
+
 
 # Предел шагов у сеанса «без конца». Это не длительность, а то, на чём
 # арифметика ещё не теряет смысл: 10 млн шагов управления по 20 мс — это
@@ -992,8 +1080,10 @@ def _sim_class(rule_obs):
                 # зовёт `_update_vision(sim)`, а тот ведёт
                 # `_last_vision_update_time` — то есть у повторного съёма
                 # есть последствие, и выбросить его значит изменить
-                # расписание обновления зрения. В этой сборке зрение
-                # выключено, но проверяется это, а не предполагается.
+                # расписание обновления зрения. Зрение в продукте есть
+                # (`BodyConfig.vision`), по умолчанию выключено, и
+                # ловушка держится ПРОВЕРКОЙ признака у тела, а не
+                # предположением о сборке.
                 return super().step(action)
             # Отметка привязывается к НОМЕРУ СОСТОЯНИЯ, а не только к
             # дынамическому отрезку `step`. Причина названа, а не
@@ -1044,10 +1134,42 @@ def _build_body(cfg: BodyConfig, sources, video_path=None, head_stab=None):
         odor_source=sources,
         peak_odor_intensity=np.ones((len(sources), 1)),
     )
+    # Пул зрительных объектов вписывается ДО компиляции модели: MuJoCo
+    # не добавляет тела в собранную модель. При `vis_objects = 0` не
+    # вписывается ничего, и сцена остаётся прежней — проверено
+    # побитовым совпадением траектории (`probe/objects.py`).
+    n_obj = int(getattr(cfg, "vis_objects", 0) or 0)
+    if n_obj > 0:
+        from . import objects as _objects
+
+        if n_obj > _objects.POOL:
+            raise ValueError(
+                "слотов зрительных объектов просят %d, а предел пула %d: "
+                "каждый слот это тело MJCF и шесть лишних геометрий уже "
+                "меняют порядок растеризации кадра (`objects.py`)"
+                % (n_obj, _objects.POOL))
+        _objects.inject(arena, n=n_obj)
     extra = {}
     if head_stab is not None:
         extra = {"head_stabilization_model": head_stab,
                  "neck_kp": head_stab.neck_kp}
+    # Зрение передаётся ТОЛЬКО когда оно нужно. Передача
+    # `enable_vision=False` не равна непередаче: `Fly.__init__` на
+    # выключенном зрении всё равно проходит по ветке настройки, и
+    # сравнивать прежние прогоны пришлось бы с другой дорогой кода.
+    if bool(getattr(cfg, "vision", False)):
+        extra["enable_vision"] = True
+        hz = float(getattr(cfg, "vision_hz", 100.0) or 0.0)
+        if hz <= 0.0:
+            raise ValueError(
+                "зрение включено, а частота обновления %r: кадр глаза "
+                "не обновится ни разу" % (hz,))
+        # FlyGym держит её целым числом герц
+        # (`_eff_visual_render_interval = 1 / vision_refresh_rate`),
+        # и дробную просьбу надо округлить ЗДЕСЬ, а не оставить
+        # расхождение между заказанным и действительным: в прогон
+        # уезжает то, что действительно считало.
+        extra["vision_refresh_rate"] = int(round(hz))
     fly = Fly(
         enable_adhesion=True,
         enable_olfaction=True,
@@ -1215,7 +1337,34 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     for name, idx in list(sensor_idx.items()) + [("выход L", motor_l), ("выход R", motor_r)]:
         print(f"  {name:12s} {len(idx):6d} нейронов")
 
+    # --- зрение: переходник по имени, до сборки движка ---
+    #
+    # Здесь, а не после сборки, по одной причине: фоторецепторы обязаны
+    # попасть в `no_refractory` так же, как обонятельные каналы. Иначе
+    # та же частота даёт меньше спайков, и числа этого прогона
+    # несравнимы с замерами проб (`probe/vision_chain.py`,
+    # `probe/vision_live.py` — обе снимают рефрактерность с
+    # фоторецепторов).
+    vis = None
+    if bool(getattr(cfg, "vision", False)):
+        from . import vision as V
+
+        vis = V.make(str(getattr(cfg, "vision_adapter", "retina")),
+                     mode=str(getattr(cfg, "vision_mode", "whiten")),
+                     assign=str(getattr(cfg, "vision_assign", "capacity")),
+                     shuffle=bool(getattr(cfg, "vision_shuffle", False)),
+                     seed=cfg.seed,
+                     channel=str(getattr(cfg, "vision_channel", "max")),
+                     max_hz=float(getattr(cfg, "vision_max_hz", 150.0)),
+                     ref=float(getattr(cfg, "vision_ref", 0.5)),
+                     eyes=str(getattr(cfg, "vision_eyes", "both")))
+        vis.attach(neurons, device)
+        print(f"  зрение      {len(vis.indices):6d} фоторецепторов "
+              f"({vis.name} v{vis.version}, {cfg.vision_eyes})")
+
     driven = np.unique(np.concatenate(list(sensor_idx.values())))
+    if vis is not None and len(vis.indices):
+        driven = np.unique(np.concatenate([driven, vis.indices]))
     if engine is None:
         engine = sim.build_engine(weights=weights, neurons=neurons,
                                   device=device, seed=cfg.seed,
@@ -1328,6 +1477,51 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
 
         resume_smooth, resume_report = RP.restore_body(resume, body, engine)
         obs = body.fly.get_observation(body)
+    # --- зрительная сцена: свет, пул объектов, заданная траектория ---
+    #
+    # Всё это ставится ПОСЛЕ живых условий и ПОСЛЕ продолжения из
+    # снимка, но ДО разогрева: свет и объекты меняют кадр глаза, то есть
+    # вход, и мерить на них калибровку значило бы считать опору в одних
+    # условиях, а эпизод — в других.
+    vis_pool, vis_track = None, None
+    vis_light = None
+    if bool(getattr(cfg, "vision", False)):
+        from . import vision as V
+
+        want = float(getattr(cfg, "vision_light", 1.0) or 1.0)
+        # Свет правится только когда его просили менять: при множителе 1
+        # модель не трогается вовсе, и кадр остаётся прежним до бита.
+        vis_light = (V.scene_light(body, want) if want != 1.0
+                     else V.light_state(body))
+    if int(getattr(cfg, "vis_objects", 0) or 0) > 0:
+        from . import objects as O
+
+        # Владелец пула один. Живые условия уже нашли его по именам тел
+        # (`live.attach` -> `objects.discover`), и второй `Pool` на ту
+        # же модель означал бы два источника истины о слотах.
+        vis_pool = (live.pool if live is not None and live.pool is not None
+                    else O.discover(body, n=int(cfg.vis_objects)))
+        if vis_pool is None:
+            raise RuntimeError(
+                "слоты зрительных объектов просили, а в модели их нет: "
+                "`objects.inject` зовётся в `_build_body` до компиляции")
+        if getattr(cfg, "vis_track", None):
+            vis_track = O.Track(cfg.vis_track)
+            need = vis_track.need_slots()
+            if need > len(vis_pool.slots):
+                raise ValueError(
+                    "трек просит %d слотов, а вписано %d: поднимите "
+                    "`vis_objects`" % (need, len(vis_pool.slots)))
+            # Нулевое модельное время — часть трека, а не «ещё не
+            # началось»: объект, заданный с t0 = 0, обязан стоять на
+            # месте уже на первом шаге, а не появиться на втором.
+            vis_track.apply(vis_pool, 0.0, cmd="трек: начало")
+    elif getattr(cfg, "vis_track", None):
+        raise ValueError(
+            "траектория объектов задана, а слотов не просили: укажите "
+            "`vis_objects` (тела MuJoCo создаются до компиляции модели и "
+            "на ходу не добавляются)")
+
     if on_body is not None:
         on_body(body)
 
@@ -1344,6 +1538,12 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
               "закрытие окна останавливает эпизод")
 
     ant_l, ant_r = _odour_channels(body.fly)
+    # Что со зрением случилось за сеанс. Считается, а не объявляется:
+    # «обновлений зрения» берётся из той самой маски, которую ведёт
+    # `Fly.post_step`, и измеренная частота обновления сравнивается с
+    # заказанной в самом прогоне.
+    vis_seen = {"шагов с подачей": 0, "обновлений": 0, "подача": None,
+                "последнее обновление, мс": None}
 
     def pose_antennae():
         """Положение и курс ОТ ОБОНЯТЕЛЬНЫХ СЕНСОРОВ, а не от груди.
@@ -1381,8 +1581,15 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         oi = np.asarray(obs["odor_intensity"])[0]
         return float(oi[ant_l]), float(oi[ant_r])
 
-    def drive_brain(left_i, right_i, taste_hz, ref):
+    def drive_brain(left_i, right_i, taste_hz, ref, frame=None):
         """Придуманная часть: интенсивность -> частота рецепторов.
+
+        ``frame`` — кадр ``obs["vision"]`` или ``None``. Подача зрения
+        стоит ЗДЕСЬ, между сенсорными каналами и прямыми стимулами, и
+        порядок не случаен: `rates.zero_()` стирает всё, поэтому
+        зрение обязано лечь после него, а прямые стимулы из окна —
+        после зрения, иначе окно не смогло бы поднять частоту
+        фоторецептора поверх кадра.
 
         Частоты ставятся `index_fill_`, а не записью по срезу
         (`rates[0, idx] = rl`). Разница не в арифметике, а в том, что
@@ -1406,6 +1613,20 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         rates.index_fill_(1, t_sens["odour_right"], rr)
         if taste_hz > 0:
             rates.index_fill_(1, t_sens["taste"], taste_hz)
+        if vis is not None and frame is not None \
+                and bool(getattr(cfg, "vision_feed", True)):
+            # Потолок и насыщение перечитываются из настройки на каждом
+            # шаге, а не берутся один раз до цикла: иначе живая правка
+            # подтверждалась бы как применённая и попадала в журнал
+            # прогона, ничего при этом не меняя. Так же здесь устроены
+            # `odour_ref` и `dn_tau_s`. При неизменной настройке
+            # значения те же.
+            vis.max_hz = float(cfg.vision_max_hz)
+            vis.ref = max(float(cfg.vision_ref), 1e-12)
+            vis_seen["подача"] = vis.feed(
+                rates, frame,
+                contrast=float(getattr(cfg, "vision_contrast", 1.0) or 1.0))
+            vis_seen["шагов с подачей"] += 1
         if live is not None:
             # Прямые нейронные стимулы — после сенсорных каналов и после
             # `rates.zero_()`: иначе их стирало бы каждым шагом.
@@ -1617,7 +1838,28 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         ref_now = (max(float(cfg.odour_ref), 1e-9)
                    if cfg.odour_ref is not None else odour_ref)
         k = math.exp(-dt_s / max(cfg.dn_tau_s, 1e-6))
-        rl, rr = drive_brain(li, ri, taste, ref_now)
+        # Заданная траектория объектов — на границе шага управления,
+        # там же, где живые правки: внутри шага состояние модели не
+        # целостно. Трек правит модель только когда заказанное
+        # изменилось, поэтому неподвижный объект не стоит ничего.
+        if vis_track is not None:
+            vis_track.apply(vis_pool, step * cfg.control_ms)
+        # Отметка времени ТОГО кадра, который этот шаг подаёт в сеть, —
+        # снимается ДО подачи. Снятая после физики относилась бы к
+        # самому свежему кадру, а подан был прошлый: разница ровно в
+        # шаг управления, и по ней читающий решил бы, что зрение
+        # опережает мозг. Поймано на первом же прогоне.
+        vis_t_ms = None
+        if vis is not None:
+            _last = float(getattr(body.fly, "_last_vision_update_time", 0.0)
+                          or 0.0)
+            # `-inf` до первого кадра: это признак «кадра ещё не было»,
+            # а не отметка времени, и писать его в запись нельзя.
+            vis_t_ms = (round(_last * 1000.0, 4)
+                        if math.isfinite(_last) else None)
+        rl, rr = drive_brain(li, ri, taste, ref_now,
+                             frame=(obs.get("vision") if vis is not None
+                                    else None))
 
         acc, dl, dr, rd, spikes_total = step_measure()
         # Счётчики копятся за весь сеанс, запись — только за окно:
@@ -1652,6 +1894,31 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                 body.render()
             if term or trunc:
                 break
+        # --- сколько раз кадр обновился за этот шаг управления ---
+        #
+        # Берётся у самого FlyGym, а не считается делением частот: он
+        # дописывает `_vision_update_mask` на каждом шаге физики, по
+        # `True` на каждое обновление. Поэтому «кадр обновился дважды за
+        # шаг управления» — замер, а не арифметика.
+        #
+        # Маска после подсчёта ОЧИЩАЕТСЯ, и это не мелочь: она растёт по
+        # одному питоновскому `bool` на шаг физики, то есть при шаге
+        # 2e-4 с по 5000 записей на секунду модельного времени. У сеанса
+        # без заданного конца это утечка — список из 5000 ссылок стоит
+        # около 40 КБ на секунду модельного времени и не освобождается
+        # никогда. Свойство `fly.vision_update_mask` читают только
+        # примеры апстрима, которых здесь нет, и вот эта запись.
+        vis_n = 0
+        if vis is not None:
+            _mask = getattr(body.fly, "_vision_update_mask", None)
+            if _mask:
+                vis_n = int(sum(1 for b in _mask if b))
+                del _mask[:]
+            vis_seen["обновлений"] += vis_n
+            _l = float(getattr(body.fly, "_last_vision_update_time", 0.0)
+                       or 0.0)
+            vis_seen["последнее обновление, мс"] = (
+                round(_l * 1000.0, 4) if math.isfinite(_l) else None)
         closed = False
         if viewer is not None and step % cfg.view_every == 0:
             if not viewer.is_running():
@@ -1717,6 +1984,22 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         rec["cmd_turn"] = round(cmd.u_turn, 5)
         rec["cmd_drive"] = round(cmd.u_drive, 5)
         rec["cmd_escape"] = round(cmd.escape, 5)
+        # Зрение в записи шага. Поля появляются ТОЛЬКО при включённом
+        # зрении: у прежнего эпизода их не было, и дописывать нули
+        # значило бы менять форму `track.parquet` всем сохранённым
+        # прогонам.
+        #
+        # `vis_t_ms` — модельное время того кадра, который этот шаг
+        # ПОДАЛ в сеть, снятое до подачи; `vis_lag_ms` — на сколько он
+        # отстал от шага. `vis_n` — сколько раз кадр обновился за шаг.
+        if vis is not None:
+            rec["vis_t_ms"] = vis_t_ms
+            rec["vis_lag_ms"] = (None if vis_t_ms is None
+                                 else round(rec["t_ms"] - vis_t_ms, 4))
+            rec["vis_n"] = int(vis_n)
+            fed = vis_seen.get("подача") or {}
+            rec["vis_hz"] = round(float(fed.get("средняя, Гц", 0.0)), 3)
+            rec["vis_sat"] = round(float(fed.get("в потолке, доля", 0.0)), 4)
         records.append(rec)
         row_cpu = None
         if on_step is not None or tape is not None:
@@ -1745,6 +2028,18 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         print(f"  видео: {video_path}")
     if viewer is not None:
         viewer.close()
+    # Со зрения снимается всё, что живёт в модели, ДО её закрытия:
+    # после `close()` ни частоту обновления, ни свет спросить уже не у
+    # кого, а живая правка могла их поменять посреди сеанса. Записывать
+    # в прогон надо последнее действительное, а не заказанное в начале.
+    if vis is not None:
+        from . import vision as V
+
+        vis_seen["частота у FlyGym"] = int(
+            getattr(body.fly, "vision_refresh_rate", 0) or 0)
+        vis_light = V.light_state(body)
+        if vis_pool is not None:
+            vis_seen["объекты"] = vis_pool.state()
     body.close()
 
     # Фактическую длительность считаем по пройденным шагам и только если
@@ -1809,6 +2104,52 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             "дешёвых": int(accfwd["дешёвых"]),
             "полных": int(accfwd["полных"]),
         }
+    # --- происхождение зрения: что именно считало этот прогон ---
+    #
+    # Блок пишется ТОЛЬКО при включённом зрении: отсутствие ключа и
+    # значит «зрение было выключено», как у всех 28 прежних прогонов.
+    # Внутри — не просьба, а действительное: частота обновления
+    # измерена по отметкам FlyGym, отпечаток привязки взят у самой
+    # привязки, свет прочитан из модели. По этому блоку прогон
+    # опознаётся однозначно, и его хватает, чтобы собрать такой же.
+    if vis is not None:
+        meas_hz = (vis_seen["обновлений"] / dur_s) if dur_s else None
+        timing["зрение"] = {
+            "включено": True,
+            "частота обновления заказана, Гц": float(
+                getattr(cfg, "vision_hz", 100.0)),
+            "частота обновления у FlyGym, Гц": int(
+                vis_seen.get("частота у FlyGym", 0)),
+            "частота обновления измерена, Гц": (round(meas_hz, 3)
+                                                if meas_hz is not None
+                                                else None),
+            "обновлений кадра за сеанс": int(vis_seen["обновлений"]),
+            "шагов с подачей": int(vis_seen["шагов с подачей"]),
+            "последнее обновление, мс": vis_seen["последнее обновление, мс"],
+            "рабочая точка, а не постоянная":
+                "100 Гц выбраны по замеру цены шага (RESEARCH.md §6), а "
+                "не выведены из биологии; поле `vision_hz` меняет её, и "
+                "более высокие частоты замерены отдельно",
+            "на разогреве": "не подавалось: перекос и шум съёма мерятся "
+                            "на симметричном обонятельном входе, как во "
+                            "всех прежних эпизодах",
+            "контраст": float(getattr(cfg, "vision_contrast", 1.0)),
+            "контраст — чей": "объявленное преобразование КАДРА "
+                              "(clip(0,5 + (I − 0,5)·k)), а не свойство "
+                              "сцены",
+            "свет сцены": vis_light,
+            "свет — чей": "множитель к light_ambient и light_diffuse "
+                          "настоящих источников MuJoCo арены FlyGym: "
+                          "меняется сам рендер кадра глаза",
+            "привязка": vis.provenance(),
+        }
+        if vis_seen.get("объекты") is not None:
+            timing["зрение"]["объекты"] = vis_seen["объекты"]
+        if vis_track is not None:
+            timing["зрение"]["траектория"] = vis_track.state()
+        c = vis.caveat()
+        if c:
+            timing.setdefault("оговорки", []).append(c)
     if endless:
         timing["steps_requested"] = None   # предела не было
         timing.setdefault("оговорки", []).append(
