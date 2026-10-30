@@ -269,10 +269,39 @@ class Channel:
             return None
 
     def close(self):
-        for q in (self.frames, self.events):
-            close = getattr(q, "close", None)
-            if close is not None:
-                close()
+        """Закрыть обе очереди, не повиснув на недочитанных кадрах.
+
+        Почему это не просто `q.close()` на обе. У `mp.Queue` есть
+        питающий поток, и при выходе из интерпретатора
+        `multiprocessing.util._exit_function` его ДОЖИДАЕТСЯ. Если в
+        очереди осталось то, что никто не прочитал, ожидание не
+        кончается никогда: процесс печатает весь свой вывод и повисает
+        насмерть. Поймано замером — `probe/bodyfinal_timing.py` досчитала
+        эпизод, записала отчёт и провисела семнадцать часов на выходе,
+        потому что складывала кадры в очередь, у которой в этом прогоне
+        не было читателя вовсе.
+
+        Поэтому очереди закрываются РАЗНО, и это не осторожность, а
+        устройство обмена:
+
+        * `frames` — кадры картинки, которые по замыслу МОЖНО бросать
+          при переполнении (у очереди на них есть `maxsize`, и окно
+          отстающие кадры не ждёт). Значит недочитанный кадр терять
+          разрешено, и ожидание питающего потока отменяется;
+        * `events` — `Status`, `Series`, `Done`, `Error`, `Artifact`.
+          Их терять нельзя: по `Done` окно оживляет кнопку «пуск», а по
+          `Error` показывает причину. Здесь ожидание сохраняется, как
+          было.
+        """
+        frames_close = getattr(self.frames, "close", None)
+        if frames_close is not None:
+            cancel = getattr(self.frames, "cancel_join_thread", None)
+            if cancel is not None:
+                cancel()
+            frames_close()
+        events_close = getattr(self.events, "close", None)
+        if events_close is not None:
+            events_close()
 
 
 # ------------------------------------------------------- кольцо кадров тела
