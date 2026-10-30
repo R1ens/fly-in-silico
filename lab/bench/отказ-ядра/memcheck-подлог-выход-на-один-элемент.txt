@@ -1,0 +1,30 @@
+1-﻿========= COMPUTE-SANITIZER
+2-подлог 1
+3:========= Invalid __global__ atomic of size 4 bytes
+4-=========     at ev_spmv_i64_k+0x2f0
+5-=========     by thread (64,0,0) in block (577,0,0)
+6-=========     Address 0x1b2fdb7fcc is out of bounds
+7-=========     and is 137�101 bytes after the nearest allocation at 0x1b2fd96800 of size 64 bytes
+8-=========     Saved host backtrace up to driver entry point at kernel launch time
+9-=========         Host Frame: call in evspmv.py:799
+10-=========         Host Frame: narrow_out in podlog.py:56
+11-=========         Host Frame: <module> in podlog.py:133
+12-========= 
+13:========= Invalid __global__ atomic of size 4 bytes
+14-=========     at ev_spmv_i64_k+0x2f0
+15-=========     by thread (65,0,0) in block (577,0,0)
+16-=========     Address 0x1b2fdb8234 is out of bounds
+17-=========     and is 137�717 bytes after the nearest allocation at 0x1b2fd96800 of size 64 bytes
+18-=========     Saved host backtrace up to driver entry point at kernel launch time
+19-=========         Host Frame: call in evspmv.py:799
+20-=========         Host Frame: narrow_out in podlog.py:56
+21-=========         Host Frame: <module> in podlog.py:133
+22-========= 
+23:========= Invalid __global__ atomic of size 4 bytes
+24-=========     at ev_spmv_i64_k+0x2f0
+25-=========     by thread (66,0,0) in block (577,0,0)
+26-=========     Address 0x1b2fdb8dd4 is out of bounds
+27-=========     and is 140�693 bytes after the nearest allocation at 0x1b2fd96800 of size 64 bytes
+28-=========     Saved host backtrace up to driver entry point at kernel launch time
+29-=========         Host Frame: call in evspmv.py:799
+30-=========         Host Frame: narrow_out in podlog.py:56
