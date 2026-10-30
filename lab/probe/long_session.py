@@ -116,9 +116,25 @@ def main():                                                   # noqa: C901
                     help="сколько минут по стене держать сессию")
     ap.add_argument("--окно", type=float, default=10.0,
                     help="сколько секунд модельного времени держать в записи")
+    # ВИД СЕАНСА. Прежний (арена) остаётся умолчанием и не меняется ни
+    # одним числом: на нём снят эталон (678,0 с модельного за 20 минут),
+    # и сравнивать с ним можно только его же.
+    #
+    # `тело-зрение` — то, чего не гонял никто: долгий сеанс в ТЕЛЕ со
+    # включённым зрением. Это другой вид прогона и другая механическая
+    # модель (камеры добавляют два приваренных тела, муха тяжелее на
+    # 0,1941 %), поэтому его числа с ареной не сравниваются — он
+    # проверяет не скорость, а то же, что и прежний: что за сеансом
+    # можно сидеть, память не ползёт, правки доходят, остановка
+    # доводит до конца.
+    ap.add_argument("--вид", default="арена",
+                    choices=("арена", "тело-зрение"),
+                    help="что держать долгим сеансом")
     args = ap.parse_args()
     minutes = float(getattr(args, "минут"))
     keep_s = float(getattr(args, "окно"))
+    вид = str(getattr(args, "вид"))
+    rep["вид"] = вид
 
     print("— кольцо записи —")
     part_ring()
@@ -162,9 +178,18 @@ def main():                                                   # noqa: C901
     # Горизонт берётся с запасом: сессию заканчивает остановка, а не
     # исчерпание времени — иначе проверка мерила бы не то.
     horizon = max(60.0, minutes * 60.0)
-    spec = {"kind": "arena", "t": horizon, "seed": 0, "open_report": False,
-            "out": "probe-long-session", "bin_ms": 20.0,
-            "arena": {"probes": False, "keep_s": keep_s}}
+    if вид == "арена":
+        spec = {"kind": "arena", "t": horizon, "seed": 0,
+                "open_report": False, "out": "probe-long-session",
+                "bin_ms": 20.0,
+                "arena": {"probes": False, "keep_s": keep_s}}
+    else:
+        spec = {"kind": "body", "t": horizon, "seed": 0,
+                "open_report": False, "out": "probe-long-vision",
+                "bin_ms": 20.0,
+                "body": {"probes": False, "keep_s": keep_s,
+                         "vision": True, "vis_objects": 1,
+                         "vision_hz": 100.0}}
     ses.submit(spec)
     t0 = time.perf_counter()
     while ses.state != "running" and time.perf_counter() - t0 < 240:
@@ -182,16 +207,29 @@ def main():                                                   # noqa: C901
         round(base_mb, 1) if base_mb else None)
 
     # --- живём ---
-    plan = [  # (доля прожитого, правка)
-        (0.20, {"odours": [{"x": 50.0, "y": 10.0, "strength": 2.0,
-                            "sigma": 15.0}]}),
-        (0.40, {"orn_max_hz": 220.0}),
-        (0.60, {"odours": [{"x": 10.0, "y": 50.0, "strength": 1.0,
-                            "sigma": 9.0},
-                           {"x": 50.0, "y": 50.0, "strength": 1.0,
-                            "sigma": 9.0}]}),
-        (0.80, {"loom_range_mm": 25.0}),
-    ]
+    if вид == "арена":
+        plan = [  # (доля прожитого, правка)
+            (0.20, {"odours": [{"x": 50.0, "y": 10.0, "strength": 2.0,
+                                "sigma": 15.0}]}),
+            (0.40, {"orn_max_hz": 220.0}),
+            (0.60, {"odours": [{"x": 10.0, "y": 50.0, "strength": 1.0,
+                                "sigma": 9.0},
+                               {"x": 50.0, "y": 50.0, "strength": 1.0,
+                                "sigma": 9.0}]}),
+            (0.80, {"loom_range_mm": 25.0}),
+        ]
+    else:
+        # У тела свои живые ручки: `odours` и `loom_range_mm` — арены.
+        # `vision_feed` взят нарочно: он ПОМЕЧЕННЫЙ, то есть сеанс, у
+        # которого посреди счёта выключили подачу зрения, не сравним с
+        # эталонным, и отчёт обязан это показать. Долгий сеанс — ровно
+        # то место, где такую дорогу надо проверить, а не обойти.
+        plan = [
+            (0.20, {"orn_max_hz": 220.0}),
+            (0.40, {"vision_feed": False}),
+            (0.60, {"vision_feed": True}),
+            (0.80, {"vision_max_hz": 200.0}),
+        ]
     done = set()
     t_start = time.perf_counter()
     last_t_ms, back = ses.t_ms, 0
@@ -266,7 +304,12 @@ def main():                                                   # noqa: C901
     check("сессия сохранена", out is not None and out.exists(),
           str(out) if out else "пути нет; ошибка %s" % ses.error)
     if out and out.exists():
-        meta = json.loads((out / "episode.json").read_text(encoding="utf-8"))
+        # Имя файла зависит от ВИДА прогона: арена пишет
+        # `episode.json`, тело — `embodied.json`. Поймано прогоном
+        # долгого сеанса со зрением: проверка падала не на числах, а на
+        # имени файла.
+        имя = "episode.json" if вид == "арена" else "embodied.json"
+        meta = json.loads((out / имя).read_text(encoding="utf-8"))
         tm = meta.get("timing") or {}
         rep["замеры"]["timing сохранённого"] = tm
         check("сохранённый прогон несёт журнал живых правок",
