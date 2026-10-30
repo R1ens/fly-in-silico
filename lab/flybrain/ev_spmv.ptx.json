@@ -1,0 +1,23 @@
+{
+  "артефакт": "ev_spmv.ptx",
+  "источник": "ev_spmv.cu",
+  "отпечаток источника": "sha256:0b92dbbb61a4152e2622f90d43b98b5ec8901f5ac2c8d4e6df9c6dc3adbb2a39",
+  "отпечаток артефакта": "sha256:7b36591a7dafaf4059b102bdef790470291cbf887fe073a7be71b5e2a7ab1f7f",
+  "ядра": [
+    "ev_spmv_i32_k",
+    "ev_spmv_i64_k"
+  ],
+  "abi": 3,
+  "цель": "compute_52",
+  "версия ptx": "8.7",
+  "собран чем": "Cuda compilation tools, release 12.8, V12.8.61",
+  "nvcc при сборке": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin\\nvcc.EXE",
+  "хостовой компилятор при сборке": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat",
+  "флаги": [
+    "-ptx",
+    "-arch=compute_52",
+    "-Wno-deprecated-gpu-targets"
+  ],
+  "предупреждения nvcc": [],
+  "как пересобрать и сверить": "lab/probe/kernel_ship.py --происхождение"
+}
