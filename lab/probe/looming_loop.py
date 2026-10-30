@@ -111,6 +111,13 @@ def check(name, ok, info=""):
         fails.append(name)
 
 
+def fp(a):
+    """Отпечаток массива: первые 16 знаков sha256 по его байтам."""
+    import hashlib
+    return hashlib.sha256(
+        np.ascontiguousarray(a).tobytes()).hexdigest()[:16]
+
+
 def note(text):
     print("  — " + text)
     rep.setdefault("оговорки", []).append(text)
