@@ -117,15 +117,23 @@ def в_другом_процессе(зрение, зерно, длина):
         "dev = 'cuda' if torch.cuda.is_available() else 'cpu'\n"
         "n = D.load_neurons(); W = D.load_weights(device=dev)\n"
         "fp = эпизод(%r, %d, %r, n, W, dev)\n"
-        "print('ОТП' + fp)\n" % (bool(зрение), int(зерно), float(длина)))
+        # Метка ASCII нарочно: кодировка стандартного вывода дочернего
+        # процесса нам не подчинена, и кириллическая метка приходила
+        # искажённой — проба тогда докладывала «нет вывода» при
+        # РАБОТАЮЩЕМ дочернем процессе. Поймано прогоном, а потом
+        # подтверждено ручным вызовом того же дочернего кода.
+        "print('FP=' + fp)\n" % (bool(зрение), int(зерно), float(длина)))
     корень = Path(__file__).resolve().parents[1]
     r = subprocess.run([sys.executable, "-I", "-c", код], cwd=str(корень),
                        capture_output=True, text=True, encoding="utf-8",
                        errors="replace", timeout=3600)
     for строка in (r.stdout or "").splitlines():
-        if строка.startswith("ОТП"):
-            return строка[3:].strip()
-    return "нет вывода: " + (r.stderr or "")[-200:]
+        if "FP=" in строка:
+            return строка.split("FP=", 1)[1].strip()
+    # Отказ разбора обязан отличаться от отказа процесса: иначе «нет
+    # вывода» читается как «процесс не дошёл», а он дошёл.
+    return ("нет метки FP= в выводе; код возврата %s; хвост stderr: %s"
+            % (r.returncode, (r.stderr or "")[-200:]))
 
 
 def main():
