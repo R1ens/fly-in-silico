@@ -168,6 +168,30 @@ class BodyConfig:
     neck_kp: float | None = None
     probes: bool = True  # писать readout_* прямых зондов в запись
 
+    # --- прямое вмешательство в названные популяции (`motor.DnIntervention`) ---
+    #
+    # `dn_drive` — постоянная пуассоновская частота на нейроны названной
+    # популяции: `"DNa02:left=200"`, `"sel:celltype=DNp03=150"`. Это
+    # ВХОД опыта, как запах: он подаётся в сеть, а не обходит её.
+    # `dn_silence` — маска `fire` на названную популяцию, то есть
+    # отрицательный контроль: `"DNa02"` или любая другая популяция через
+    # `sel:`, например `"sel:class:ALPN"` — прежний сенсорный съём.
+    #
+    # Оба по умолчанию выключены, и при выключенных обоих объекта
+    # вмешательства в прогоне нет вовсе — эталонные прогоны считаются
+    # побитово как раньше. Включённое вмешательство пишет оговорку и с
+    # эталонными не сравнивается.
+    dn_drive: str | None = None
+    dn_silence: str | None = None
+
+    # Файл адресации «зонд → вес поворота и тяги» для `motor="dn_linear"`.
+    # None — коэффициенты из кода (`motor.TURN_WEIGHTS_V1`), как считались
+    # все прежние прогоны. Смысл ручки в том, что лучше определённая
+    # адресация подключается ДАННЫМИ: файл едет в `engineered` с sha256 и
+    # записанным происхождением, как семя, и прогоны с разными файлами
+    # машинно различимы. См. `motor.load_weight_map`.
+    motor_map: str | None = None
+
     # --- запись видео ---
     video: bool = False
     fps: int = 30
@@ -1222,6 +1246,16 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                                   no_refractory=driven,
                                   spmv=getattr(cfg, "spmv", None))
 
+    # Прямое вмешательство. Строится ПОСЛЕ движка, потому что маска
+    # заглушения ставится на движок, и ставится она один раз — до
+    # разогрева, иначе перекос и шум измерились бы на незаглушённой
+    # сети, а отрицательный контроль сравнил бы две разные опоры.
+    interv = None
+    if cfg.dn_drive or cfg.dn_silence:
+        interv = motor.DnIntervention(neurons, device, drive=cfg.dn_drive,
+                                      silence=cfg.dn_silence)
+        interv.apply_masks(engine)
+
     t_sens = {k: torch.as_tensor(v, device=device) for k, v in sensor_idx.items()}
     t_ml = torch.as_tensor(motor_l, device=device)
     t_mr = torch.as_tensor(motor_r, device=device)
@@ -1254,6 +1288,14 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     dec_kw = {}
     if cfg.motor == "dn_trained":
         dec_kw["weights_path"] = cfg.motor_weights
+    if cfg.motor == "dn_linear" and cfg.motor_map:
+        dec_kw["map_path"] = cfg.motor_map
+    elif cfg.motor_map and cfg.motor != "dn_linear":
+        # Молча не применять нельзя: прогон выглядел бы настроенным по
+        # файлу адресации, а считался бы не по нему.
+        raise ValueError(
+            "motor_map задан, а декодер %r его не читает: файл адресации "
+            "относится только к `dn_linear`" % cfg.motor)
     decoder = motor.make_decoder(cfg.motor, shape=shape, **dec_kw)
     bridge = motor.GiantFiberBridge(kind=cfg.gf_bridge,
                                     gf_ref_hz=cfg.gf_ref_hz,
@@ -1410,6 +1452,12 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             # Прямые нейронные стимулы — после сенсорных каналов и после
             # `rates.zero_()`: иначе их стирало бы каждым шагом.
             live.add_drive(rates)
+        if interv is not None:
+            # Накачка настройкой прогона — там же и по той же причине.
+            # Порядок с `live.add_drive` задан: если пользователь мышью
+            # накачал ту же популяцию, побеждает настройка прогона, и
+            # это записано, а не оставлено на догадку.
+            interv.apply(rates)
         return rl, rr
 
     def step_brain():
@@ -1522,6 +1570,16 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         }
     print(f"  опора {calib['dn_ref_hz']} Гц, перекос {bias:+.5f}, "
           f"шум {noise:.5f}, яркость насыщения {odour_ref:.5f}")
+
+    # Накачка включается ЗДЕСЬ, после калибровки, и ни шагом раньше.
+    # Причина измерима: `calibrate` считает `bias_hz` как среднюю
+    # разницу сторон по разогреву и дальше вычитает её из каждого шага.
+    # Накачка, шедшая и на разогреве, попала бы в `bias_hz` целиком и
+    # вычиталась бы из самой себя. Заодно первый шаг эпизода становится
+    # ступенью, по которой видна динамика отклика. См.
+    # `motor.DnIntervention`.
+    if interv is not None:
+        interv.enabled = True
 
     # В снимок состояния калибровка уходит НЕОКРУГЛЁННОЙ. Числа в
     # `calib` округлены для чтения глазами и для `embodied.json` (перекос
@@ -1874,14 +1932,16 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     engineered = motor.engineered_block(
         decoder=decoder, bridge=bridge, head_stab=head_stab,
         readout_rows=readout.rows if cfg.probes else None,
-        readout_src=src)
+        readout_src=src,
+        extra=({"прямое вмешательство": interv.spec()}
+               if interv is not None else None))
     # В оговорки идёт только то, что ведёт команду: иначе прогон на
     # нисходящем декодере нёс бы оговорку про сенсорный ALPN, который в
     # нём команду не ведёт вовсе.
     for row in src:
         if row.get("ведёт команду") and row.get("оговорка"):
             timing.setdefault("оговорки", []).append(row["оговорка"])
-    for obj in (bridge, head_stab):
+    for obj in (bridge, head_stab, interv):
         c = obj.caveat() if obj is not None else None
         if c:
             timing.setdefault("оговорки", []).append(c)
