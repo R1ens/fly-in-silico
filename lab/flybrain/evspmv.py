@@ -75,6 +75,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -109,6 +110,33 @@ KERNELS = {"int32": b"ev_spmv_i32_k", "int64": b"ev_spmv_i64_k"}
 # арифметику не влияет, потому что в счёте одно умножение и атомарное
 # добавление, и сливать их в FMA не с чем.
 PTX_TARGET = "compute_52"
+
+# Версия ISA, с которой артефакт КЛАДЁТСЯ В ДЕРЕВО. `nvcc` 12.8 пишет в
+# PTX `.version 8.7`, и это не свойство счёта, а свойство компилятора:
+# драйвер обязан понимать объявленную версию, поэтому артефакт от
+# нынешнего `nvcc` требовал бы драйвера R570 и новее. Колёса torch под
+# cu128 при этом работают и на драйверах от R525 — то есть оставался бы
+# промежуток, где torch считает, а наше ядро не загружается. Ровно та
+# зависимость, которую вся эта дорога убирает.
+#
+# Поэтому ОДНА директива понижается (:func:`lower_ptx_version`), и
+# значение выбрано замером, а не вкусом (`probe/kernel_ship.py`, §7):
+# принимаются 8.7…4.1, а 4.0 отвергается, и отвергается с называнием
+# причины — «PTX .version 4.0 does not support .target sm_52». То есть
+# границу задаёт не арифметика, а выбранная виртуальная цель: `sm_52`
+# появился в CUDA 6.5, а это и есть ISA 4.1. Ниже спускаться было бы
+# можно только вместе с целью, а это сузило бы набор карт снизу и
+# меняло бы ВТОРУЮ директиву — чего преобразование делать не вправе.
+#
+# ISA 4.1 отвечает CUDA 6.5, то есть драйверам R340 и новее: промежуток
+# R525…R569 закрыт с большим запасом.
+PTX_VERSION = "4.1"
+
+# Директивы PTX, которые читаются и правятся по одной. Регулярные
+# выражения привязаны к началу строки и к концу: `.version` в тексте
+# ровно одна, и преобразование обязано это проверить, а не надеяться.
+_VERSION_RE = re.compile(r"^\.version[ \t]+(\S+)[ \t]*$", re.M)
+_TARGET_RE = re.compile(r"^\.target[ \t]+(\S+)[ \t]*$", re.M)
 
 # Какой дорогой доставлять ядро. Одна переменная, одно значение:
 # ``ptx`` (по умолчанию) или ``nvcc``. Подмены одной дороги другой нет
@@ -295,6 +323,98 @@ def _run_nvcc(args, where, tag, timeout=600):
     return got, log, nvcc, vcvars
 
 
+# --- понижение версии ISA: одна директива и ничего больше -------------
+
+
+def ptx_version(text):
+    """Объявленная версия ISA. Директива обязана быть ровно одна."""
+    found = _VERSION_RE.findall(text)
+    if len(found) != 1:
+        raise EventKernelUnavailable(
+            "в PTX директив `.version` %d, а ожидается ровно одна: текст "
+            "не похож на вывод nvcc для одного модуля" % len(found))
+    return found[0]
+
+
+def ptx_target(text):
+    """Объявленная цель. Нужна для проверки, что её НЕ тронули."""
+    found = _TARGET_RE.findall(text)
+    if len(found) != 1:
+        raise EventKernelUnavailable(
+            "в PTX директив `.target` %d, а ожидается ровно одна"
+            % len(found))
+    return found[0]
+
+
+def _ver_tuple(v):
+    return tuple(int(x) for x in str(v).split("."))
+
+
+def lower_ptx_version(text, to=None):
+    """Понизить ОДНУ директиву `.version` и больше ничего не тронуть.
+
+    Возвращает ``(текст, было, стало)``.
+
+    Зачем это вообще, написано у :data:`PTX_VERSION`: версия ISA — это
+    свойство компилятора, а не счёта, и она задаёт нижнюю границу
+    драйвера. Понижение расширяет набор машин, на которых артефакт
+    загрузится, и **не может** изменить результат: в счёте одно
+    умножение и атомарное добавление, FMA сливать не с чем, а если
+    пониженная версия не поддержит какую-то конструкцию, JIT драйвера
+    откажется ГРОМКО (замерено: `.version 4.0` отвергается с «does not
+    support .target sm_52»), а не посчитает иначе.
+
+    Почему это функция, а не правка файла руками. Артефакт в научном
+    репозитории обязан выводиться из источника воспроизводимо. Здесь
+    преобразование описано кодом, применяется к тому, что выдал `nvcc`,
+    и **проверяет себя на месте**: сравнение построчно обязано дать
+    ровно одно расхождение, и оно обязано быть в `.version`. Если
+    преобразование когда-нибудь зацепит вторую строку — оно откажет, а
+    не отдаст молча другой артефакт.
+    """
+    to = str(to or PTX_VERSION)
+    have = ptx_version(text)
+    target_before = ptx_target(text)
+    if _ver_tuple(to) > _ver_tuple(have):
+        raise EventKernelUnavailable(
+            "просили поставить версию ISA %s вместо %s — это ПОВЫШЕНИЕ. "
+            "Поднимать версию нельзя: она объявляет то, чего в тексте "
+            "может не быть, и сузила бы набор драйверов вместо того чтобы "
+            "расширить." % (to, have))
+    out = _VERSION_RE.sub(".version " + to, text, count=1)
+
+    # Проверка на месте, а не в комментарии: ровно одно расхождение, и
+    # оно в `.version`. Без неё правка регулярным выражением однажды
+    # зацепила бы лишнее и отдала бы другой артефакт молча.
+    a, b = text.splitlines(), out.splitlines()
+    if len(a) != len(b):
+        raise EventKernelUnavailable(
+            "понижение версии ISA изменило число строк: %d -> %d"
+            % (len(a), len(b)))
+    diff = [(i, x, y) for i, (x, y) in enumerate(zip(a, b), 1) if x != y]
+    if len(diff) != 1:
+        raise EventKernelUnavailable(
+            "понижение версии ISA тронуло %d строк, а должно одну: %s"
+            % (len(diff), [i for i, _, _ in diff]))
+    line, was, now = diff[0]
+    if not (_VERSION_RE.fullmatch(was) and _VERSION_RE.fullmatch(now)):
+        raise EventKernelUnavailable(
+            "понижение версии ISA тронуло не ту строку (%d): было %r, "
+            "стало %r" % (line, was, now))
+    if ptx_target(out) != target_before:
+        raise EventKernelUnavailable(
+            "понижение версии ISA изменило цель: %s -> %s"
+            % (target_before, ptx_target(out)))
+    return out, have, to
+
+
+def ptx_transform_note(was, now):
+    """Строка в манифест: каким преобразованием одно получено из другого."""
+    return ("понижена одна директива: `.version %s` -> `.version %s` "
+            "(`evspmv.lower_ptx_version`); в тексте не изменено больше "
+            "ничего, цель `.target` та же" % (was, now))
+
+
 # --- сборка артефакта PTX (делается ЗДЕСЬ, не у пользователя) ---------
 
 
@@ -309,13 +429,20 @@ def nvcc_version(nvcc=None):
     return (got.stdout or "").strip().splitlines()[-1:] or "неизвестно"
 
 
-def compile_ptx(target=None, where=None, verbose=False):
-    """Собрать PTX из `ev_spmv.cu` и вернуть ``(текст, манифест)``.
+def compile_ptx(target=None, where=None, verbose=False, version=None):
+    """Собрать PTX из `ev_spmv.cu`: ``(артефакт, манифест, как_выдал_nvcc)``.
 
     Это делается на машине разработчика один раз, результат кладётся в
     дерево. На машине пользователя не зовётся: там PTX уже есть.
 
-    Манифест возвращается рядом с текстом, чтобы происхождение считалось
+    Возвращаются ДВА текста: то, что выдал `nvcc`, и то, что ложится в
+    дерево — второе получается из первого понижением одной директивы
+    `.version` (:func:`lower_ptx_version`, зачем — у :data:`PTX_VERSION`).
+    Оба нужны вызывающему, потому что сверка происхождения идёт в две
+    ступени: пересобрать и сверить с «как выдал `nvcc`», потом применить
+    понижение и сверить с положенным в дерево.
+
+    Манифест возвращается рядом с текстами, чтобы происхождение считалось
     из того же вызова, которым артефакт и собран — иначе они разъехались
     бы при первой же правке.
     """
@@ -350,28 +477,31 @@ def compile_ptx(target=None, where=None, verbose=False):
             "последние строки:\n%s\n%s"
             % (got.returncode, nvcc, vcvars, target, log,
                (got.stdout or "")[-1500:], (got.stderr or "")[-1500:]))
-    text = out.read_text(encoding="utf-8")
-    ver = ""
-    for line in text.splitlines():
-        if line.startswith(".version"):
-            ver = line.split()[1]
-            break
+    raw = out.read_text(encoding="utf-8")
     missing = [k.decode() for k in KERNELS.values()
-               if (".entry %s" % k.decode()) not in text]
+               if (".entry %s" % k.decode()) not in raw]
     if missing:
         raise EventKernelUnavailable(
             "в собранном PTX нет точек входа %s. Имена ядер в "
             "`ev_spmv.cu` разошлись с `KERNELS` в evspmv.py — PTX-дорога "
             "искала бы их по имени и не нашла." % missing)
+    # Понижение одной директивы. Оно и есть то, что ложится в дерево;
+    # `raw` остаётся рядом как «как выдал nvcc», чтобы сверка
+    # происхождения шла в две ступени и обе были проверяемы.
+    text, was, now = lower_ptx_version(raw, version)
     manifest = {
         "артефакт": PTX.name,
         "источник": SRC.name,
         "отпечаток источника": _sha(src_text),
         "отпечаток артефакта": _sha(text),
+        "отпечаток как выдал nvcc": _sha(raw),
         "ядра": [k.decode() for k in KERNELS.values()],
         "abi": ABI,
         "цель": target,
-        "версия ptx": ver,
+        "цель в артефакте": ptx_target(text),
+        "версия ptx": now,
+        "версия ptx как выдал nvcc": was,
+        "преобразование": ptx_transform_note(was, now),
         "собран чем": nvcc_version(nvcc),
         "nvcc при сборке": str(nvcc),
         "хостовой компилятор при сборке": str(vcvars),
@@ -382,7 +512,7 @@ def compile_ptx(target=None, where=None, verbose=False):
         "как пересобрать и сверить":
             "lab/probe/kernel_ship.py --происхождение",
     }
-    return text, manifest
+    return text, manifest, raw
 
 
 # --- драйверный API через ctypes --------------------------------------
@@ -537,6 +667,24 @@ class PtxKernel:
                 "Пересоберите из источника: "
                 "lab/probe/kernel_ship.py --пересобрать"
                 % (PTX.name, got, man.get("отпечаток артефакта")))
+        # Версия и цель читаются ИЗ САМОГО артефакта и сверяются с
+        # манифестом. Отпечаток это уже покрывает, но при расхождении
+        # сказать «версия в файле 8.7, а в манифесте 4.1» полезнее, чем
+        # «отпечатки разные»: сразу видно, что кто-то правил `.version`
+        # руками вместо пересборки.
+        got_ver, got_target = ptx_version(text), ptx_target(text)
+        want_ver = man.get("версия ptx")
+        want_target = man.get("цель в артефакте")
+        if want_ver and got_ver != want_ver:
+            raise EventKernelUnavailable(
+                "в артефакте %s объявлена версия ISA %s, а в манифесте "
+                "%s. Пересоберите: lab/probe/kernel_ship.py --пересобрать"
+                % (PTX.name, got_ver, want_ver))
+        if want_target and got_target != want_target:
+            raise EventKernelUnavailable(
+                "в артефакте %s объявлена цель %s, а в манифесте %s. "
+                "Пересоберите: lab/probe/kernel_ship.py --пересобрать"
+                % (PTX.name, got_target, want_target))
         if int(man.get("abi", -1)) != ABI:
             raise EventKernelUnavailable(
                 "артефакт %s собран под abi %s, а движок ждёт %d: "
@@ -605,7 +753,10 @@ class PtxKernel:
             "артефакт": str(PTX),
             "цель артефакта": man.get("цель"),
             "версия ptx": man.get("версия ptx"),
+            "версия ptx как выдал nvcc": man.get("версия ptx как выдал nvcc"),
+            "преобразование артефакта": man.get("преобразование"),
             "отпечаток артефакта": man.get("отпечаток артефакта"),
+            "отпечаток как выдал nvcc": man.get("отпечаток как выдал nvcc"),
             "отпечаток источника": man.get("отпечаток источника"),
             "собран чем": man.get("собран чем"),
             "версия драйвера": drv.version,
