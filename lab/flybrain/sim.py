@@ -22,6 +22,7 @@ Verified against the upstream backend by ``cli.py verify``.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -74,6 +75,56 @@ class Stimulus:
 FAST = "быстрый"
 REFERENCE = "эталонный"
 
+# --- чем считать умножение связей -------------------------------------
+#
+# Два пути к ОДНОМУ произведению `W @ spikes`, и они не два движка:
+# результат обязан совпадать побитово, и это проверяется
+# `probe/lif_event.py` (пять видов равенства) и `probe/lif_equal.py`.
+#
+# `SPMV_CSR` — прежний `torch.sparse.mm` по CSR. Читает все 15 091 983
+# связи на каждом тике 0,1 мс. Остаётся эталоном и остаётся выбираемым
+# всегда: событийный путь требует `nvcc` на машине, а эталонный — ничего.
+#
+# `SPMV_EVENT` — своё ядро (`flybrain/ev_spmv.cu`): складываются только
+# строки спайкующих нейронов. В рабочей точке спайкуют 28…103 нейрона из
+# 138 639, их связей 6 592…10 365 из 15 091 983, то есть `csrmv`
+# умножает на ноль 99,96 % прочитанного.
+#
+# ТИХОГО ОТКАТА МЕЖДУ НИМИ НЕТ. Если событийное ядро просили, а собрать
+# его нечем, движок поднимает `evspmv.EventKernelUnavailable` с
+# указанием, чего не хватает. Причина — замеренная: `use_graphs` в этом
+# же классе отказывает молча и оставляет шаг втрое медленнее, и второй
+# такой механизм сделал бы любое будущее число непроверяемым.
+SPMV_CSR = "эталонный"
+SPMV_EVENT = "событийный"
+SPMV_CHOICES = (SPMV_CSR, SPMV_EVENT)
+
+# Выбор по умолчанию. Берётся из окружения, чтобы прогон можно было
+# перевести на событийное умножение, не правя ни одного вызова:
+#
+#     set FLYBRAIN_SPMV=событийный
+#
+# Встроенное значение — СОБЫТИЙНОЕ, и разрешение владельца на
+# `nvcc` и MSVC получено. Основания, все замеренные:
+#
+# * равнозначность побитовая: все четыре сочетания дорога×графы
+#   дают один и тот же `v ddf796cd850722cb` при 19 захваченных
+#   графах (`probe/lif_event.py`, 18 проверок, 0 провалов);
+# * мозговая часть шага управления — в 2,679 раза ВНУТРИ настоящего
+#   встроенного контура, а не в микробенчмарке;
+# * довод, который не про скорость: мозговая часть перестаёт
+#   зависеть от фона на видеокарте — у `csrmv` она гуляла в 4,4
+#   раза при одной и той же сборке, у событийного в 1,13. Это
+#   делает воспроизводимыми все будущие замеры проекта.
+#
+# На машине без `nvcc` или MSVC движок не поднимется, и сказано это
+# ГРОМКО: `EventKernelUnavailable` называет, чего не хватает, где искали
+# и как выбрать эталонную дорогу явно (`FLYBRAIN_SPMV=эталонный`).
+# В окне это видно как ошибка задачи: `worker._run_job` ловит и
+# шлёт `ipc.Error` с причиной и следом, то есть окно не исчезает, а
+# показывает, чего не хватает.
+SPMV_DEFAULT = os.environ.get("FLYBRAIN_SPMV", SPMV_EVENT)
+
 
 @dataclass
 class RunConfig:
@@ -89,6 +140,10 @@ class RunConfig:
     # Эталонный режим оставлен, чтобы было с чем сравнивать и куда
     # отступить, если граф когда-нибудь поведёт себя иначе.
     speed: str = FAST
+    # Чем считать умножение связей: `SPMV_CSR` или `SPMV_EVENT`. None —
+    # по `SPMV_DEFAULT` (окружение `FLYBRAIN_SPMV`). Это тоже не два
+    # движка: результат обязан совпадать побитово.
+    spmv: str | None = None
 
 
 class Result:
@@ -182,7 +237,7 @@ class Engine:
     """
 
     def __init__(self, weights, n, params=None, device="cpu", batch=1, seed=0,
-                 no_refractory=None):
+                 no_refractory=None, spmv=None, allow_inexact=False):
         p = dict(params or MODEL_PARAMS)
         self.p = p
         self.n = n
@@ -251,6 +306,12 @@ class Engine:
         self._vstim = None
         self._pool = None
 
+        # Чем считается `W @ spikes`. Эталонный путь не требует ничего;
+        # событийный собирает своё ядро и отказывает ГРОМКО, если его
+        # собрать нечем, — тихого отката здесь нет нарочно.
+        self._ev = None
+        self.spmv = self._setup_spmv(spmv, allow_inexact)
+
         # Счётчик вызовов шага. Это не отладка, а подпись стоимости: по
         # ней режимы воспроизведения различаются не на слово. Просмотр
         # записанного обязан не двигать движок вовсе (ноль вызовов),
@@ -262,6 +323,78 @@ class Engine:
         # этот счётчик не идёт: он зовёт `_core` напрямую, минуя `step`,
         # и состояние вокруг него восстанавливается.
         self.calls = 0
+
+    # --- умножение связей ----------------------------------------------
+
+    def _setup_spmv(self, spmv, allow_inexact=False):
+        """Выбрать путь умножения связей. Отказ — громкий, не тихий.
+
+        Эталонный путь (`SPMV_CSR`) не требует ничего и возвращается
+        сразу. Событийный (`SPMV_EVENT`) собирает своё ядро, и всякая
+        нехватка поднимает `evspmv.EventKernelUnavailable` с указанием,
+        чего именно нет. Это ровно то, чего НЕ делает `use_graphs` в этом
+        же классе: там отказ захвата оставляет шаг втрое медленнее
+        молча, и прогон об этом не узнаёт.
+
+        Перед тем как согласиться считать событийно, проверяются три
+        числа, из которых следует побитовое равенство с `csrmv`
+        (`evspmv.exactness`): значения матрицы целые, спайк 0/1, а
+        максимальная сумма модулей по строке ниже предела точности
+        float32. Если условия не держатся — отказ, и тоже громкий:
+        событийное умножение осталось бы быстрым, но перестало бы быть
+        ТЕМ ЖЕ, а подменять равнозначность приближением молча нельзя.
+        ``allow_inexact=True`` снимает этот отказ явно и записывается в
+        отчёт прогона.
+        """
+        from . import evspmv
+
+        name = SPMV_DEFAULT if spmv is None else str(spmv)
+        if name not in SPMV_CHOICES:
+            raise ValueError(
+                "умножение связей %r не из списка %s" % (name, SPMV_CHOICES))
+        self._spmv_exact = None
+        self._spmv_inexact_ok = bool(allow_inexact)
+        if name == SPMV_CSR:
+            return name
+        if self.device != "cuda":
+            raise evspmv.EventKernelUnavailable(
+                "событийное умножение связей считает только на CUDA, а "
+                "движок собран на %r. Выберите эталонное умножение явно: "
+                "spmv=\"%s\"." % (self.device, SPMV_CSR))
+        exact = evspmv.exactness(self.w_csr)
+        self._spmv_exact = exact
+        if not exact["годится"] and not allow_inexact:
+            raise evspmv.EventKernelUnavailable(
+                "событийное умножение не обещает побитового равенства на "
+                "ЭТОЙ матрице, и поэтому не включается: значения целые — "
+                "%s (макс нецелая часть %g), макс сумма модулей по строке "
+                "%.0f против предела точности float32 %d. Либо считайте "
+                "эталонным умножением (spmv=\"%s\"), либо выберите "
+                "приближение явно (allow_inexact=True) — и тогда это "
+                "запишется в отчёт прогона как приближение."
+                % (exact["значения целые"], exact["макс нецелая часть"],
+                   exact["макс сумма модулей по строке"],
+                   exact["предел точности float32"], SPMV_CSR))
+        self._ev = evspmv.Events(self.w_csr, self.batch, self.device)
+        return name
+
+    def spmv_info(self):
+        """Чем считалось умножение связей — для отчёта прогона.
+
+        Пишется в каждый сохранённый прогон не для порядка: по готовому
+        файлу должно быть видно, каким путём он посчитан, иначе числа
+        скорости нечему приписать.
+        """
+        out = {"умножение связей": self.spmv}
+        if self._spmv_exact is not None:
+            out["побитовое равенство обеспечено"] = bool(
+                self._spmv_exact["годится"])
+            out["условия равенства"] = self._spmv_exact
+        if self._spmv_inexact_ok:
+            out["разрешено приближение"] = True
+        if self._ev is not None:
+            out["сборка ядра"] = self._ev.build_info
+        return out
 
     # --- вмешательства -------------------------------------------------
 
@@ -620,8 +753,22 @@ class Engine:
         оно выбросило бы события всех остальных.
         """
         # recurrent input: W[post, pre] @ spikes[pre]
-        recurrent = self.w_scale * torch.sparse.mm(
-            self.w_csr, (self.spikes * self.m_out).t().contiguous()).t()
+        #
+        # Две дороги к ОДНОМУ произведению, и обе здесь, рядом, а не в
+        # двух версиях файла: эталонная читает все 15 091 983 связи,
+        # событийная — только строки спайкующих нейронов. Умножение на
+        # `w_scale` в обеих стоит ПОСЛЕ суммы и остаётся отдельной
+        # операцией: внести его в ядро значило бы складывать уже
+        # умноженные слагаемые, а это другие последние биты.
+        if self._ev is None:
+            recurrent = self.w_scale * torch.sparse.mm(
+                self.w_csr, (self.spikes * self.m_out).t().contiguous()).t()
+        else:
+            # Маска `m_out` применяется внутри ядра, а не отдельным
+            # умножением: и спайк, и маска — ровно 0.0 или 1.0, поэтому
+            # произведение точное, а один полноразмерный временный
+            # тензор и одна транспонированная копия на шаг не создаются.
+            recurrent = self.w_scale * self._ev.mm(self.spikes, self.m_out)
 
         # refractory counter: reset on spike, otherwise count up
         self.refrac.add_(1.0).mul_(1.0 - self.spikes)
@@ -661,13 +808,19 @@ class Engine:
 
 def build_engine(weights=None, neurons=None, silenced=None, params=None,
                  device=None, batch=1, seed=0, no_refractory=None,
-                 graphs=True):
+                 graphs=True, spmv=None, allow_inexact=False):
     """Load what is needed and return a ready :class:`Engine`.
 
     `graphs` просит записать шаг в CUDA-графы. По умолчанию да: выигрыш
     замерен втрое, а результат побайтово тот же. На процессоре и при
     отказе захвата движок молча остаётся обычным — `use_graphs` вернёт
     False, и шаг пойдёт прежним путём.
+
+    `spmv` выбирает дорогу умножения связей: `SPMV_CSR` (эталонная) или
+    `SPMV_EVENT` (событийное ядро). None — значение `SPMV_DEFAULT`, то
+    есть окружение `FLYBRAIN_SPMV`. В отличие от `graphs`, здесь тихого
+    отката НЕТ: если событийное ядро просили и собрать его нечем,
+    сборка движка падает громко.
     """
     if neurons is None:
         neurons = D.load_neurons()
@@ -680,7 +833,8 @@ def build_engine(weights=None, neurons=None, silenced=None, params=None,
     weights = _silence(weights, np.asarray(silenced if silenced is not None
                                            else [], dtype=np.int64), n)
     eng = Engine(weights, n, params=params, device=device, batch=batch,
-                 seed=seed, no_refractory=no_refractory)
+                 seed=seed, no_refractory=no_refractory, spmv=spmv,
+                 allow_inexact=allow_inexact)
     if graphs:
         eng.use_graphs()
     return eng
@@ -732,7 +886,8 @@ def run(
     engine = build_engine(weights=weights, neurons=neurons, silenced=silenced,
                           params=p, device=device, batch=B, seed=config.seed,
                           no_refractory=stim_all,
-                          graphs=(getattr(config, "speed", FAST) != REFERENCE))
+                          graphs=(getattr(config, "speed", FAST) != REFERENCE),
+                          spmv=getattr(config, "spmv", None))
     t_setup = time.perf_counter() - t0
 
     rates = torch.zeros(B, n, device=device)
@@ -798,6 +953,11 @@ def run(
         # видно, чем он посчитан.
         "speed": getattr(config, "speed", FAST),
         "graphs": engine._graphs is not None,
+        # Каким путём считалось умножение связей. Пишется ДЕЙСТВИТЕЛЬНЫМ,
+        # а не по просьбе: тихого отката нет, но просьба может приходить
+        # из окружения, и по сохранённому файлу должно быть видно, чем
+        # прогон посчитан.
+        **engine.spmv_info(),
     }
     return Result(
         counts.cpu().numpy(),

@@ -142,7 +142,8 @@ def _spec_from_args(args, kind):
             gf_bridge=getattr(args, "gf_bridge", "none"),
             head_stab=bool(getattr(args, "head_stab", False)),
             neck_kp=getattr(args, "neck_kp", None),
-            probes=not getattr(args, "no_probes", False))
+            probes=not getattr(args, "no_probes", False),
+            spmv=getattr(args, "spmv", None))
     elif kind == "lateral":
         sp.lateral = S.LateralSpec(base_hz=args.base, depth=args.depth,
                                    period_s=args.period, top=args.top)
@@ -891,6 +892,14 @@ def build_parser():
                         "dn_trained — те же зонды, веса из файла")
     s.add_argument("--motor-weights", default=None,
                    help="файл весов для --motor-decoder dn_trained")
+    s.add_argument("--spmv", default=None,
+                   choices=("эталонный", "событийный"),
+                   help="чем считать умножение связей в движке LIF: "
+                        "эталонный — csrmv по всем 15 091 983 связям; "
+                        "событийный — своё ядро только по строкам "
+                        "спайкующих (требует nvcc и MSVC, при их "
+                        "отсутствии падает громко). По умолчанию — "
+                        "окружение FLYBRAIN_SPMV")
     s.add_argument("--gf-bridge", default="none",
                    choices=("none", "gain_v1"),
                    help="ИНЖЕНЕРНЫЙ мост через обрыв «Giant Fiber → "
