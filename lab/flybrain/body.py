@@ -180,6 +180,17 @@ class BodyConfig:
     # пока равенство не доказано на этой модели: см. `_fly_class`.
     fast_physics: bool = False
 
+    # Чем считать умножение связей в движке LIF: `sim.SPMV_CSR` или
+    # `sim.SPMV_EVENT`. None — по `sim.SPMV_DEFAULT`, то есть по
+    # окружению `FLYBRAIN_SPMV`.
+    #
+    # Это НЕ `fast_physics`: там траектория другая, здесь произведение
+    # обязано совпадать побитово, и проверяется это
+    # `probe/lif_event.py`. Поле есть потому, что событийное умножение
+    # требует `nvcc` на машине, и выбор должен быть видимым в карточке
+    # прогона, а не только в окружении.
+    spmv: str | None = None
+
     # Какой контроллер походки крутит ноги.
     #
     # * `"fast"` — вендоренная копия шага из `flybrain.gait`: те же числа,
@@ -1208,7 +1219,8 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     if engine is None:
         engine = sim.build_engine(weights=weights, neurons=neurons,
                                   device=device, seed=cfg.seed,
-                                  no_refractory=driven)
+                                  no_refractory=driven,
+                                  spmv=getattr(cfg, "spmv", None))
 
     t_sens = {k: torch.as_tensor(v, device=device) for k, v in sensor_idx.items()}
     t_ml = torch.as_tensor(motor_l, device=device)
@@ -1786,6 +1798,10 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                 bool(getattr(cfg, "fast_gain", True)) and _legacy,
             "контроллер походки": str(getattr(cfg, "gait", "fast")),
         },
+        # Чем считалось умножение связей в движке. Берётся у ДВИЖКА, а не
+        # у настройки: просьба может прийти из окружения, а тихого отката
+        # нет, поэтому записанное — это то, что действительно считало.
+        **(engine.spmv_info() if hasattr(engine, "spmv_info") else {}),
     }
     accfwd = getattr(getattr(body, "physics", None), "_fb_accfwd", None)
     if accfwd is not None:
