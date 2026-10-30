@@ -329,7 +329,15 @@ class RetinaAdapter:
         """
         import torch
 
+        from . import sim
+
         hz = self.hz(frame, contrast=contrast)
+        # Проверка ДО записи и на хосте: `hz` здесь уже числами, и
+        # проверка бесплатна. Выше предела `bernoulli` упал бы ассертом
+        # карты, а тот портит контекст CUDA необратимо
+        # (`sim.MAX_RATE_HZ`). Под поставленным потолком 150 Гц предел
+        # недостижим, но `vision_max_hz` задаётся человеком.
+        sim.check_rates_hz(hz, "подача фоторецепторов (vision.feed)")
         t = torch.as_tensor(hz, device=rates.device)
         rates[0].index_copy_(0, self._idx_t, t)
         # Сводка считается на хосте по тому же массиву, который уже

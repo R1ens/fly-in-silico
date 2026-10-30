@@ -181,29 +181,29 @@ def main():
         return [d]
 
     УСЛОВИЯ = {
-        "нависание": dict(vis_track="loom_dark", vision_bridge="гибрид"),
+        "нависание": dict(vis_track=O.preset("loom_dark"), vision_bridge="гибрид"),
         "без предмета": dict(vis_track=None, vision_bridge="гибрид"),
-        "неподвижный": dict(vis_track="still", vision_bridge="гибрид"),
-        "поперёк": dict(vis_track="sweep", vision_bridge="гибрид"),
+        "неподвижный": dict(vis_track=O.preset("still"), vision_bridge="гибрид"),
+        "поперёк": dict(vis_track=O.preset("sweep"), vision_bridge="гибрид"),
         "зрение выключено": dict(vision=False, vis_objects=0,
                                  vis_track=None, vision_bridge=None),
-        "переходник выключен": dict(vis_track="loom_dark",
+        "переходник выключен": dict(vis_track=O.preset("loom_dark"),
                                     vision_bridge=None),
-        "тасовка подачи": dict(vis_track="loom_dark",
+        "тасовка подачи": dict(vis_track=O.preset("loom_dark"),
                                vision_bridge="гибрид",
                                vision_bridge_shuffle=True),
         "заглушены T4/T5": dict(
-            vis_track="loom_dark", vision_bridge="гибрид",
+            vis_track=O.preset("loom_dark"), vision_bridge="гибрид",
             dn_silence="sel:" + ",".join(
                 "celltype=%s" % t for t in
                 ("T4a", "T4b", "T4c", "T4d",
                  "T5a", "T5b", "T5c", "T5d"))),
-        "заглушён DNp01": dict(vis_track="loom_dark",
+        "заглушён DNp01": dict(vis_track=O.preset("loom_dark"),
                                vision_bridge="гибрид",
                                dn_silence="DNp01"),
-        "мимо цели": dict(vis_track="loom_dark", vision_bridge="гибрид",
+        "мимо цели": dict(vis_track=O.preset("loom_dark"), vision_bridge="гибрид",
                           dn_silence="sel:celltype=%s" % МИМО),
-        "тело заморожено": dict(vis_track="loom_dark",
+        "тело заморожено": dict(vis_track=O.preset("loom_dark"),
                                 vision_bridge="гибрид",
                                 amp_base=0.0, amp_span=0.0,
                                 amp_min=0.0, amp_max=0.0),

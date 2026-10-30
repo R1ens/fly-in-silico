@@ -1278,11 +1278,21 @@ class DnIntervention:
                 row["роль по литературе"] = PROBE_ROLES[name]
             return idx, row
 
+        from . import sim
+
         self.rows_drive, self.rows_silence = [], []
         self._drive = []
         if drive:
             for name, side, hz in _parse_drive(drive):
                 idx, row = resolve(name, side)
+                # Проверка при СБОРКЕ, а не на шаге: частота накачки —
+                # свойство прогона, задаётся человеком и ничем не была
+                # ограничена. Выше предела `bernoulli` падает ассертом
+                # карты, а тот портит контекст CUDA необратимо, и дальше
+                # та же причина докладывается чужой строкой
+                # (`sim.MAX_RATE_HZ`). Отказ до первого шага.
+                sim.check_rates_hz(hz, "накачка %s%s (dn_drive)"
+                                   % (name, ":" + side if side else ""))
                 row["частота, Гц"] = hz
                 self.rows_drive.append(row)
                 self._drive.append((torch.as_tensor(idx, device=device), hz))

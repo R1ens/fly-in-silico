@@ -71,7 +71,7 @@ import time
 
 import numpy as np
 
-from . import retina as R, vishybrid as H
+from . import retina as R, sim as S, vishybrid as H
 
 # Популяции границы T4/T5 и те, что за ней. Имена — ключи, по которым
 # нейроны выбираются ТОЧНЫМ однополевым селектором `celltype=`, а не
@@ -236,6 +236,11 @@ class Мост:
             свод["нависание"][с] = round(float(о["нависание"]), 6)
             for к, hz in сиг.items():
                 idx, _ = self._адрес[(с, к)]
+                # Усиление переходника задаётся человеком и ничем не
+                # ограничено, а выше предела `bernoulli` падает ассертом
+                # карты, который портит контекст CUDA необратимо. Отказ
+                # здесь громкий и называет глаз и популяцию.
+                S.check_rates_hz(hz, "подача переходника на %s %s" % (к, с))
                 t = torch.as_tensor(np.asarray(hz, dtype=np.float32),
                                     device=rates.device)
                 rates[0].index_copy_(0, idx, t)
