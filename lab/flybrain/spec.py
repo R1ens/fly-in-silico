@@ -354,14 +354,66 @@ class RunSpec:
         return time.strftime("%Y%m%d-%H%M%S") + "-" + slug_fn(base)
 
 
+def _block_of_field():
+    """Имя поля блока -> блоки, которым оно принадлежит."""
+    out = {}
+    for name, cls in _BLOCKS.items():
+        for f in fields(cls):
+            out.setdefault(f.name, []).append(name)
+    return out
+
+
+def _refuse_flat(d, known):
+    """Отказать, если поле блока положили в КОРЕНЬ спеки.
+
+    До этой проверки такой ключ молча пропадал, и прогон шёл с
+    настройками по умолчанию — то есть не тем прогоном, который
+    заказали, и без единого слова об этом. Поймано по трём местам
+    сразу:
+
+    * `flybrain/ui/runs.py` — кнопка «взять эту популяцию на рулёжку»
+      посылала `{"kind": "body", "readout": имя}`, и эпизод считался с
+      `ALPN` независимо от того, какую популяцию нажали;
+    * `probe/ipc_test.py` — все пять задач пробы шли плоскими, и у
+      стимуляции пропадал ВЕСЬ блок `activate`: пункты «кадры stim» и
+      «ошибка пришла как Error» проверяли прогон вообще без стимула и
+      провалиться не могли;
+    * `probe/bodyfinal_live.py` — пункт 0 печатал «readout доехал:
+      False» и на этом успокаивался.
+
+    Незнакомые ключи по-прежнему игнорируются: прогон, сохранённый
+    старой сборкой, должен открываться новой. Отказ — только для тех
+    ключей, у которых есть ОПРЕДЕЛЁННОЕ место в блоке, то есть там, где
+    видно и что хотели, и что вместо этого получилось бы. Корпус
+    сохранённых прогонов проверен: ни в одном `spec.json` таких ключей
+    в корне нет.
+    """
+    where = _block_of_field()
+    for k in d:
+        if k in known or k in _BLOCKS or k not in where:
+            continue
+        blocks = where[k]
+        block = blocks[0] if len(blocks) == 1 else (
+            d.get("kind", "stim") if d.get("kind", "stim") in blocks
+            else blocks[0])
+        raise ValueError(
+            "ключ %r стоит в корне спеки, а принадлежит блоку %r: нужно "
+            "{%r: {%r: ...}}. В корне он не применялся вовсе, и прогон "
+            "шёл бы с настройкой по умолчанию."
+            % (k, block, block, k))
+
+
 def from_dict(d):
     """Разобрать словарь обратно в спеку.
 
     Незнакомые ключи игнорируются нарочно: прогон, сохранённый старой
-    сборкой, должен открываться новой, а не падать.
+    сборкой, должен открываться новой, а не падать. Поле блока,
+    положенное в корень, — не незнакомый ключ, и оно отвергается:
+    см. :func:`_refuse_flat`.
     """
     d = dict(d or {})
     known = {f.name for f in fields(RunSpec)}
+    _refuse_flat(d, known)
     kind = d.get("kind", "stim")
     spec = RunSpec(kind=kind)
     for k, v in d.items():
@@ -377,10 +429,29 @@ def from_dict(d):
             if k in subknown:
                 setattr(sub, k, v)
         if name == "stim" and sub.activate:
-            sub.activate = [t if isinstance(t, StimTerm) else StimTerm(
-                **{k: v for k, v in dict(t).items()
-                   if k in {f.name for f in fields(StimTerm)}})
-                for t in sub.activate]
+            # Ключи стимула тоже отвергаются, а не отсеиваются. Та же
+            # беда, что и с плоскими полями блока: `{"rate": 150.0}`
+            # отсеивалось, и стимул шёл на 200 Гц — на настройке по
+            # умолчанию, — а печаталось «150 Гц». Проверенный корпус
+            # сохранённых прогонов пишет правильные имена
+            # (`query`, `rate_hz`, `t_on_ms`), так что старые прогоны
+            # этим не задеты.
+            tkn = {f.name for f in fields(StimTerm)}
+            terms = []
+            for t in sub.activate:
+                if isinstance(t, StimTerm):
+                    terms.append(t)
+                    continue
+                t = dict(t)
+                extra = [k for k in t if k not in tkn]
+                if extra:
+                    raise ValueError(
+                        "в стимуле нет полей %s; есть %s. Неизвестное поле "
+                        "не применялось, и стимул шёл с настройкой по "
+                        "умолчанию." % (", ".join(map(repr, sorted(extra))),
+                                        ", ".join(sorted(tkn))))
+                terms.append(StimTerm(**t))
+            sub.activate = terms
         setattr(spec, name, sub)
     spec.ensure_block()
     return spec

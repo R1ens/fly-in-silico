@@ -53,14 +53,26 @@ def main():
     rep = {}
 
     # --- 0. что уходит работнику из окна: проверка схемы, без работника ---
+    # Выход — в БЛОКЕ `body`. Прежде здесь стояла плоская спека, и пункт
+    # честно печатал «readout доехал: False», на том и останавливался:
+    # `spec.from_dict` такой ключ молча отсеивал, и эпизод считался с
+    # `ALPN`. Теперь проверяется и то, что правильная форма доезжает, и
+    # ВСТРЕЧНОЕ — что плоская форма отвергается, а не исполняется с
+    # настройкой по умолчанию.
     sent = {"kind": "body", "t": 0.4, "seed": 0,
-            "readout": "DNa02", "no_open": True}
+            "body": {"readout": "DNa02"}, "no_open": True}
     got = SP.from_dict(sent)
+    try:
+        SP.from_dict({"kind": "body", "t": 0.4, "readout": "DNa02"})
+        flat_refused = "НЕТ: плоская спека разобралась молча"
+    except ValueError as exc:
+        flat_refused = str(exc)[:120]
     rep["спека окна"] = {
         "окно посылает": sent,
         "spec.body.readout после разбора": got.body.readout,
         "readout доехал": got.body.readout == "DNa02",
         "no_open доехал": "no_open" in {f for f in got.to_dict()},
+        "плоская спека отвергнута": flat_refused,
     }
     print("0. спека, которую посылает окно")
     for k, v in rep["спека окна"].items():

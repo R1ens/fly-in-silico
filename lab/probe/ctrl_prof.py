@@ -131,6 +131,26 @@ def patch_instance(body, coarse=False):
     """Обёртки на экземплярах: физика MuJoCo, арена, фазовый множитель."""
     if coarse:
         return
+    # Наблюдение на дешёвой дороге (`fast_obs`) живёт в ПОДКЛАССЕ `Fly`,
+    # который `body._fly_class` собирает на лету. Обёртка на самом
+    # `Fly.get_observation` до него не доходит, и в разложении строка
+    # «наблюдение» выходила нулевой, а её время оседало в остатке
+    # «прочее FlyGym внутри шага» — двадцать с лишним миллисекунд
+    # на шаг управления прятались там целиком.
+    #
+    # Класс тела собирается слоями (`_fast_obs_mixin`, затем надстройка
+    # под `acc_forward`), и `get_observation` может быть объявлен не на самом
+    # внешнем. Берётся первый по MRO, у кого он свой: именно он и
+    # зовётся. Если это сам `Fly` из пакета — обёртка там уже стоит.
+    from flygym_gymnasium.fly import Fly as _PkgFly
+
+    for cls in type(body.fly).__mro__:
+        if "get_observation" in cls.__dict__:
+            if cls is not _PkgFly:
+                cls.get_observation = timed(
+                    "наблюдение: дешёвая дорога (подкласс Fly)",
+                    cls.__dict__["get_observation"])
+            break
     ph = body.physics
     ph.step = timed("MuJoCo: mj_step", ph.step)
     ph.forward = timed("MuJoCo: mj_forward", ph.forward)
