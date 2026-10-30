@@ -210,6 +210,16 @@ def _spec_from_args(args, kind):
             vision_shuffle=bool(getattr(args, "vision_shuffle", False)),
             vision_light=getattr(args, "vision_light", 1.0),
             vision_contrast=getattr(args, "vision_contrast", 1.0),
+            vision_bridge=getattr(args, "vision_bridge", None),
+            vision_bridge_boundary=getattr(
+                args, "vision_bridge_boundary", "T4/T5"),
+            vision_bridge_gain=getattr(args, "vision_bridge_gain", 200.0),
+            vision_bridge_delay_ms=getattr(
+                args, "vision_bridge_delay_ms", 30.0),
+            vision_bridge_shuffle=bool(getattr(
+                args, "vision_bridge_shuffle", False)),
+            vision_bridge_subtypes_shuffle=bool(getattr(
+                args, "vision_bridge_subtypes_shuffle", False)),
             vis_objects=int(getattr(args, "vis_objects", 0) or 0),
             vis_track=_track_from_args(args))
         # Пресет накладывается ПОВЕРХ флагов и в самом конце, а не
@@ -1035,6 +1045,32 @@ def build_parser():
                    help="контраст кадра: clip(0,5 + (I − 0,5)·k). "
                         "Объявленное преобразование кадра, не свойство "
                         "сцены")
+    s.add_argument("--vision-bridge", default=None, choices=("гибрид",),
+                   help="ГИБРИДНЫЙ зрительный переходник: направленные "
+                        "сигналы T4/T5 считаются ВНЕ сети, а дальше "
+                        "сигнал идёт по настоящим связям FlyWire "
+                        "(T4/T5 -> LPLC2, LC4 -> DNp01). Это ИНЖЕНЕРНЫЙ "
+                        "интерфейс, а не передача по глубокому "
+                        "зрительному пути оригинальной сети: без него за "
+                        "третьим синапсом ровно 0,000 Гц")
+    s.add_argument("--vision-bridge-boundary", default="T4/T5",
+                   choices=("T4/T5", "LC4/LPLC2"),
+                   help="где переходник стыкуется с сетью. При "
+                        "LC4/LPLC2 отклики самих LC4 и LPLC2 НЕ "
+                        "принадлежат никаким синапсам — они поданы")
+    s.add_argument("--vision-bridge-gain", type=float, default=200.0,
+                   help="усиление подачи переходника, Гц")
+    s.add_argument("--vision-bridge-delay-ms", type=float, default=30.0,
+                   help="плечо задержки коррелятора, мс")
+    s.add_argument("--vision-bridge-shuffle", action="store_true",
+                   help="ВСТРЕЧНЫЙ ЗАМЕР: те же числа тем же "
+                        "популяциям, но нейронам в случайном порядке — "
+                        "суммарный вход тот же, разрушена только "
+                        "пространственная структура")
+    s.add_argument("--vision-bridge-subtypes-shuffle", action="store_true",
+                   help="ВСТРЕЧНЫЙ ЗАМЕР: перемешать соответствие "
+                        "«подтип T4/T5 — направление» — разрушена "
+                        "только направленная структура")
     s.add_argument("--objects", type=int, default=0, dest="vis_objects",
                    help="сколько слотов зрительных объектов вписать в "
                         "сцену (тела MuJoCo создаются до компиляции)")

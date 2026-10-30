@@ -210,9 +210,14 @@ class BodyConfig:
     #
     # Это НЕ `fast_physics`: там траектория другая, здесь произведение
     # обязано совпадать побитово, и проверяется это
-    # `probe/lif_event.py`. Поле есть потому, что событийное умножение
-    # требует `nvcc` на машине, и выбор должен быть видимым в карточке
-    # прогона, а не только в окружении.
+    # `probe/lif_event.py`. Поле есть потому, что выбор дороги должен
+    # быть видимым в карточке прогона, а не только в окружении.
+    #
+    # Умолчание — ЭТАЛОННАЯ дорога, и это откат: событийная выведена из
+    # приёмки выпуска, пока не названа причина единичного
+    # `CUDA illegal memory access` (`KERNEL_FAULT.md`, разбор не нашёл
+    # её; `sim.SPMV_DEFAULT` объясняет решение). `nvcc` для событийной
+    # дороги не нужен — ядро едет готовым PTX (`KERNEL_SHIP.md`).
     spmv: str | None = None
 
     # Какой контроллер походки крутит ноги.
@@ -359,6 +364,33 @@ class BodyConfig:
     # написано в происхождении прогона. При k = 1 преобразование не
     # исполняется вовсе, и частоты совпадают с `retina.rates` до бита.
     vision_contrast: float = 1.0
+
+    # --- гибридный зрительный переходник (`flybrain.vislink`) ---
+    #
+    # `None` — переходника нет вовсе, и прогон неотличим от прежних: за
+    # третьим синапсом по-прежнему ровно 0,000 Гц, и это замеренное
+    # состояние продуктового зрения, а не недоделка.
+    # `"гибрид"` — ИНЖЕНЕРНЫЙ переходник: ранняя зрительная обработка
+    # считается ВНЕ сети, подача идёт на T4a…d и T5a…d, а дальше сигнал
+    # идёт по настоящим связям FlyWire (T4/T5 → LPLC2, LC4 → DNp01).
+    #
+    # Это НЕ передача по глубокому пути оригинальной сети, и так оно
+    # названо и в коде, и в сводке прогона, и в отчёте. Граница
+    # стыковки входит в происхождение прогона отдельным полем, а не
+    # примечанием: по сохранённому файлу должно быть видно, какие
+    # отклики посчитаны синапсами, а какие поданы снаружи.
+    vision_bridge: str | None = None
+    vision_bridge_boundary: str = "T4/T5"
+    vision_bridge_gain: float = 200.0
+    vision_bridge_delay_ms: float = 30.0
+    # Два встречных замера переходника. `shuffle` — те же числа другим
+    # адресатам (суммарный вход побитово тот же, разрушена только
+    # пространственная структура); `subtypes` — перемешанное
+    # соответствие «подтип → направление» (разрушена только
+    # направленная структура). Без них ни одно утверждение о подаче
+    # не стоит ничего.
+    vision_bridge_shuffle: bool = False
+    vision_bridge_subtypes_shuffle: bool = False
 
     # --- зрительные объекты в сцене (`flybrain.objects`) ---
     #
@@ -1370,6 +1402,7 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     # `probe/vision_live.py` — обе снимают рефрактерность с
     # фоторецепторов).
     vis = None
+    vbr = None                 # гибридный переходник, если его просили
     if bool(getattr(cfg, "vision", False)):
         from . import vision as V
 
@@ -1385,6 +1418,49 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         vis.attach(neurons, device)
         print(f"  зрение      {len(vis.indices):6d} фоторецепторов "
               f"({vis.name} v{vis.version}, {cfg.vision_eyes})")
+        # Переходник строится здесь же и из того же набора: ему нужна
+        # матрица связей, чтобы НАВЕСТИ омматидий на T4/T5 по
+        # возбуждающим синапсам через ламину и медуллу. Строится он
+        # только когда его просили: при `vision_bridge=None` ни одного
+        # обращения к `vislink` в прогоне нет.
+        if getattr(cfg, "vision_bridge", None):
+            from . import vislink as VBR
+
+            реж = str(cfg.vision_bridge)
+            if реж != "гибрид":
+                raise ValueError(
+                    "`vision_bridge` знает одно значение — \"гибрид\"; "
+                    "дано %r. Физиологический режим (`visdyn`) отвергнут "
+                    "своим нулевым контролем и умолчанием не бывает "
+                    "(FULL_LOOP_VALIDATION.md §2.4)" % (реж,))
+            vbr = VBR.Мост(
+                neurons, weights, device=device,
+                граница=str(getattr(cfg, "vision_bridge_boundary",
+                                    "T4/T5")),
+                усиление_hz=float(getattr(cfg, "vision_bridge_gain",
+                                          200.0)),
+                задержка_мс=float(getattr(cfg, "vision_bridge_delay_ms",
+                                          30.0)),
+                кадр_мс=float(cfg.control_ms),
+                тасовка=bool(getattr(cfg, "vision_bridge_shuffle", False)),
+                подтипы_тасовка=bool(getattr(
+                    cfg, "vision_bridge_subtypes_shuffle", False)),
+                seed=cfg.seed,
+                mode=str(getattr(cfg, "vision_mode", "whiten")),
+                assign=str(getattr(cfg, "vision_assign", "capacity")))
+            нав, вс = vbr.наведено
+            print("  переходник  %6d нейронов границы %s "
+                  "(ИНЖЕНЕРНЫЙ, место наведено у %d из %d)"
+                  % (sum(len(i) for i, _ in vbr._адрес.values()),
+                     vbr.граница, нав, вс))
+
+    if vbr is None and getattr(cfg, "vision_bridge", None):
+        # Переходник берёт яркость у кадра глаза, и без зрения её нет
+        # вовсе. Тихо его пропустить нельзя: прогон тогда утверждал бы
+        # режимом то, чего в нём не было.
+        raise ValueError(
+            "`vision_bridge` просили при выключенном зрении: переходник "
+            "берёт яркость у кадра глаза, поставьте `vision=True`")
 
     driven = np.unique(np.concatenate(list(sensor_idx.values())))
     if vis is not None and len(vis.indices):
@@ -1585,7 +1661,8 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
     # `Fly.post_step`, и измеренная частота обновления сравнивается с
     # заказанной в самом прогоне.
     vis_seen = {"шагов с подачей": 0, "обновлений": 0, "подача": None,
-                "последнее обновление, мс": None}
+                "последнее обновление, мс": None,
+                "шагов с переходником": 0, "переходник": None}
 
     def pose_antennae():
         """Положение и курс ОТ ОБОНЯТЕЛЬНЫХ СЕНСОРОВ, а не от груди.
@@ -1662,6 +1739,7 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
         # выключения подачи в записи стояло 117,985 Гц. Поле, которое
         # врёт, хуже отсутствующего поля.
         vis_seen["подача"] = None
+        vis_seen["переходник"] = None
         if vis is not None and frame is not None \
                 and bool(getattr(cfg, "vision_feed", True)):
             # Потолок и насыщение перечитываются из настройки на каждом
@@ -1676,6 +1754,20 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                 rates, frame,
                 contrast=float(getattr(cfg, "vision_contrast", 1.0) or 1.0))
             vis_seen["шагов с подачей"] += 1
+            # Переходник — ПОСЛЕ фоторецепторов и по тому же кадру.
+            # Популяции не пересекаются (фоторецепторы и T4/T5
+            # непересекающиеся множества нейронов), поэтому записи не
+            # затирают друг друга; проверено отдельно в
+            # `probe/looming_loop.py`.
+            #
+            # Контраст переходнику НЕ передаётся: он считает производную
+            # яркости по времени, и преобразование вокруг середины шкалы
+            # поменяло бы её на постоянный множитель, то есть выдало бы
+            # изменение чувствительности за изменение сцены.
+            if vbr is not None:
+                vis_seen["переходник"] = vbr.feed(rates,
+                                                  vis.per_omma(frame))
+                vis_seen["шагов с переходником"] += 1
         if live is not None:
             # Прямые нейронные стимулы — после сенсорных каналов и после
             # `rates.zero_()`: иначе их стирало бы каждым шагом.
@@ -2071,6 +2163,15 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             if fed is not None:
                 rec["vis_hz"] = round(float(fed["средняя, Гц"]), 3)
                 rec["vis_sat"] = round(float(fed["в потолке, доля"]), 4)
+            # То же правило у переходника: ключей нет, когда подачи не
+            # было, а не ноль. `vbr_loom` — нависание, то есть наружное
+            # движение тёмного края, сумма по обоим глазам.
+            bridged = vis_seen.get("переходник")
+            if bridged is not None:
+                rec["vbr_hz"] = round(float(bridged["средняя, Гц"]), 4)
+                rec["vbr_max_hz"] = round(float(bridged["наибольшая, Гц"]), 2)
+                rec["vbr_loom"] = round(
+                    float(sum(bridged["нависание"].values())), 6)
         records.append(rec)
         row_cpu = None
         if on_step is not None or tape is not None:
@@ -2214,6 +2315,24 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                           "меняется сам рендер кадра глаза",
             "привязка": vis.provenance(),
         }
+        if vbr is not None:
+            # Происхождение переходника — отдельным полем, а не
+            # примечанием: по сохранённому прогону должно быть видно,
+            # какие отклики посчитаны синапсами FlyWire, а какие поданы
+            # снаружи. Сводку даёт сам мост, а не настройка.
+            timing["зрение"]["переходник"] = vbr.сводка()
+            timing["зрение"]["шагов с переходником"] = int(
+                vis_seen["шагов с переходником"])
+            timing.setdefault("оговорки", []).append(
+                "в прогоне работал ГИБРИДНЫЙ ЗРИТЕЛЬНЫЙ ПЕРЕХОДНИК "
+                "(граница %s): направленные сигналы T4/T5 посчитаны ВНЕ "
+                "сети, соответствие подтип-направление задано "
+                "соглашением, омматидий у T4/T5 наведён по возбуждающим "
+                "синапсам. Это инженерный интерфейс, а НЕ передача по "
+                "глубокому зрительному пути оригинальной сети FlyWire. "
+                "Настоящим связям принадлежит то, что за границей: "
+                "T4/T5 -> LPLC2, LC4 -> DNp01 и глубже."
+                % vbr.граница)
         if vis_seen.get("объекты") is not None:
             timing["зрение"]["объекты"] = vis_seen["объекты"]
         if vis_track is not None:

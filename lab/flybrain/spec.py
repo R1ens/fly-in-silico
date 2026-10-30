@@ -155,6 +155,17 @@ class BodySpec:
     vision_shuffle: bool = False
     vision_light: float = 1.0
     vision_contrast: float = 1.0
+    # Гибридный зрительный переходник (`flybrain.vislink`). `None` —
+    # переходника нет, и прогон неотличим от прежних: за третьим
+    # синапсом ровно 0,000 Гц. `"гибрид"` — ИНЖЕНЕРНЫЙ интерфейс с
+    # границей T4/T5, а не передача по глубокому пути оригинальной
+    # сети; граница уезжает в происхождение прогона отдельным полем.
+    vision_bridge: str | None = None
+    vision_bridge_boundary: str = "T4/T5"
+    vision_bridge_gain: float = 200.0
+    vision_bridge_delay_ms: float = 30.0
+    vision_bridge_shuffle: bool = False
+    vision_bridge_subtypes_shuffle: bool = False
     vis_objects: int = 0
     vis_track: list = None
 
@@ -379,6 +390,12 @@ class RunSpec:
             vision_shuffle=b.vision_shuffle,
             vision_light=b.vision_light,
             vision_contrast=b.vision_contrast,
+            vision_bridge=b.vision_bridge,
+            vision_bridge_boundary=b.vision_bridge_boundary,
+            vision_bridge_gain=b.vision_bridge_gain,
+            vision_bridge_delay_ms=b.vision_bridge_delay_ms,
+            vision_bridge_shuffle=b.vision_bridge_shuffle,
+            vision_bridge_subtypes_shuffle=b.vision_bridge_subtypes_shuffle,
             vis_objects=b.vis_objects,
             vis_track=b.vis_track,
         )
@@ -596,6 +613,26 @@ VISION_PRESETS = {
         "что": "неподвижный объект там, где нависающий оказывается на "
                "середине пути. Встречный замер к обоим движущимся",
         "body": {"vision": True, "vis_objects": 1, "vis_track": "still"},
+    },
+    "loom-dark-bridge": {
+        "что": "тот же тёмный нависающий объект, но с ГИБРИДНЫМ "
+               "переходником: направленные сигналы T4/T5 считаются ВНЕ "
+               "сети, а дальше сигнал идёт по настоящим связям FlyWire "
+               "(T4/T5 -> LPLC2, LC4 -> DNp01). Это ИНЖЕНЕРНЫЙ "
+               "интерфейс, а не передача по глубокому зрительному пути "
+               "оригинальной сети, и граница стыковки записана в "
+               "происхождении прогона",
+        "body": {"vision": True, "vis_objects": 1,
+                 "vis_track": "loom_dark", "vision_bridge": "гибрид"},
+    },
+    "loom-dark-bridge-shuffled": {
+        "что": "встречный замер к `loom-dark-bridge`: те же числа "
+               "подаются тем же популяциям, но нейронам в случайном "
+               "порядке. Суммарный вход сохраняется, разрушена только "
+               "пространственная структура подачи",
+        "body": {"vision": True, "vis_objects": 1,
+                 "vis_track": "loom_dark", "vision_bridge": "гибрид",
+                 "vision_bridge_shuffle": True},
     },
     "loom-dark-shuffled": {
         "что": "тот же тёмный нависающий объект на ПЕРЕМЕШАННОЙ "
