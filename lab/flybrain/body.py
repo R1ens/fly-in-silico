@@ -347,6 +347,26 @@ class BodyConfig:
     # исполняется вовсе, и частоты совпадают с `retina.rates` до бита.
     vision_contrast: float = 1.0
 
+    # --- запись и воспроизведение зрительного входа (`vistape`) ---
+    #
+    # Зачем. Замерено, что живой рендер НЕ воспроизводим между
+    # процессами: первая расходящаяся ступень — сырые пиксели
+    # `physics.render` (`probe/retina_repro.py`), при побитово
+    # совпавшем всём остальном. Живой рендер от этого не становится
+    # неправильным, но научный прогон, который надо воспроизвести
+    # побитово, не может зависеть от выхода видеокарты.
+    #
+    # `vision_record` — писать кадр КАЖДОГО шага управления в ленту;
+    # `vision_replay` — брать кадры из ленты вместо живого рендера.
+    # Одновременно не задаются: это было бы запись того, что и так
+    # читается.
+    #
+    # Прогон из записи НЕ является прогоном с живым зрением, и в его
+    # происхождении это стоит отдельным полем. Сравнивать их между
+    # собой нельзя.
+    vision_record: str | None = None
+    vision_replay: str | None = None
+
     # --- гибридный зрительный переходник (`flybrain.vislink`) ---
     #
     # `None` — переходника нет вовсе, и прогон неотличим от прежних: за
@@ -1446,6 +1466,35 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                   % (sum(len(i) for i, _ in vbr._адрес.values()),
                      vbr.граница, нав, вс))
 
+    # Лента зрения. Ставится после `vis`, потому что обе дороги имеют
+    # смысл только при включённом зрении: записывать нечего и
+    # подставлять некуда.
+    vtape_w = vtape_r = None
+    if getattr(cfg, "vision_record", None) and getattr(cfg, "vision_replay", None):
+        raise ValueError(
+            "`vision_record` и `vision_replay` заданы одновременно: это "
+            "была бы запись того, что и так читается из записи")
+    if getattr(cfg, "vision_record", None) or getattr(cfg, "vision_replay", None):
+        if vis is None:
+            raise ValueError(
+                "запись или воспроизведение зрения просили при "
+                "выключенном зрении: писать нечего и подставлять некуда, "
+                "поставьте `vision=True`")
+        from . import vistape as VT
+
+        if getattr(cfg, "vision_record", None):
+            vtape_w = VT.Запись(cfg.vision_record, cfg.control_ms,
+                                float(getattr(cfg, "vision_hz", 100.0)),
+                                зерно=cfg.seed)
+            print("  лента зрения  запись в %s" % cfg.vision_record)
+        else:
+            vtape_r = VT.Воспроизведение(cfg.vision_replay,
+                                         control_ms=cfg.control_ms)
+            print("  лента зрения  ВОСПРОИЗВЕДЕНИЕ из %s (%d шагов, "
+                  "отпечаток %s)"
+                  % (cfg.vision_replay, vtape_r.шагов,
+                     vtape_r.манифест["отпечаток ленты"]))
+
     if vbr is None and getattr(cfg, "vision_bridge", None):
         # Переходник берёт яркость у кадра глаза, и без зрения её нет
         # вовсе. Тихо его пропустить нельзя: прогон тогда утверждал бы
@@ -1779,6 +1828,21 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             interv.apply(rates)
         return rl, rr
 
+    def кадр_шага(step, t_ms):
+        """Кадр этого шага: живой, записанный или из записи.
+
+        Одно место на все три дороги нарочно: иначе «что подавалось»
+        пришлось бы выводить из настроек, а не читать из кода. Запись
+        идёт ПОСЛЕ получения живого кадра, воспроизведение — ВМЕСТО
+        него, и обе дороги сверяют номер шага.
+        """
+        if vtape_r is not None:
+            return vtape_r.кадр(step, t_ms)
+        живой = obs.get("vision")
+        if vtape_w is not None:
+            vtape_w.шаг(step, t_ms, живой)
+        return живой
+
     def step_brain():
         acc = torch.zeros(n, device=device)
         for _ in range(brain_steps):
@@ -2014,7 +2078,8 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
             vis_t_ms = (round(_last * 1000.0, 4)
                         if math.isfinite(_last) else None)
         rl, rr = drive_brain(li, ri, taste, ref_now,
-                             frame=(obs.get("vision") if vis is not None
+                             frame=(кадр_шага(step, step * cfg.control_ms)
+                                    if vis is not None
                                     else None))
 
         acc, dl, dr, rd, spikes_total = step_measure()
@@ -2333,6 +2398,20 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                 "Настоящим связям принадлежит то, что за границей: "
                 "T4/T5 -> LPLC2, LC4 -> DNp01 и глубже."
                 % vbr.граница)
+        # Лента зрения: происхождение — отдельным полем, потому что
+        # прогон из записи НЕ является прогоном с живым зрением.
+        if vtape_w is not None:
+            timing["зрение"]["лента"] = dict(vtape_w.закрыть(),
+                                             **{"роль": "запись"})
+        elif vtape_r is not None:
+            timing["зрение"]["лента"] = dict(vtape_r.состояние(),
+                                             **{"роль": "воспроизведение"})
+            timing.setdefault("оговорки", []).append(
+                "зрительный вход ВОСПРОИЗВЕДЁН ИЗ ЗАПИСИ, а не получен "
+                "живым рендером: кадры пришли с диска. Этот прогон не "
+                "сравним с прогоном при живом зрении, зато воспроизводим "
+                "побитово между процессами — живой рендер таким не "
+                "является (FULL_LOOP_VALIDATION.md §8.2а)")
         if vis_seen.get("объекты") is not None:
             timing["зрение"]["объекты"] = vis_seen["объекты"]
         if vis_track is not None:

@@ -160,6 +160,13 @@ class BodySpec:
     # синапсом ровно 0,000 Гц. `"гибрид"` — ИНЖЕНЕРНЫЙ интерфейс с
     # границей T4/T5, а не передача по глубокому пути оригинальной
     # сети; граница уезжает в происхождение прогона отдельным полем.
+    # Лента зрительного входа. Замерено, что ЖИВОЙ рендер не
+    # воспроизводим между процессами (первая расходящаяся ступень —
+    # сырые пиксели `physics.render`), а воспроизведение из записи от
+    # видеокарты не зависит вовсе и даёт побитовое равенство. Две
+    # воспроизводимости разные, и путать их нельзя.
+    vision_record: str | None = None
+    vision_replay: str | None = None
     vision_bridge: str | None = None
     vision_bridge_boundary: str = "T4/T5"
     vision_bridge_gain: float = 200.0
@@ -391,6 +398,8 @@ class RunSpec:
             vision_shuffle=b.vision_shuffle,
             vision_light=b.vision_light,
             vision_contrast=b.vision_contrast,
+            vision_record=b.vision_record,
+            vision_replay=b.vision_replay,
             vision_bridge=b.vision_bridge,
             vision_bridge_boundary=b.vision_bridge_boundary,
             vision_bridge_gain=b.vision_bridge_gain,

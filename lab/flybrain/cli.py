@@ -210,6 +210,8 @@ def _spec_from_args(args, kind):
             vision_shuffle=bool(getattr(args, "vision_shuffle", False)),
             vision_light=getattr(args, "vision_light", 1.0),
             vision_contrast=getattr(args, "vision_contrast", 1.0),
+            vision_record=getattr(args, "vision_record", None),
+            vision_replay=getattr(args, "vision_replay", None),
             vision_bridge=getattr(args, "vision_bridge", None),
             vision_bridge_boundary=getattr(
                 args, "vision_bridge_boundary", "T4/T5"),
@@ -1047,6 +1049,18 @@ def build_parser():
                    help="контраст кадра: clip(0,5 + (I − 0,5)·k). "
                         "Объявленное преобразование кадра, не свойство "
                         "сцены")
+    s.add_argument("--vision-record", default=None,
+                   help="записать зрительный вход в ленту (.npz рядом с "
+                        "манифестом .json). ЖИВОЙ рендер не "
+                        "воспроизводим между процессами — первая "
+                        "расходящаяся ступень сырые пиксели; "
+                        "воспроизведение такой ленты от видеокарты не "
+                        "зависит и даёт побитовое равенство")
+    s.add_argument("--vision-replay", default=None,
+                   help="взять зрительный вход из ленты вместо живого "
+                        "рендера. Прогон из записи НЕ является прогоном "
+                        "с живым зрением, и в происхождении это "
+                        "записано отдельным полем")
     s.add_argument("--vision-bridge", default=None, choices=("гибрид",),
                    help="ГИБРИДНЫЙ зрительный переходник: направленные "
                         "сигналы T4/T5 считаются ВНЕ сети, а дальше "
