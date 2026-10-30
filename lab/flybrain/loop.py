@@ -129,6 +129,10 @@ class Commentator:
         self._last = ""
         self._thread = None
         self._errors = []
+        # Сколько реплик брошено без попытки: заполняется `finish(drop=True)`
+        # на оборванном эпизоде. Объявлено здесь, чтобы поле было и у
+        # прогона, который до `finish` не дошёл.
+        self.dropped = 0
         if enabled:
             self._thread = threading.Thread(target=self._work, daemon=True)
             self._thread.start()
@@ -163,12 +167,37 @@ class Commentator:
                 self.out.append({"t_ms": t_ms, "text": text})
             print(f"  [{t_ms/1000:5.1f} с] {text}")
 
-    def finish(self, timeout=180):
+    def finish(self, timeout=180, drop=False):
+        """Дождаться комментатора и забрать реплики.
+
+        ``drop`` — НЕ ждать очередь, а бросить непрошедшее. Нужен ровно
+        на ОБОРВАННОМ эпизоде: ожидание очереди к локальной модели стоит
+        до трёх минут настенного времени ПОСЛЕ того, как счёт
+        закончился, и всё это время окно стоит, хотя пользователь уже
+        нажал «Стоп». Время после «Стоп» принадлежит ему.
+
+        Брошенное СЧИТАЕТСЯ, а не теряется молча: число уезжает в
+        :attr:`dropped`, и по сохранённому прогону видно, что
+        комментарий неполон. Иначе «реплик меньше, чем шагов» читалось
+        бы как «модель промолчала».
+        """
         if not self.enabled:
             return []
-        deadline = time.time() + timeout
-        while not self._q.empty() and time.time() < deadline:
-            time.sleep(0.2)
+        if drop:
+            while True:
+                try:
+                    self._q.get_nowait()
+                except Exception:
+                    break
+                self.dropped += 1
+            # Короткий срок всё равно нужен: нить может сидеть в уже
+            # НАЧАТОМ запросе к модели, и его не отменить. Она
+            # демоническая, процесс не задержит.
+            deadline = time.time() + min(float(timeout), 5.0)
+        else:
+            deadline = time.time() + timeout
+            while not self._q.empty() and time.time() < deadline:
+                time.sleep(0.2)
         self._q.put(None)
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, deadline - time.time()))
@@ -387,6 +416,10 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
 
         tape.begin(engine, grab=_grab)
 
+    # Оборвали ли эпизод. Нужен не для отчёта, а для `Commentator.finish`:
+    # на оборванном эпизоде непрошедшие реплики бросаются, а не
+    # ожидаются.
+    оборван = False
     t1 = time.perf_counter()
     for step in range(n_steps):
         t_ms = step * config.control_ms
@@ -469,6 +502,7 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
             on_step(step, rec, row_cpu, commentator)
         if should_stop is not None and should_stop():
             n_steps = step + 1
+            оборван = True
             records = records[:n_steps]
             # `bins` здесь не режется: при провернувшемся кольце строки
             # лежат не по порядку, и расставить их можно только зная
@@ -483,8 +517,11 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
     if bar is not None:
         bar.close()
 
-    print("\nжду комментатора...")
-    comments = commentator.finish()
+    if оборван:
+        print("\nэпизод оборван: непрошедшие реплики комментатора брошены")
+    else:
+        print("\nжду комментатора...")
+    comments = commentator.finish(drop=оборван)
     if commentator.errors:
         print(f"  локальная модель: {commentator.errors[0][:200]}")
 
@@ -513,6 +550,16 @@ def run_episode(arena: Arena | None = None, config: EpisodeConfig | None = None,
     }
     if n_steps < requested_steps:
         timing["duration_s"] = round(dur_s, 6)
+    if getattr(commentator, "dropped", 0):
+        # Комментарий неполон, и это СКАЗАНО числом. Иначе «реплик
+        # меньше, чем шагов» читалось бы как «модель промолчала», а не
+        # как «эпизод оборвали и ждать очередь к модели не стали».
+        timing["реплик брошено"] = int(commentator.dropped)
+        timing.setdefault("оговорки", []).append(
+            "эпизод оборван, и %d реплик комментатора брошено без "
+            "попытки: ожидание очереди к локальной модели стоит до трёх "
+            "минут ПОСЛЕ того, как счёт закончился. Комментарий этого "
+            "прогона неполон." % int(commentator.dropped))
     if kept < n_steps:
         # Запись короче сессии. Молчать об этом нельзя: по `bins` считают
         # растр и ход активности, и без подписи они выглядели бы как
