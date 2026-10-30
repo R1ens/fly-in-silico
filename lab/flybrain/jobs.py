@@ -619,6 +619,30 @@ def _job_body(spec, ctx):
         # разбираются команды, пришедшие за время шага.
         ctx.control_point(rec["t_ms"], state=state)
 
+    def on_body(body):
+        """Тело собрано — дальше разогрев нисходящих, и он объявляется.
+
+        `ipc.STATES` объявляет состояние `warmup`, задача арены его
+        шлёт, а задача тела не шлёт вовсе: окно и проба видели
+        `setup` до самого первого шага. Между этими двумя состояниями
+        лежит разогрев нисходящих — `max(5, 3000*dn_tau_s/control_ms)`
+        шагов движка, то есть 75 шагов при tau 0,5 с, и он бывает
+        длиннее самого эпизода. Без объявления «запустить и остановить
+        муху» снаружи не отличить: ждать `warmup` бессмысленно, он не
+        придёт никогда (`probe/ipc_test.py`, пункт 6б висел на этом
+        ожидании два своих срока по 300 с подряд).
+
+        Шлётся ИМЕННО здесь, из крючка «тело собрано», а не перед
+        `run_episode`, как у арены: разогрев начинается сразу за этим
+        крючком, и `Cancel`, пришедший на это состояние, перехватывается
+        первой же проверкой `should_stop` в разогреве, а не ждёт конца
+        сборки MuJoCo. Разогрев при продолжении из снимка не идёт, но
+        `_job_body` продолжением не бывает: `resume` в `run_episode`
+        кладёт только `flybrain.replay`, минуя реестр.
+        """
+        ctx.on_body(body)
+        ctx.status("warmup", "разогрев нисходящих", 0.0)
+
     ctx.status("setup", "сборка тела", 0.0)
     video = None
     if cfg.video:
@@ -631,7 +655,7 @@ def _job_body(spec, ctx):
     run = _call(B.run_episode, cfg=cfg, neurons=neurons, weights=weights,
                 sources=(spec.body.sources if spec.body else None),
                 progress=False, on_step=on_step, should_stop=ctx.should_stop,
-                on_body=ctx.on_body, video_path=video, live=state, tape=tape)
+                on_body=on_body, video_path=video, live=state, tape=tape)
     _record_edits(run.timing, state)
     _record_tape(tape, state)
     if state.log:

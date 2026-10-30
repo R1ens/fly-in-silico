@@ -44,10 +44,15 @@ def main():
           + ("есть" if sess.ring is not None else "НЕТ"))
 
     # --- стимуляция: следим за сглаживанием между кадрами
-    spec = {"kind": "stim", "activate": [
-        {"query": "class:gustatory+side:left", "rate": 200.0, "on": 0.0}],
+    # Блок `stim` и настоящие имена полей (`rate_hz`, `t_on_ms`). Плоский
+    # `activate` `spec.from_dict` не применял вовсе — стимуляция шла без
+    # единого стимула, — а `rate`/`on` отсеивались внутри стимула и
+    # подменялись настройкой по умолчанию (200 Гц, 0 мс).
+    spec = {"kind": "stim", "stim": {"activate": [
+        {"query": "class:gustatory+side:left", "rate_hz": 200.0,
+         "t_on_ms": 0.0}]},
         "t": 0.6, "bin_ms": 10.0}
-    print("\nстимуляция " + spec["activate"][0]["query"] + ", 0,6 с")
+    print("\nстимуляция " + spec["stim"]["activate"][0]["query"] + ", 0,6 с")
     sess.submit(spec)
 
     samples = []
@@ -93,7 +98,8 @@ def main():
 
     # --- тело: кадр из кольца
     print("\nтело, 1,2 с")
-    sess.submit({"kind": "body", "t": 1.2, "readout": "ALPN", "control_ms": 20.0})
+    sess.submit({"kind": "body", "t": 1.2,
+                 "body": {"readout": "ALPN", "control_ms": 20.0}})
     seqs = []
     t0 = time.perf_counter()
     last = t0

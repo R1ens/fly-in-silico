@@ -799,7 +799,11 @@ def _detail_lateral(ui, entry, state, col, on_rerun_spec):
         _table_row(ui, left, name, [fn(row) for _, _, fn in used], widths)
         if ui.button("runs/take/" + name, btn, take_text,
                      enabled=on_rerun_spec is not None) and on_rerun_spec:
-            on_rerun_spec({"kind": "body", "readout": name})
+            # Выход кладётся В БЛОК `body`, а не в корень спеки. В корне
+            # `spec.from_dict` его не применял, и эпизод считался с
+            # `ALPN` — то есть кнопка «взять эту популяцию» молча
+            # подменяла нажатую популяцию настройкой по умолчанию.
+            on_rerun_spec({"kind": "body", "body": {"readout": name}})
 
 
 def _detail_agent(ui, entry, state, col):
