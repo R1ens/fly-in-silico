@@ -1,4 +1,4 @@
-# fly-brain
+# fly-in-silico
 
 Мозг дрозофилы по коннектому FlyWire v783 — **138 639 нейронов и
 15 091 983 синаптические связи** — считается целиком на видеокарте, а
@@ -94,8 +94,8 @@
 Нужны Windows, видеокарта NVIDIA и Python 3.12.
 
 ```bash
-git clone https://github.com/R1ens/fly-brain.git
-cd fly-brain
+git clone https://github.com/R1ens/fly-in-silico.git
+cd fly-in-silico
 uv venv --python 3.12 .venv
 uv pip install --index-url https://download.pytorch.org/whl/cu128 torch
 uv pip install -r requirements.lock
