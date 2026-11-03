@@ -290,6 +290,23 @@ class Ctx:
     def step(self, rec):
         """Шаг управления сделан. Работник кладёт сюда кадр картинки."""
 
+    #: Нужен ли этому контексту кадр глаз. По умолчанию НЕТ, и это не
+    #: осторожность, а цена: по одному только наличию крючка
+    #: `run_episode` включает `fly.render_raw_vision`, и FlyGym начинает
+    #: складывать сырые кадры обоих глаз на каждом обновлении сетчатки —
+    #: 1,38 МБ копии сто раз на модельную секунду. Командной строке
+    #: показывать их некуда, и платить за них она не должна: прогон
+    #: `fly body` обязан стоить ровно столько же, сколько стоил.
+    #: Работник перекрывает это полем в своём контексте.
+    wants_vision = False
+
+    def vision(self, step, t_ms, fisheye, omma, updates, renders):
+        """Сетчатка обновилась. Работник кладёт сюда кадр ГЛАЗ.
+
+        Зовётся ТОЛЬКО на шагах с настоящим обновлением — об этом
+        заботится `body.run_episode`, а не этот крючок.
+        """
+
 
 class PrintCtx(Ctx):
     """Контекст командной строки: ход печатается, кадры никому не нужны."""
@@ -655,7 +672,9 @@ def _job_body(spec, ctx):
     run = _call(B.run_episode, cfg=cfg, neurons=neurons, weights=weights,
                 sources=(spec.body.sources if spec.body else None),
                 progress=False, on_step=on_step, should_stop=ctx.should_stop,
-                on_body=on_body, video_path=video, live=state, tape=tape)
+                on_body=on_body, video_path=video, live=state, tape=tape,
+                on_vision=(ctx.vision
+                           if getattr(ctx, "wants_vision", False) else None))
     _record_edits(run.timing, state)
     _record_tape(tape, state)
     if state.log:

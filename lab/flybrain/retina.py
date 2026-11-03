@@ -88,9 +88,49 @@ CAND = 24          # сколько ближайших омматидиев ра
 
 
 def _vision_dir() -> Path:
+    """Каталог данных зрения NeuroMechFly.
+
+    Сначала — по описанию пакета, БЕЗ его исполнения. Это не
+    придирка: `import flygym_gymnasium` тянет за собой mujoco и
+    gymnasium, то есть секунды и сотни мегабайт, а здесь нужен один
+    путь. Работнику это экономит время до знакомства с окном, а окну
+    позволяет прочитать карту омматидиев, не затаскивая к себе движок,
+    которого у него по уговору быть не должно.
+
+    Запасной путь — обычный импорт: пакет мог быть установлен так, что
+    описание пути не даёт (zip, нестандартный загрузчик).
+    """
+    import importlib.util
+
+    spec = importlib.util.find_spec("flygym_gymnasium")
+    origin = getattr(spec, "origin", None) if spec is not None else None
+    if origin:
+        d = Path(origin).parent / "data" / "vision"
+        if d.is_dir():
+            return d
     import flygym_gymnasium as fg
 
     return Path(fg.__file__).parent / "data" / "vision"
+
+
+_IDMAP = None
+
+
+def id_map():
+    """Карта омматидиев как есть: int16 (512, 450), 0 — фон, 1..721 — номер.
+
+    Та самая, по которой FlyGym собирает показания омматидиев из
+    кадра, и та же, по которой он рисует их обратно
+    (`Retina.hex_pxls_to_human_readable`). Окно берёт её, чтобы
+    показать показания шестиугольниками: раскраска по этой карте — не
+    наша картинка «в духе» сетчатки, а ровно обратное преобразование
+    того, что получила сеть.
+    """
+    global _IDMAP
+    if _IDMAP is None:
+        _IDMAP = np.load(_vision_dir() / "ommatidia_id_map.npy").astype(
+            np.int16)
+    return _IDMAP
 
 
 _OMMA = None

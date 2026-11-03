@@ -40,6 +40,19 @@ from . import data as D, ipc, regions as R, world
 RING_SHAPE = (720, 960, 3)
 RING_SLOTS = 4
 
+# Кадр ГЛАЗА. Размер не выбран, а задан FlyGym: `config.yaml` объявляет
+# `raw_img_height_px: 512` и `raw_img_width_px: 450`, а исправление
+# рыбьего глаза форму не меняет. Омматидиев 721 на глаз, у каждого два
+# типа фоторецепторов. Ставить сюда свои числа нельзя: кольцо проверяет
+# форму при записи, и расхождение будет видно отказом, а не тихой кашей.
+EYE_SHAPE = (512, 450, 3)
+EYE_OMMA = (721, 2)
+# Три слота, а не четыре: кадр глаза приходит реже кадра тела (100 Гц
+# модельного против 50, то есть при 0,077× реального — около восьми в
+# секунду), и запас на два кадра вперёд здесь с избытком. Слот стоит
+# 1,39 МБ, кольцо целиком — 4,2 МБ.
+EYE_SLOTS = 3
+
 POPULATIONS_CACHE = D.CACHE / "populations.json"
 
 # Как часто обновлять Status внутри задачи. Кадры идут 3–12 Гц, и слать
@@ -143,6 +156,14 @@ class Worker:
             self.populations)
         self._status("boot", "warmup", "геометрия", 0.9)
         self.ring = ipc.FrameRing(shape=RING_SHAPE, slots=RING_SLOTS)
+        # Кольцо глаз заводится ВСЕГДА, вместе с кольцом тела, а не при
+        # первом прогоне со зрением. Причина простая: описатель уходит в
+        # `Hello`, то есть один раз за весь сеанс работника, и окну
+        # больше неоткуда его узнать. 4,2 МБ разделяемой памяти — цена
+        # того, что зрение можно включить в любом прогоне, не
+        # перезапуская работника.
+        self.eyes = ipc.EyeRing(shape=EYE_SHAPE, omma=EYE_OMMA,
+                                slots=EYE_SLOTS)
         self.ch.send(self._hello())
         self._status("boot", "done", "готов", 1.0)
 
@@ -213,6 +234,7 @@ class Worker:
             positions_quantised=quant,
             region_code=codes,
             frame_ring=self.ring.descriptor(),
+            eye_ring=self.eyes.descriptor(),
         )
 
     # ------------------------------------------------------------- служебное
@@ -302,8 +324,21 @@ class Worker:
         # Очередь событий не трогаем: `Done` и `Error` уже отправлены, и
         # они обязаны дойти — на них держится кнопка «пуск» в окне.
         self.ch.release_frames()
-        self.ring.close()
-        self.ring.unlink()
+        for ring in (self.ring, getattr(self, "eyes", None)):
+            if ring is None:
+                continue
+            # Каждое в своём `try`: если первое кольцо уже закрыто
+            # (повторный `_close` после ошибки разогрева), второе всё
+            # равно обязано отвязаться, иначе его имя останется в
+            # системе, а это 4,2 МБ на сеанс окна.
+            try:
+                ring.close()
+            except Exception:                                  # noqa: BLE001
+                pass
+            try:
+                ring.unlink()
+            except Exception:                                  # noqa: BLE001
+                pass
 
     def _query(self, cmd):
         try:
@@ -583,6 +618,26 @@ class _WorkerCtx:
         self.last_cam = None
         self.render_ms = 0.0
         self._mark = time.perf_counter()
+        # Счётчики глаз СУММАРНЫЕ и считаются здесь, а не в окне: окно
+        # видит только те кадры, которые успело забрать, и по ним не
+        # отличить «сетчатка не обновлялась» от «обновилась, а кадр
+        # вытеснили». Три величины врозь, и сливать их нельзя:
+        #   * `eye_updates` — полные ПАРНЫЕ обновления сетчатки, то есть
+        #     новые наблюдения, которые получила сеть;
+        #   * `eye_renders` — сырые рендеры камер, по одному на глаз;
+        #   * `eye_frames` — сколько кадров ушло в кольцо. Меньше
+        #     `eye_updates` ровно тогда, когда за один шаг управления
+        #     сетчатка обновилась несколько раз: в кольцо уходит
+        #     последнее наблюдение шага, а счётчики растут на все.
+        # Кадр глаз работнику НУЖЕН: его ждёт окно. Это ровно та
+        # ручка, которой командная строка остаётся при своей прежней
+        # цене, а окно получает картинку.
+        self.wants_vision = True
+        self.eye_updates = 0
+        self.eye_renders = 0
+        self.eye_frames = 0
+        self.eye_ms = 0.0
+        self.eye_bad = ""
 
     def __getattr__(self, name):
         return getattr(self._base, name)
@@ -635,11 +690,82 @@ class _WorkerCtx:
             "pic": int(self.pictures),
         }
 
+    def vision(self, step, t_ms, fisheye, omma, updates, renders):
+        """Кадр ГЛАЗ в кольцо. Зовётся только при настоящем обновлении.
+
+        Почему копия в uint8, а не float32, которым кадр приходит.
+        Картинка глаза нужна окну ДЛЯ ПОКАЗА, и показывает окно восемь
+        бит на канал; `physics.render` отдаёт ровно такие целые,
+        исправление рыбьего глаза их не размывает, а FlyGym приводит
+        результат к `float32` уже после. То есть uint8 здесь — не
+        огрубление измерения, а возврат к той точности, с которой кадр
+        и родился; проверено отдельной пробой, а не объявлено.
+
+        **Показания омматидиев идут как есть, `float32`, без единого
+        преобразования.** Это научная величина: ровно этот массив
+        получает переходник сетчатки. Огрубить его до картинки значило
+        бы показать окну не то, что считает сеть.
+
+        Отказ кольца (не та форма) НЕ валит прогон: счёт мухи не
+        обязан прекращаться из-за того, что картинку некуда положить.
+        Но и молчать нельзя — причина запоминается и уходит в сводку.
+        """
+        ring = getattr(self.w, "eyes", None)
+        if ring is None:
+            return
+        t = time.perf_counter()
+        self.eye_updates += int(updates)
+        self.eye_renders += int(renders)
+        try:
+            img = np.asarray(fisheye)
+            # `clip` до приведения: отрицательных и больших 255 значений
+            # рендер не даёт, но проверять это каждым кадром дешевле,
+            # чем однажды получить перевёрнутые байты.
+            img = np.clip(img, 0.0, 255.0).astype(np.uint8, copy=False)
+            # Счётчик кадров поднимается ДО записи: в слоте он должен
+            # означать «этот кадр включительно», иначе читатель, взявший
+            # самый свежий слот, увидит число на единицу меньше, чем
+            # кадров на самом деле положено, и припишет недостачу
+            # вытеснению.
+            self.eye_frames += 1
+            ring.write(float(t_ms), img, np.asarray(omma, dtype=np.float32),
+                       self.eye_renders, self.eye_updates, self.eye_frames)
+        except (ValueError, TypeError) as exc:
+            self.eye_frames -= 1
+            if not self.eye_bad:
+                self.eye_bad = str(exc)[:200]
+                self._base.log("кадр глаз не кладётся в кольцо: "
+                               + self.eye_bad, level="warn")
+        self.eye_ms += (time.perf_counter() - t) * 1000.0
+
     def extras(self):
-        if not self.pictures:
-            return {}
-        return {"picture_frames": self.pictures,
-                "render_ms": round(self.render_ms / self.pictures, 3)}
+        out = {}
+        if self.pictures:
+            out["picture_frames"] = self.pictures
+            out["render_ms"] = round(self.render_ms / self.pictures, 3)
+        if self.eye_updates or self.eye_bad:
+            # Три счётчика в сводке прогона РАЗДЕЛЬНО и с единицами в
+            # именах: «кадров» без указания, чего именно, — это ровно
+            # то место, где частота показа начинает выдаваться за
+            # частоту наблюдений.
+            out["eyes"] = {
+                "обновлений сетчатки": int(self.eye_updates),
+                "рендеров камер": int(self.eye_renders),
+                "кадров в кольцо": int(self.eye_frames),
+                # Наблюдения, вытесненные ВНУТРИ шага управления. При
+                # шаге 20 мс и частоте 100 Гц сетчатка обновляется за
+                # шаг дважды, а наружу уходит последнее наблюдение
+                # шага: первое сеть получила, а окно не увидело. Это
+                # не потеря в кольце и не сбой — это свойство того,
+                # что показ привязан к шагу управления, — но
+                # сосчитано оно должно быть.
+                "вытеснено внутри шага": int(self.eye_updates
+                                             - self.eye_frames),
+                "мс на кадр": (round(self.eye_ms / self.eye_frames, 3)
+                               if self.eye_frames else None),
+                "отказ": self.eye_bad or None,
+            }
+        return out
 
     def close(self):
         if self.ren is not None:

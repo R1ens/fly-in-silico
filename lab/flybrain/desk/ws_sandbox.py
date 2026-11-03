@@ -47,6 +47,7 @@ import time
 
 import numpy as np
 
+from . import eyes as EY
 from . import layout as L
 from . import widgets as W
 from .state import BODY_VIEWS, SANDBOX_Z
@@ -588,6 +589,32 @@ def centre(app, ctx, r):                                      # noqa: C901
         frame = None
     box = view.fit_aspect(FRAME_AR)
 
+    # --- вид глаз вместо сцены ---------------------------------------
+    # Переключатель, а не вторая панель рядом: картинка глаза это
+    # 450×512, и четырём таким нужна та же площадь, что сцене. В
+    # колонке показаний шириной в триста точек их было бы не
+    # рассмотреть, а рассматривать их как раз и надо.
+    if sb.eye_view:
+        pad = sc.px(S.md)
+        tb = L.Rect(view.x + pad, view.y + pad, view.w - pad * 2,
+                    sc.px(S.control) + sc.px(S.xs) * 2)
+        EY.draw(app, ctx, L.Rect(view.x, tb.y1 + sc.px(S.sm), view.w,
+                                 max(1, view.y1 - tb.y1 - sc.px(S.sm))))
+        hit, picks = W.viewport_toolbar(ctx, "sb/tbe", tb, [
+            ("seg", "mode", ["сцена", "глаза"], 1,
+             ["арена и муха со стороны",
+              "кадр обоих глаз и показания омматидиев"]),
+            ("-",),
+            ("full", "fullscreen",
+             "свернуть вид (F11)" if dock.maximized else
+             "развернуть вид (F11)", dock.maximized),
+        ])
+        if picks.get("mode") == 0:
+            sb.eye_view = False
+        if hit == "full":
+            dock.maximized = not dock.maximized
+        return
+
     if frame is not None:
         dl.image(frame, box.x, box.y, box.w, box.h)
     else:
@@ -613,6 +640,10 @@ def centre(app, ctx, r):                                      # noqa: C901
     tb = L.Rect(view.x + pad, view.y + pad, view.w - pad * 2,
                 sc.px(S.control) + sc.px(S.xs) * 2)
     hit, picks = W.viewport_toolbar(ctx, "sb/tb", tb, [
+        ("seg", "mode", ["сцена", "глаза"], 0,
+         ["арена и муха со стороны",
+          "кадр обоих глаз и показания омматидиев"]),
+        ("-",),
         ("seg", "view", names, idx,
          ["камера позади мухи", "профиль, головой вправо",
           "сверху, головой вверх", "лицом к мухе"]),
@@ -626,6 +657,8 @@ def centre(app, ctx, r):                                      # noqa: C901
          "свернуть вид (F11)" if dock.maximized else "развернуть вид (F11)",
          dock.maximized),
     ])
+    if picks.get("mode") == 1:
+        sb.eye_view = True
     if "view" in picks:
         cam3.view = keys[picks["view"]]
         cam3.yaw = cam3.pitch = 0.0
@@ -1156,6 +1189,16 @@ def _meters(app, ctx, r):
                 "шаг управления 20 мс — это %s с по стене"
                 % _fmt(0.02 / max(sb.ratio, 1e-9), 2),
                 role="micro", color=C.faint)
+        # Два числа про скорость на одном экране — повод их развести, а
+        # не повод надеяться, что никто не заметит. Внизу окна доля
+        # считается от начала задачи и включает сборку тела (это
+        # десятки секунд), здесь — по недавним шагам. Они и обязаны
+        # расходиться, пока сеанс молод.
+        if s.fits(f.micro.gh):
+            W.label(ctx, s.take(f.micro.gh + sc.px(2)),
+                    "внизу окна доля реального считается от начала "
+                    "задачи и включает сборку тела",
+                    role="micro", color=C.faint)
     W.kv(ctx, s.take(sc.px(S.row)), "состояние",
          "пауза" if sb.paused else ("идёт" if (ses is not None and ses.busy)
                                     else "простой"))
@@ -1192,6 +1235,8 @@ def _meters(app, ctx, r):
                     % _fmt(top, 0), role="small", color=C.warn,
                     wrapped=True)
         s.take(h, sc.px(S.xs))
+
+    EY.rows(app, ctx, s)
 
     W.section(ctx, s, "Выбранная популяция",
               right=str(app.st.sb.readout))

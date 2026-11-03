@@ -30,6 +30,51 @@ SCALE_MIN, SCALE_MAX = 10.0, 400.0
 SCALE_DECAY = 0.99
 
 
+class Rate:
+    """Частота события по НАСТЕННОМУ времени, скользящим окном.
+
+    Заведена отдельным классом ровно затем, чтобы частоту нельзя было
+    посчитать неправильно по невниманию. Неправильно — это два способа,
+    и оба в этом проекте уже встречались:
+
+    1. поделить суммарный счётчик на всё время сеанса: тогда пауза,
+       сборка тела и разогрев размазываются по частоте, и она врёт вниз
+       тем сильнее, чем дольше смотришь;
+    2. взять число обновлений за МОДЕЛЬНУЮ секунду и назвать его
+       кадрами в секунду. При 0,077× реального времени 100 обновлений
+       на модельную секунду — это 7,7 обновления в настоящую, и
+       разница тут в тринадцать раз.
+
+    Поэтому считается только так: берётся суммарный монотонный счётчик
+    и отметка `perf_counter`, и частота — это приращение счётчика,
+    делённое на приращение настенного времени в окне `window`. Пока
+    окно не набралось, частота не показывается вовсе (`None`), а не
+    показывается нулём: ноль означал бы «событий нет».
+    """
+
+    def __init__(self, window=1.5):
+        self.window = float(window)
+        self._pts = []            # (настенное время, суммарный счётчик)
+        self.value = None
+
+    def tick(self, total, now=None):
+        now = time.perf_counter() if now is None else now
+        self._pts.append((now, float(total)))
+        # Выбрасываем всё, что старше окна, но последнюю старую точку
+        # оставляем: без неё база отсчёта прыгала бы вперёд и частота
+        # считалась бы по огрызку окна.
+        while len(self._pts) > 2 and now - self._pts[1][0] > self.window:
+            self._pts.pop(0)
+        t0, v0 = self._pts[0]
+        dt = now - t0
+        self.value = ((total - v0) / dt) if dt >= 0.25 else None
+        return self.value
+
+    def reset(self):
+        self._pts = []
+        self.value = None
+
+
 class Session:
     """Работник, его кадры и всё, что из них накоплено."""
 
@@ -43,6 +88,7 @@ class Session:
         self.n = 0
         self.ready = False
         self.error = None
+        self.traceback = ""
 
         self.job_id = None
         self.boot_phase = ""
@@ -79,6 +125,36 @@ class Session:
         self.frames_seen = 0
         self.frames_dropped = 0
         self._last_frame_at = 0.0
+
+        # --- глаза ---------------------------------------------------
+        # Четыре величины, и все четыре разные. Сливать любые две
+        # значит получить число, которого никто не мерил:
+        #   `eye_renders`  — сырых рендеров камер, по одному на глаз;
+        #   `eye_updates`  — полных ПАРНЫХ обновлений сетчатки, то есть
+        #                    наблюдений, которые получила сеть;
+        #   `eye_taken`    — сколько РАЗНЫХ кадров забрало окно;
+        #   `eye_missed`   — сколько кадров работник записал, а окно не
+        #                    увидело: кольцо на три слота, и при
+        #                    медленном окне кадр вытесняется.
+        # Частота показа окна (кадры в секунду у `Shell`) к этим четырём
+        # отношения не имеет вовсе и живёт в другом месте.
+        self.eyes = None
+        self.eye_seq = 0
+        self.eye_t_ms = 0.0
+        self.eye_wall = 0.0
+        self.eye_img = None
+        self.eye_omma = None
+        self.eye_renders = 0
+        self.eye_updates = 0
+        self.eye_taken = 0
+        self.eye_missed = 0
+        self.eye_written = 0
+        self._eye_from = 0
+        self._eye_at = 0.0
+        self._taken_wall = 0.0
+        self.rate_renders = Rate()
+        self.rate_updates = Rate()
+        self.rate_taken = Rate()
 
         self._labels = None        # подписи нейронов, читаются по требованию
         self._facets = None        # списки значений для сборщика запроса
@@ -127,7 +203,9 @@ class Session:
         отображение, но имя остаётся в системе до `unlink()`. Без него
         каждый сеанс оставляет блок на 15,8 МБ (восемь слотов
         960×720×3 плюс заголовок), и за долгую смену окна их
-        накапливаются десятки.
+        накапливаются десятки. Колец ДВА — тело и глаза, — и
+        отвязываются оба одним циклом: забыть второе значит оставлять
+        ещё 4,2 МБ на каждое открытие окна.
 
         Кольцо создаёт РАБОТНИК (`worker.Worker.boot`), а окно
         присоединяется к нему по описателю из `Hello`, то есть
@@ -165,13 +243,15 @@ class Session:
                 self.chan.close(drop_events=True)
             except Exception:                                  # noqa: BLE001
                 pass
-        if self.ring is not None:
+        for ring in (self.ring, self.eyes):
+            if ring is None:
+                continue
             try:
-                self.ring.close()
+                ring.close()
             except Exception:                                  # noqa: BLE001
                 pass
             try:
-                self.ring.unlink()
+                ring.unlink()
             except Exception:                                  # noqa: BLE001
                 pass
 
@@ -213,6 +293,21 @@ class Session:
         self.last_n = 0
         self.last_spikes = 0
         self._body_from = int(self.ring.seq) if self.ring is not None else 0
+        # Кадр глаз принадлежит прошлому прогону ровно так же, как кадр
+        # тела, и по той же причине: в общей памяти лежит прошлое
+        # наблюдение, и первый же опрос вернул бы его как новое.
+        # Счётчики тоже обнуляются — они про ЭТОТ прогон.
+        self.eye_img = self.eye_omma = None
+        self.eye_seq = 0
+        self.eye_t_ms = 0.0
+        self.eye_wall = 0.0
+        self.eye_renders = self.eye_updates = self.eye_written = 0
+        self.eye_taken = self.eye_missed = 0
+        self._eye_at = 0.0
+        self._taken_wall = 0.0
+        self._eye_from = int(self.eyes.seq) if self.eyes is not None else 0
+        for r in (self.rate_renders, self.rate_updates, self.rate_taken):
+            r.reset()
         self.reset_activity()
         self.cmd.put(ipc.Submit(self.job_id, dict(spec)))
         return self.job_id
@@ -274,6 +369,7 @@ class Session:
             self._take(msg)
         self._decay(dt)
         self._poll_body()
+        self._poll_eyes()
         return got
 
     def _take(self, msg):
@@ -318,6 +414,11 @@ class Session:
             if msg.job_id in (self.job_id, "boot"):
                 self.state = "error"
                 self.error = msg.message
+                # Разбор стека приходит вместе с сообщением и до сих пор
+                # выбрасывался. Без него отказ задачи в окне выглядит
+                # одной строкой, а пробам приходится воспроизводить
+                # прогон заново, чтобы узнать, где он сломался.
+                self.traceback = msg.tb
             self.log.append("ошибка: " + msg.message)
         elif isinstance(msg, ipc.Applied):
             # Подтверждение ФАКТИЧЕСКОГО применения. Окно показывает
@@ -340,6 +441,13 @@ class Session:
                 self.ring = ipc.FrameRing.from_descriptor(h.frame_ring)
             except Exception as exc:                           # noqa: BLE001
                 self.log.append("кольцо кадров недоступно: " + repr(exc)[:120])
+        if h.eye_ring:
+            # Кольцо глаз отдельное и открывается отдельно: его отказ не
+            # должен лишать окно картинки тела, а отказ кольца тела — глаз.
+            try:
+                self.eyes = ipc.EyeRing.from_descriptor(h.eye_ring)
+            except Exception as exc:                           # noqa: BLE001
+                self.log.append("кольцо глаз недоступно: " + repr(exc)[:120])
         self.ready = True
 
     def _on_frame(self, f):
@@ -399,12 +507,134 @@ class Session:
         np.clip(self.disp, 0.0, 1.0, out=self.disp)
 
     def _poll_body(self):
+        """Свежий кадр тела — КОПИЕЙ в постоянный буфер, а не видом.
+
+        Вид в разделяемую память дешевле на копию, но слот кольца
+        могут переписать, пока окно его рисует: слотов четыре, кадры
+        идут около четырёх раз в секунду, то есть запас — секунда.
+        Этого обычно хватает, но «обычно» здесь не годится: на экране
+        оказался бы кадр, склеенный из двух разных шагов. Своя копия
+        это исключает, стоит 2,07 МБ памяти раз и навсегда и 8 МБ/с
+        переписи.
+
+        С утечкой, которую долгий сеанс намерил по 10 МБ/с, это не
+        связано: та оказалась в незавершённых запусках ядер и снята
+        синхронизацией раз в кадр (`gpu.Surface.finish`).
+        """
         if self.ring is None:
             return
         seq, view = self.ring.latest()
         if view is not None and seq > self._body_from                 and seq != self.body_seq:
             self.body_seq = seq
-            self.body_frame = view
+            if (self.body_frame is None
+                    or self.body_frame.shape != view.shape):
+                self.body_frame = np.empty_like(view)
+            self.body_frame[...] = view
+
+    def _poll_eyes(self):
+        """Забрать свежий кадр глаз. Ничего не ждёт и ничего не повторяет.
+
+        Главное свойство: кадр берётся ТОЛЬКО когда номер вырос. Между
+        обновлениями сетчатки кольцо отдаёт тот же слот, и если считать
+        каждый опрос взятием, `eye_taken` стало бы равно частоте показа
+        окна — то есть повтор был бы выдан за наблюдение. Ветки для
+        этого здесь нет.
+
+        Пропуск считается по номерам, а не угадывается: работник ведёт
+        номер подряд, поэтому всё, что между прошлым взятым и этим, —
+        кадры, которые окно не увидело. Их не «потеряли», их вытеснило
+        кольцо на три слота, и знать об этом окно обязано.
+        """
+        if self.eyes is None:
+            return
+        seq, meta, img, omma = self.eyes.latest()
+        now = time.perf_counter()
+        if seq <= self._eye_from:
+            # В кольце нет ни одного кадра ЭТОГО прогона: в слоте лежит
+            # наблюдение прошлого, вместе с его счётчиками. Читать их
+            # здесь значит приписать прогону чужие числа — и ровно это
+            # поймала проба: сеанс БЕЗ зрения показывал 120 обновлений
+            # сетчатки, оставшихся от предыдущего сеанса со зрением.
+            # Частоты всё равно тикаем: окно должно видеть, что частота
+            # обновлений — ноль, а не «неизвестно».
+            self.rate_renders.tick(self.eye_renders, now)
+            self.rate_updates.tick(self.eye_updates, now)
+            self.rate_taken.tick(self.eye_taken, now)
+            return
+        if meta is not None:
+            # Суммарные счётчики работника читаются КАЖДЫЙ опрос, даже
+            # когда кадр тот же: они растут и между взятыми кадрами, и
+            # по ним видно, что сетчатка жива, а окно просто не успело.
+            self.eye_renders = int(meta[2])
+            self.eye_updates = int(meta[3])
+            self.eye_written = int(meta[4])
+        if seq != self.eye_seq:
+            if self.eye_seq:
+                self.eye_missed += max(0, seq - self.eye_seq - 1)
+            elif seq - self._eye_from > 1:
+                # Первый взятый кадр прогона может быть не первым
+                # записанным: окно опрашивает кольцо раз в кадр, а
+                # работник успел положить несколько. Эти кадры
+                # вытеснены так же, как любые другие.
+                self.eye_missed += seq - self._eye_from - 1
+            self.eye_seq = int(seq)
+            self.eye_t_ms = float(meta[0])
+            self.eye_wall = float(meta[1])
+            self.eye_img = img
+            # Показания омматидиев копируются ЗДЕСЬ, а картинка — в
+            # панели (`desk/eyes._photo`), и это не разнобой. Показания
+            # нужны сеансу: по ним считаются числа, и читать их из
+            # слота, который работник может переписать посреди счёта,
+            # нельзя; 11,5 КБ копии стоят ровно ничего. Картинка нужна
+            # только показу, и копировать её имеет смысл там, где её
+            # показывают, — прогон без открытого вида глаз за копию
+            # 1,38 МБ платить не должен.
+            self.eye_omma = np.array(omma, copy=True)
+            self.eye_taken += 1
+            self._eye_at = now
+            # Настенные часы ОБОИХ процессов: по ним и только по ним
+            # считается задержка доставки. `perf_counter` для этого не
+            # годится — его точка отсчёта у каждого процесса своя.
+            self._taken_wall = time.time()
+        self.rate_renders.tick(self.eye_renders, now)
+        self.rate_updates.tick(self.eye_updates, now)
+        self.rate_taken.tick(self.eye_taken, now)
+
+    @property
+    def eye_lost_in_step(self):
+        """Наблюдения, вытесненные ВНУТРИ шага управления.
+
+        Сетчатка обновляется по своей частоте, а наружу кадр уходит раз
+        на шаг управления: при 100 Гц и шаге 20 мс за шаг происходит два
+        обновления, и первое из них сеть получила, а окно не увидело.
+        Это не потеря и не сбой — это цена привязки показа к шагу, — но
+        называть её надо своим именем и считать отдельно от вытеснения
+        в кольце (`eye_missed`), потому что лечатся они по-разному.
+        """
+        return max(0, self.eye_updates - self.eye_written)
+
+    @property
+    def eye_age_s(self):
+        """Сколько секунд назад окно взяло последний кадр глаз.
+
+        По НАСТЕННЫМ часам окна, а не по модельному времени: вопрос
+        «насколько устарела картинка перед глазами» — про настоящие
+        секунды. Ноль, пока кадров не было вовсе.
+        """
+        return (time.perf_counter() - self._eye_at) if self._eye_at else 0.0
+
+    @property
+    def eye_lag_s(self):
+        """Задержка доставки: от записи работником до взятия окном.
+
+        Считается по `time.time()`, потому что `perf_counter` в двух
+        процессах несопоставим — у него своя точка отсчёта в каждом.
+        Величина маленькая (десятки миллисекунд), и разрешения
+        системных часов на неё хватает.
+        """
+        if not self.eye_wall or not self._eye_at:
+            return 0.0
+        return max(0.0, self._taken_wall - self.eye_wall)
 
     # ------------------------------------------------------------------ подписи
 

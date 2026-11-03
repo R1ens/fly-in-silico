@@ -568,6 +568,10 @@ class SandboxState:
     applied_feed: bool = True
     vision_max_hz: float = 150.0
     applied_vis_hz: float = 150.0
+    # Что показывать в середине: сцену или глаза. Это вид, а не
+    # условие опыта, — на расчёт он не влияет никак и в спеку не
+    # уходит.
+    eye_view: bool = False
     vision_contrast: float = 1.0
     applied_contrast: float = 1.0
     vision_light: float = 1.0
@@ -618,6 +622,12 @@ class SandboxState:
         скорости отрицательна, а «применённые раздражители» и «ждут
         применения» первые секунды описывают прошлый прогон.
         """
+        # Разложенные картинки омматидиев принадлежат прошлому кадру
+        # прошлого сеанса: показать их как новые значило бы выдать
+        # чужое наблюдение за своё.
+        from . import eyes as _eyes
+
+        _eyes.reset()
         self.applied_slots = []
         self.applied_stim = []
         self.applied_lesions = []

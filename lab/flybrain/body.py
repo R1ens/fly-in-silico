@@ -2201,8 +2201,17 @@ def run_episode(cfg: BodyConfig | None = None, neurons=None, weights=None,
                 if фишай is not None and омм is not None:
                     vis_seen["рендеров камер"] = (
                         vis_seen.get("рендеров камер", 0) + 2 * vis_n)
-                    on_vision(step, step * cfg.control_ms, фишай, омм,
-                              vis_n, 2 * vis_n)
+                    # Отметка времени — время САМОГО НАБЛЮДЕНИЯ, а не
+                    # начала шага управления. FlyGym помнит его в
+                    # `_last_vision_update_time`, и это разные вещи: при
+                    # шаге 20 мс и частоте 100 Гц наблюдение случается
+                    # внутри шага, и подпись «начало шага» ошибалась бы
+                    # на величину до самого шага. Запас — начало шага:
+                    # он всегда есть и всегда верен хотя бы по порядку.
+                    когда = (round(_l * 1000.0, 4)
+                             if math.isfinite(_l) and _l > 0.0
+                             else step * cfg.control_ms)
+                    on_vision(step, когда, фишай, омм, vis_n, 2 * vis_n)
         closed = False
         if viewer is not None and step % cfg.view_every == 0:
             if not viewer.is_running():

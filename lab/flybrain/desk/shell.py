@@ -298,6 +298,10 @@ class Offscreen:
         self.launches = self.main.launches() + self.overlay.launches()
         self.main.flush(self.surf)
         self.overlay.flush(self.surf)
+        # Без окна `present` не зовётся, а синхронизация нужна та же:
+        # иначе кадр, собранный в поверхность, утекает ровно так же,
+        # как кадр, выведенный на экран (`gpu.Surface.finish`).
+        self.surf.finish()
         self.frame_ms = (time.perf_counter() - t0) * 1000.0
         self.inp.end_frame()
 

@@ -272,7 +272,7 @@ class DrawList:
         добавления, — именно на этом держится предсказуемое наложение.
         """
         if not self.cmds:
-            return None, None, None, 0
+            return None, None, None, 0, 0
         a = np.asarray(self.cmds, dtype=np.float32)
         half = np.where(a[:, 0] == KIND_SEG, a[:, 9] * 0.5 + 1.0, 0.0)
         x0 = np.maximum(np.minimum(a[:, 1], a[:, 3]) - half, a[:, 10])
@@ -306,23 +306,34 @@ class DrawList:
         tile_id = cy * tiles_x + cx
 
         order = np.lexsort((owner, tile_id))
+        ntiles = tiles_x * tiles_y
         items = owner[order].astype(np.int32)
-        cnt = np.bincount(tile_id[order], minlength=tiles_x * tiles_y)
-        starts = np.zeros(tiles_x * tiles_y + 1, dtype=np.int32)
+        cnt = np.bincount(tile_id[order], minlength=ntiles)
+        starts = np.zeros(ntiles + 1, dtype=np.int32)
         np.cumsum(cnt, out=starts[1:])
+        # Число плиток отдаётся отдельно, хотя сейчас оно и равно
+        # `len(starts) - 1`: ядро обязано получать длину числом, а не
+        # вычитать её из формы массива. Так его нельзя сломать, подав
+        # массив другой длины.
         return (np.ascontiguousarray(a), np.ascontiguousarray(items),
-                np.ascontiguousarray(starts), tiles_x)
+                np.ascontiguousarray(starts), tiles_x, ntiles)
 
     def _glyph_arrays(self):
-        if not self.gi:
+        """Шесть массивов глифов плюс их длина.
+
+        Длина отдаётся отдельно по той же причине, что число плиток в
+        `_bin`: ядро не должно выводить её из формы массива.
+        """
+        n = len(self.gi)
+        if not n:
             return None
         return (np.asarray(self.gi, dtype=np.int32),
                 np.asarray(self.gx, dtype=np.int32),
                 np.asarray(self.gy, dtype=np.int32),
                 np.ascontiguousarray(np.asarray(self.gc, dtype=np.float32)),
                 np.asarray(self.ga, dtype=np.float32),
-                np.ascontiguousarray(np.asarray(self.gclip, dtype=np.float32)))
-
+                np.ascontiguousarray(np.asarray(self.gclip, dtype=np.float32)),
+                n)
 
 # ---------------------------------------------------------------- поверхность
 
@@ -482,9 +493,10 @@ class Surface:
         def k_shapes(cmd: ti.types.ndarray(dtype=ti.f32, ndim=2),
                      items: ti.types.ndarray(dtype=ti.i32, ndim=1),
                      starts: ti.types.ndarray(dtype=ti.i32, ndim=1),
-                     tiles_x: ti.i32, side: ti.i32, W: ti.i32, H: ti.i32):
+                     tiles_x: ti.i32, side: ti.i32, W: ti.i32, H: ti.i32,
+                     ntiles: ti.i32):
             """Поток — пиксель, список своей плитки проходится по порядку."""
-            for t, j in ti.ndrange(starts.shape[0] - 1, side * side):
+            for t, j in ti.ndrange(ntiles, side * side):
                 lo, hi = starts[t], starts[t + 1]
                 if hi > lo:
                     x = (t % tiles_x) * side + j % side
@@ -562,8 +574,9 @@ class Surface:
                    gc: ti.types.ndarray(dtype=ti.f32, ndim=2),
                    ga: ti.types.ndarray(dtype=ti.f32, ndim=1),
                    gq: ti.types.ndarray(dtype=ti.f32, ndim=2),
-                   gh: ti.i32, mw: ti.i32, W: ti.i32, H: ti.i32):
-            for k, j in ti.ndrange(gi.shape[0], mw * gh):
+                   gh: ti.i32, mw: ti.i32, W: ti.i32, H: ti.i32,
+                   n: ti.i32):
+            for k, j in ti.ndrange(n, mw * gh):
                 u, v = j % mw, j // mw
                 g = gi[k]
                 if u < agw[g]:
@@ -652,9 +665,10 @@ class Surface:
 
     def draw(self, dl, atlas=None):
         """Фигуры, картинки и текст: по одному запуску ядра на вид."""
-        cmd, items, starts, tiles_x = dl._bin(self.w, self.h)
+        cmd, items, starts, tiles_x, ntiles = dl._bin(self.w, self.h)
         if cmd is not None:
-            self._k_shapes(cmd, items, starts, tiles_x, TILE, self.w, self.h)
+            self._k_shapes(cmd, items, starts, tiles_x, TILE, self.w, self.h,
+                           ntiles)
         for img in dl.images:
             rgb, x0, y0, w, h = img[:5]
             alpha = img[5] if len(img) > 5 else 1.0
@@ -662,11 +676,35 @@ class Surface:
                           self.w, self.h, float(alpha))
         g = dl._glyph_arrays()
         if g is not None and atlas is not None:
-            gi, gx, gy, gc, ga, gq = g
+            gi, gx, gy, gc, ga, gq, n = g
             self._k_text(atlas.pixels, atlas.gx, atlas.gw,
                          gi, gx, gy, gc, ga, gq,
-                         atlas.gh, atlas.max_gw, self.w, self.h)
+                         atlas.gh, atlas.max_gw, self.w, self.h, n)
 
     def present(self, canvas, gamma=1.0):
         self._k_tone(float(gamma))
         canvas.set_image(self.out)
+        self.finish()
+
+    @staticmethod
+    def finish():
+        """Дождаться видеокарты. РАЗ в кадр, и это не про скорость.
+
+        Taichi 1.7.4 держит на каждом незавершённом запуске свою
+        память и отпускает её только на синхронизации. Замерено
+        отдельной пробой на одном и том же кадре: 600 кадров без
+        синхронизации — **+34,32 МБ**, те же 600 с `ti.sync()` на
+        кадр — **+0,06 МБ**. В окне это давало около десяти мегабайт
+        в секунду: долгий сеанс намерил 541 -> 1408 МБ за 105 секунд,
+        ровно и без насыщения.
+
+        Течёт это одинаково в v2 и в v3 — проверено запуском той же
+        пробы на замороженном дереве (0,059 против 0,0595 МБ на кадр),
+        то есть беда не этого этапа, а всей отрисовки с самого начала.
+        Просто до сих пор никто не держал окно открытым достаточно
+        долго, чтобы её увидеть.
+
+        Ждать здесь нечего: кадр всё равно показывается только после
+        того, как ядра его досчитали.
+        """
+        ti.sync()
