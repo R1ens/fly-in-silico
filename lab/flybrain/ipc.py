@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import queue
+import time
 from multiprocessing import shared_memory
 from typing import Any, NamedTuple
 
@@ -391,6 +392,157 @@ class FrameRing:
         # пока они живы.
         self._seq = None
         self._slots = None
+        self.shm.close()
+
+    def unlink(self):
+        try:
+            self.shm.unlink()
+        except FileNotFoundError:
+            pass
+
+
+class EyeRing:
+    """Кольцо кадров ОБОИХ глаз: картинка и показания омматидиев.
+
+    Почему отдельное кольцо, а не поле в кольце тела
+    ------------------------------------------------
+    Три причины, и все три — про смысл, а не про удобство.
+
+    1. **Разная частота.** Вид тела рисуется раз на шаг управления (50
+       Гц модельного), а глаза обновляются по своей частоте
+       (`vision_hz`, по умолчанию 100 Гц модельного) и на шагах между
+       обновлениями FlyGym отдаёт ТОТ ЖЕ массив. Если везти их в одном
+       слоте, окно не сможет отличить новое наблюдение от повторённого —
+       а задание требует именно этого различения.
+    2. **Разная судьба при переполнении.** Кадр тела — картинка, и его
+       можно ронять молча. Кадр глаза несёт **модельную отметку
+       времени** того наблюдения, которое ушло в сеть, то есть он
+       научная величина, и о каждом пропуске окно обязано знать по
+       счётчику, а не догадываться.
+    3. **Разный состав.** У глаза две части: картинка (uint8, для
+       показа) и **показания омматидиев** (float32) — а это ровно тот
+       массив, который получает переходник сетчатки. Вторая часть не
+       картинка вовсе, и хранить её как картинку значило бы потерять
+       точность и смысл.
+
+    Что лежит в слоте
+    -----------------
+    * ``meta`` — четыре числа: модельное время кадра в мс, настенная
+      отметка записи, **суммарное** число сырых рендеров камер и
+      **суммарное** число полных обновлений сетчатки. Счётчики
+      суммарные нарочно: по разности двух опросов читатель сам считает
+      частоту, и по ней же видит, что кадр не обновлялся — а если бы
+      везлись приращения, пропущенный опрос терял бы их безвозвратно;
+    * ``img`` — два кадра глаза uint8. Это **исправленный рыбий глаз**,
+      то есть ровно то, из чего FlyGym считает шестиугольные пиксели, а
+      не отдельно нарисованная картинка;
+    * ``omma`` — показания омматидиев float32 формы (2, N, 2): два
+      глаза, N омматидиев, два типа фоторецепторов. Это то же самое,
+      что уходит в `vision.RetinaAdapter.feed`, без единого
+      преобразования по дороге.
+
+    Писатель занимает слоты по кругу и поднимает счётчик **только после
+    того**, как записаны все три части. Читатель берёт предыдущий слот,
+    то есть заведомо дописанный, — та же защита, что у `FrameRing`, и
+    по той же причине: ни блокировок, ни копий.
+    """
+
+    META = 4                       # модельное мс, стена, рендеров, обновлений
+
+    def __init__(self, shape=(512, 450, 3), omma=(721, 2), slots=3,
+                 name=None, create=True):
+        self.shape = tuple(int(v) for v in shape)
+        self.omma_shape = tuple(int(v) for v in omma)
+        self.slots = int(slots)
+        self.img_bytes = 2 * int(np.prod(self.shape))          # два глаза
+        self.omma_bytes = 2 * int(np.prod(self.omma_shape)) * 4
+        self.meta_bytes = self.slots * self.META * 8
+        size = (_HEADER + self.meta_bytes
+                + (self.img_bytes + self.omma_bytes) * self.slots)
+        if create:
+            self.shm = shared_memory.SharedMemory(create=True, size=size)
+        else:
+            self.shm = shared_memory.SharedMemory(name=name)
+        self.name = self.shm.name
+        off = 0
+        self._seq = np.ndarray((1,), dtype=np.int64, buffer=self.shm.buf[:8])
+        off = _HEADER
+        self._meta = np.ndarray(
+            (self.slots, self.META), dtype=np.float64,
+            buffer=self.shm.buf[off:off + self.meta_bytes])
+        off += self.meta_bytes
+        self._img = np.ndarray(
+            (self.slots, 2) + self.shape, dtype=np.uint8,
+            buffer=self.shm.buf[off:off + self.img_bytes * self.slots])
+        off += self.img_bytes * self.slots
+        self._omma = np.ndarray(
+            (self.slots, 2) + self.omma_shape, dtype=np.float32,
+            buffer=self.shm.buf[off:off + self.omma_bytes * self.slots])
+        if create:
+            self._seq[0] = 0
+            self._meta[:] = 0.0
+
+    @classmethod
+    def open(cls, name, shape=(512, 450, 3), omma=(721, 2), slots=3):
+        return cls(shape=shape, omma=omma, slots=slots, name=name,
+                   create=False)
+
+    @classmethod
+    def from_descriptor(cls, desc):
+        return cls.open(desc["name"], tuple(desc["shape"]),
+                        tuple(desc["omma"]), int(desc["slots"]))
+
+    def descriptor(self):
+        return {"name": self.name, "shape": list(self.shape),
+                "omma": list(self.omma_shape), "slots": self.slots}
+
+    def write(self, t_model_ms, img_pair, omma_pair, raw_renders,
+              retinal_updates, wall=None):
+        """Записать кадр обоих глаз. Счётчик поднимается ПОСЛЕДНИМ.
+
+        ``img_pair`` — (2, H, W, 3) uint8, ``omma_pair`` — (2, N, 2).
+        Форма проверяется, а не предполагается: кадр не той формы лёг бы
+        в слот молча и показался бы окну как настоящий.
+        """
+        img = np.asarray(img_pair)
+        om = np.asarray(omma_pair, dtype=np.float32)
+        if img.shape != (2,) + self.shape:
+            raise ValueError(
+                "кадр глаз имеет форму %s, а кольцо заведено под %s"
+                % (tuple(img.shape), (2,) + self.shape))
+        if om.shape != (2,) + self.omma_shape:
+            raise ValueError(
+                "показания омматидиев имеют форму %s, а кольцо заведено "
+                "под %s" % (tuple(om.shape), (2,) + self.omma_shape))
+        seq = int(self._seq[0])
+        i = seq % self.slots
+        self._img[i] = img
+        self._omma[i] = om
+        self._meta[i] = (float(t_model_ms),
+                         float(time.time() if wall is None else wall),
+                         float(raw_renders), float(retinal_updates))
+        self._seq[0] = seq + 1
+        return seq + 1
+
+    def latest(self):
+        """(номер, meta, картинки, омматидии); (0, None, None, None) если пусто."""
+        seq = int(self._seq[0])
+        if seq <= 0:
+            return 0, None, None, None
+        i = (seq - 1) % self.slots
+        return seq, self._meta[i].copy(), self._img[i], self._omma[i]
+
+    @property
+    def seq(self):
+        return int(self._seq[0])
+
+    def close(self):
+        # Те же грабли, что у `FrameRing`: виды на буфер держат mmap, и
+        # close() на нём падает, пока они живы.
+        self._seq = None
+        self._meta = None
+        self._img = None
+        self._omma = None
         self.shm.close()
 
     def unlink(self):
