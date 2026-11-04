@@ -1,0 +1,12 @@
+[Taichi] version 1.7.4, llvm 15.0.1, commit b4b956fd, win, python 3.12.13
+[Taichi] Starting on arch=vulkan
+  работник готов за 7.0 с
+[vost#0:0/libx264 @ 000002bbbf659800] Multiple -pix_fmt options specified for stream 0, only the last option '-pix_fmt yuv420p' will be used.
+  сцена «мозг»: 250 кадров
+  сцена «активность»: 300 кадров
+  кадр тела: есть
+  сцена «тело»: 300 кадров
+  сцена «глаза»: 350 кадров
+  сцена «концовка»: 150 кадров
+
+  fly-in-silico.mp4 — 27.0 с, 87.6 МБ
