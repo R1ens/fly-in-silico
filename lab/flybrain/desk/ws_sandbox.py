@@ -55,8 +55,18 @@ from .tokens import C, R, S
 
 __all__ = ["SPACE"]
 
+
+def _ar(app):
+    """Соотношение сторон кадра тела. Берётся у сеанса, а не задаётся.
+
+    Своя константа здесь уже стоила чёрных полей: работник отдавал
+    1280×720, а окно вписывало кадр в 4:3 по памятной записи.
+    """
+    ses = getattr(app, "ses", None)
+    return ses.body_ar if ses is not None else 16.0 / 9.0
+
+
 TABS = ("Показания", "События", "Команды")
-FRAME_AR = 960.0 / 720.0
 
 SLOT_COLORS = (C.accent, C.info, C.ok, C.plot_alt)
 
@@ -587,7 +597,7 @@ def centre(app, ctx, r):                                      # noqa: C901
     frame = app.ses.body_frame if app.ses is not None else None
     if st.run.phase == "prep":
         frame = None
-    box = view.fit_aspect(FRAME_AR)
+    box = view.fit_aspect(_ar(app))
 
     # --- вид глаз вместо сцены ---------------------------------------
     # Переключатель, а не вторая панель рядом: картинка глаза это

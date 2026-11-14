@@ -33,8 +33,18 @@ from .tokens import C, R, S
 
 __all__ = ["SPACE"]
 
+
+def _ar(app):
+    """Соотношение сторон кадра тела. Берётся у сеанса, а не задаётся.
+
+    Своя константа здесь уже стоила чёрных полей: работник отдавал
+    1280×720, а окно вписывало кадр в 4:3 по памятной записи.
+    """
+    ses = getattr(app, "ses", None)
+    return ses.body_ar if ses is not None else 16.0 / 9.0
+
+
 TABS = ("Показания", "Путь", "Зрение", "Журнал")
-FRAME_AR = 960.0 / 720.0
 
 CAM_HELP = ("Поворот — потянуть мышью по виду, приближение — колесом. "
             "Кадр снимает работник на шаге управления, поэтому вид "
@@ -61,7 +71,7 @@ def centre(app, ctx, r):
     if st.run.phase == "prep":
         # В подготовке кадров нового эпизода ещё нет по определению.
         frame = None
-    box = view.fit_aspect(FRAME_AR)
+    box = view.fit_aspect(_ar(app))
 
     if frame is not None:
         dl.image(frame, box.x, box.y, box.w, box.h)
