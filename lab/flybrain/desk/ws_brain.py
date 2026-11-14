@@ -83,7 +83,12 @@ def centre(app, ctx, r):
     bv.mode = "activity" if b.mode == "activity" else "regions"
     # В анатомии цвет нейропиля не зависит от активности: показывают
     # строение. В активности долю цвета отдаём самой активности.
-    bv.region_floor = 0.25 if b.mode == "activity" else 1.0
+    # Сколько цвета нейропиля остаётся у молчащего нейрона.
+    # В анатомии — весь: там показывают строение. В активности
+    # цвет и так магмовый, доля нужна лишь чтобы облако не пропадало.
+    # В «областях в работе» пол низкий: молчащий нейрон должен почти
+    # погаснуть, иначе яркость перестаёт означать частоту.
+    bv.region_floor = {"activity": 0.25, "both": 0.10}.get(b.mode, 1.0)
     bv.dim = b.dim
     bv.rad0 = 1.25 * b.point
     bv.rad1 = 2.6 * b.point
@@ -175,7 +180,8 @@ def _toolbar(app, ctx, view):
                 sc.px(S.control) + sc.px(S.xs) * 2)
     hit, picks = W.viewport_toolbar(ctx, "brain/tb", tb, [
         ("seg", "mode", modes, keys.index(b.mode) if b.mode in keys else 0,
-         ["цвет по нейропилям", "цвет по кадрам динамики LIF"]),
+         ["цвет по нейропилям", "цвет по кадрам динамики LIF",
+          "цвет по нейропилю, яркость по частоте"]),
         ("-",),
         ("all", "brain", "показать весь мозг"),
         ("focus", "expand", "навести камеру на выделенное"),
@@ -224,7 +230,7 @@ def _legend(app, ctx, view):
     back = ctx.layer(ctx.overlay)
     dl = ctx.dl
 
-    if b.mode == "activity":
+    if b.mode in ("activity", "both"):
         seen = int(getattr(ses, "frames_seen", 0) or 0)
         if not seen:
             note = "активность: кадров ещё не было"
@@ -250,6 +256,9 @@ def _legend(app, ctx, view):
             color=C.dim)
 
     # Шкала активности: полоса магмы с настоящими границами в герцах.
+    # Только в «Активности»: в «областях в работе» цвет означает
+    # нейропиль, а частоту несёт яркость, и полоса магмы под таким
+    # кадром обещала бы не то.
     if b.mode == "activity" and int(getattr(ses, "frames_seen", 0) or 0):
         from ..ui import theme
         sw = min(sc.px(220), view.w // 3)
@@ -340,7 +349,7 @@ def inspector(app, ctx, r):
                         "подписи нейропилей")
     b.only_active = W.toggle(ctx, "brain/oa", s.take(sc.px(S.row)),
                              b.only_active, "только сработавшие",
-                             enabled=(b.mode == "activity"),
+                             enabled=(b.mode in ("activity", "both")),
                              tip="имеет смысл только в режиме активности")
     b.point = W.slider(ctx, "brain/pt", s.take(sc.px(40)), b.point, 0.5,
                        2.5, "размер точки", "×", fmt="{:.2f}")
