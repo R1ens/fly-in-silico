@@ -68,6 +68,15 @@ class BrainView:
         self.zoom = 1.0
         self.dist = 3.0
         self._fit_key = None
+        # Замороженный охват. Подгонка — это ДЕЙСТВИЕ (сменили вид,
+        # выделили набор), а не непрерывная функция угла: пока
+        # расстояние пересчитывалось на каждый поворот, вращение выходило
+        # с «дыханием». Замер (`probe/promo.py --тряска`): по кругу
+        # потребное расстояние гуляет от 1,480 до 2,171 — 47 %, — и
+        # мозг то упирался в края, то отъезжал на две трети кадра.
+        # С замороженным охватом он поворачивается как тело, а не
+        # как резиновый.
+        self.fit_hold = None
         # Подвыборка для подгонки: по 12 тысячам точек охват считается с той
         # же точностью, но за доли миллисекунды.
         self._fit_step = max(1, self.n // 12000)
@@ -178,10 +187,12 @@ class BrainView:
             self._base = p.mean(axis=0).astype(np.float32)
         self._fit_rev += 1
         self._fit_key = None
+        self.fit_hold = None
 
     def next_view(self):
         self.view_i = (self.view_i + 1) % len(VIEWS)
         _, self.yaw, self.pitch = VIEWS[self.view_i]
+        self.fit_hold = None
 
     def _fit(self, aspect, fovy=38.0, margin=1.08):
         """Расстояние и точка, на которую смотрит камера.
@@ -266,6 +277,36 @@ class BrainView:
 
     def refit(self):
         self._fit_key = None
+        self.fit_hold = None
+
+    def hold_fit(self, aspect, по_кругу=True, по_наклону=False, шагов=24):
+        """Заморозить охват так, чтобы мозг помещался при ЛЮБОМ повороте.
+
+        Берётся не расстояние текущего угла, а наибольшее по обходу:
+        иначе на полпути облёта облако вылезет за край. Центр берётся
+        средний по тому же обходу — тогда мозг вращается вокруг
+        неподвижной точки, а не ездит по кадру.
+
+        `по_наклону` добавляет к обходу наклон камеры. Для облёта он не
+        нужен (наклон при съёмке не меняется), а для вращения мышью
+        нужен: там тянут и вверх.
+        """
+        yaw0, pitch0, key0 = self.yaw, self.pitch, self._fit_key
+        наклоны = ((-1.3, -0.6, 0.0, 0.6, 1.3) if по_наклону
+                   else (pitch0,))
+        круг = ([yaw0 + 2 * math.pi * i / шагов for i in range(шагов)]
+                if по_кругу else [yaw0])
+        ds, cs = [], []
+        for pitch in наклоны:
+            for yaw in круг:
+                self.yaw, self.pitch = yaw, pitch
+                self._fit_key = None
+                ds.append(self._fit(aspect))
+                cs.append(self._centre.copy())
+        self.yaw, self.pitch, self._fit_key = yaw0, pitch0, key0
+        self.fit_hold = float(max(ds))
+        self._centre = np.mean(cs, axis=0).astype(np.float32)
+        return self.fit_hold
 
     @property
     def view_name(self):
@@ -285,6 +326,16 @@ class BrainView:
                 self.pitch = max(-1.45, min(
                     1.45, self.pitch + (cy - self._drag[1]) / max(vh, 1) * 4.0))
                 self.view_i = -1
+                # Пока вращают, охват только РАСТЁТ. Подгонка на каждый
+                # угол давала «дыхание»: мозг то упирался в края, то
+                # отъезжал (47 % по кругу, замер в `promo.py --тряска`).
+                # Заморозить его сразу на наибольшем нельзя — масштаб
+                # прыгнул бы в тот момент, когда за мозг только взялись.
+                # Поэтому камера отъезжает, когда облако не влезает, и
+                # никогда не наезжает обратно: за один оборот охват
+                # приходит к наибольшему и дальше стоит.
+                self.fit_hold = max(self.fit_hold or 0.0,
+                                    self._fit(vw / max(vh, 1)))
             self._drag = (cx, cy)
         else:
             self._drag = None
@@ -350,7 +401,7 @@ class BrainView:
         if vw < 8 or vh < 8:
             return
         aspect = vw / max(vh, 1)
-        self.dist = self._fit(aspect) * self.zoom
+        self.dist = (self.fit_hold or self._fit(aspect)) * self.zoom
         # Камера на орбите всегда смотрит в ноль. Чтобы навести её на
         # выделенный участок, мир сдвигается под неё: матрица
         # домножается справа на перенос. Так проекция, подписи и
